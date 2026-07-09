@@ -21,7 +21,15 @@
    ```
    VWORLD_API_KEY=발급받은_키
    ```
-4. Claude 설정에 등록한다 (아래 "Claude에 등록하기" 참고). `command`에 exe 경로를 직접 지정하면 되고 `args`는 필요 없다.
+4. Claude/Codex에 등록한다 — `install.ps1`을 실행하면 자동으로 등록된다(아래 "자동 등록" 참고). 수동으로 하려면 "Claude에 등록하기" 참고.
+
+## 자동 등록 (Claude Code + Codex CLI)
+
+`claude`, `codex` CLI가 PC에 설치되어 있으면 아래 스크립트가 둘 다 자동으로 등록해준다(찾지 못한 CLI는 건너뛴다). VWorld API 키도 대화형으로 물어봐서 `.env`까지 만들어준다.
+```
+powershell -ExecutionPolicy Bypass -File install.ps1
+```
+실행 후 Claude Code/Codex를 재시작하면 `eiass_*` 도구를 바로 쓸 수 있다. Claude Desktop은 CLI가 없어 자동 등록은 지원하지 않고, 실행 후 안내되는 JSON 스니펫을 `claude_desktop_config.json`에 직접 추가하면 된다.
 
 ## 설치 — 방법 2: Python으로 실행
 
