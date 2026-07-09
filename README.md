@@ -7,11 +7,21 @@
 | 도구 | 기능 |
 |---|---|
 | `eiass_search_projects` | 사업명/협의완료일 범위/진행상태/기후변화영향평가/업종 등 필터로 사업 검색 |
-| `eiass_find_projects_by_document_keyword` | 필터로 후보를 좁힌 뒤, 협의의견(등) 원문에서 키워드가 있는 사업만 추려서 반환 |
+| `eiass_find_projects_by_document_keyword` | 필터로 후보를 좁힌 뒤, 지정 단계(기본 협의의견) 원문에서 키워드가 있는 사업만 추려서 반환. 소규모(~50건) 조회용, `offset`으로 이어서 조회 가능 |
+| `eiass_start_document_keyword_scan` | 대량 후보(수백 건)를 타임아웃 없이 끝까지 훑는 백그라운드 스캔 시작. 즉시 `job_id` 반환 |
+| `eiass_get_scan_status` | `job_id`로 스캔 진행 상황·중간/최종 매칭 결과 조회 |
+| `eiass_cancel_scan` | 진행 중인 백그라운드 스캔 취소 |
 | `eiass_get_project_documents` | 사업 개요 필드 + 단계별(초안/본안/협의의견 등) 첨부문서 목록 조회 |
-| `eiass_read_document` | 첨부 PDF를 다운로드해 텍스트 추출 |
+| `eiass_read_document` | 첨부 PDF를 다운로드해 텍스트 추출(로컬 캐시 우선) |
 | `eiass_check_protected_area_adjacency` | 주소 → 지오코딩 → 반경 내 KDPA 보호지역(국립공원/천연기념물/습지보호지역/야생생물보호구역/OECM) 조회 |
 | `eiass_geocode` | 주소 → 경위도 좌표 |
+
+### 대량 문서 키워드 검색이 빨라진 이유
+
+첨부 PDF를 file_seq 기준으로 로컬 SQLite에 캐시하고(`%LOCALAPPDATA%\DOHWA EIASS Agent\doc_text_cache.sqlite3`), 사업 상세조회 결과도 서버 프로세스가 살아있는 동안 메모리에 캐시한다. 그래서:
+- `text_queries="CALPUFF,CMAQ"`처럼 **여러 키워드를 한 번에** 넘기면 문서를 한 번만 열어서 전부 확인한다(키워드 수만큼 반복 다운로드하지 않음).
+- 같은 후보군을 **다른 키워드로 다시 조회**하거나 `offset`으로 **이어서 조회**해도 이미 받은 문서는 재다운로드하지 않는다 (실측: 같은 배치를 다른 키워드로 재조회 시 5초대 → 0.3초대).
+- 후보가 많아 한 번의 호출로는 끝낼 수 없을 때는 `eiass_start_document_keyword_scan`으로 백그라운드에 맡기고 `eiass_get_scan_status`로 폴링하면, MCP 호출 하나의 타임아웃과 무관하게 끝까지 진행된다.
 
 ## 설치 — 방법 1: exe로 실행 (Python 설치 불필요, 추천)
 

@@ -18,8 +18,10 @@ import json
 import math
 import os
 import re
+import sqlite3
 import sys
 import tempfile
+import threading
 import urllib.parse
 from collections import OrderedDict
 from datetime import date, datetime
@@ -112,6 +114,70 @@ def app_local_data_dir():
     path = os.path.join(base, 'DOHWA EIASS Agent')
     os.makedirs(path, exist_ok=True)
     return path
+
+
+# ── 첨부문서 텍스트 캐시 (file_seq 기준) ──
+# 같은 사업/키워드를 다시 조회하거나 CALPUFF→CMAQ처럼 후보군이 겹치는 여러 키워드를
+# 연속 조회할 때, 같은 PDF를 매번 재다운로드·재추출하지 않도록 로컬 SQLite에 캐시한다.
+
+_CACHE_LOCK = threading.Lock()
+
+
+def _cache_db_path():
+    return os.path.join(app_local_data_dir(), 'doc_text_cache.sqlite3')
+
+
+def _cache_connect():
+    conn = sqlite3.connect(_cache_db_path(), timeout=30)
+    conn.execute('PRAGMA journal_mode=WAL')
+    conn.execute('''
+        CREATE TABLE IF NOT EXISTS doc_text_cache (
+            file_seq TEXT PRIMARY KEY,
+            text TEXT NOT NULL,
+            page_offsets TEXT NOT NULL,
+            pages INTEGER NOT NULL,
+            char_count INTEGER NOT NULL,
+            fetched_at TEXT NOT NULL
+        )
+    ''')
+    return conn
+
+
+def _cache_get(file_seq):
+    with _CACHE_LOCK:
+        conn = _cache_connect()
+        try:
+            row = conn.execute(
+                'SELECT text, page_offsets, pages FROM doc_text_cache WHERE file_seq = ?', (file_seq,)
+            ).fetchone()
+        finally:
+            conn.close()
+    if not row:
+        return None
+    text, page_offsets_json, pages = row
+    return {'text': text, 'page_offsets': json.loads(page_offsets_json), 'pages': pages}
+
+
+def _cache_put(file_seq, text, page_offsets, pages):
+    with _CACHE_LOCK:
+        conn = _cache_connect()
+        try:
+            conn.execute(
+                'INSERT OR REPLACE INTO doc_text_cache '
+                '(file_seq, text, page_offsets, pages, char_count, fetched_at) VALUES (?, ?, ?, ?, ?, ?)',
+                (file_seq, text, json.dumps(page_offsets), pages, len(text), datetime.utcnow().isoformat()),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+
+def _page_for_offset(page_offsets, char_index):
+    """누적 문자 오프셋 목록에서 char_index가 속한 페이지 번호(1-base)를 추정한다."""
+    for i, cum in enumerate(page_offsets or []):
+        if char_index < cum:
+            return i + 1
+    return len(page_offsets) if page_offsets else None
 
 
 def dotenv_paths():
@@ -944,11 +1010,27 @@ def _parse_docs_by_stage(soup):
     return result
 
 
-def get_project_detail(view_type, eia_cd, revirpt_seq, session=None):
+_DETAIL_CACHE_LOCK = threading.Lock()
+_DETAIL_CACHE = {}  # (view_type, eia_cd, revirpt_seq) -> detail dict; 프로세스 수명 동안만 유지(메모리)
+
+
+def get_project_detail(view_type, eia_cd, revirpt_seq, session=None, use_cache=False):
     """사업 개요 필드 + 단계별 첨부문서(stage_docs, '협의의견' 포함) 조회.
+
+    use_cache=True면 같은 (view_type, eia_cd, revirpt_seq) 재조회 시 재요청하지 않고
+    메모리 캐시를 반환한다(CALPUFF→CMAQ처럼 같은 후보군을 다른 키워드로 다시 훑을 때
+    search_projects_by_document_keyword가 이 옵션을 켠다). 최신 상태를 원하면 기본값(False)대로
+    둔다 — 진행 중인 사업은 문서가 추가될 수 있으므로 eiass_get_project_documents는 기본이 최신조회다.
 
     반환: {'fields': {...}, 'stage_docs': OrderedDict{stage: {category: [{'seq','name','is_pdf'}]}}}
     """
+    cache_key = (view_type, eia_cd, revirpt_seq)
+    if use_cache:
+        with _DETAIL_CACHE_LOCK:
+            cached = _DETAIL_CACHE.get(cache_key)
+        if cached is not None:
+            return cached
+
     s = session or _session()
 
     if view_type == 'after':
@@ -983,7 +1065,11 @@ def get_project_detail(view_type, eia_cd, revirpt_seq, session=None):
             'recv_date': get_td_text('조사년도'),
             'comp_date': _format_after_survey_period(get_td_text('환경영향 조사기간(금회)')),
         }
-        return {'fields': fields, 'stage_docs': _parse_after_docs(soup)}
+        result = {'fields': fields, 'stage_docs': _parse_after_docs(soup)}
+        if use_cache:
+            with _DETAIL_CACHE_LOCK:
+                _DETAIL_CACHE[cache_key] = result
+        return result
 
     if view_type == 'eia':
         detail_url = f'{EIASS_BASE}/biz/base/info/eiaInfo.do?EIA_CD={eia_cd}&REVIRPT_SEQ={revirpt_seq}'
@@ -1013,11 +1099,20 @@ def get_project_detail(view_type, eia_cd, revirpt_seq, session=None):
         'recv_date': stage_recv if stage_recv != '-' else get_detail_label('접수일자', '접수일'),
         'comp_date': _format_comp_date_with_result(consult_complete, consult_result),
     }
-    return {'fields': fields, 'stage_docs': _parse_docs_by_stage(soup)}
+    result = {'fields': fields, 'stage_docs': _parse_docs_by_stage(soup)}
+    if use_cache:
+        with _DETAIL_CACHE_LOCK:
+            _DETAIL_CACHE[cache_key] = result
+    return result
 
 
-def download_document_text(file_seq, session=None, max_chars=20000):
-    """첨부 PDF(FILE_SEQ)를 다운로드해 텍스트를 추출한다. fitz(PyMuPDF) 필요."""
+def _get_full_document_text(file_seq, session=None):
+    """캐시 우선 조회 후 없으면 다운로드+추출한다. 검색용이므로 절대 잘리지 않은 전체
+    텍스트를 반환한다(요약/표시용 자르기는 download_document_text에서만 한다)."""
+    cached = _cache_get(file_seq)
+    if cached:
+        return {'text': cached['text'], 'page_offsets': cached['page_offsets'],
+                'pages': cached['pages'], 'from_cache': True}
     if fitz is None:
         raise EiassError('PyMuPDF(fitz)가 설치되어 있지 않아 PDF 텍스트를 추출할 수 없습니다.')
     s = session or _session()
@@ -1031,15 +1126,35 @@ def download_document_text(file_seq, session=None, max_chars=20000):
         parts = [page.get_text() for page in doc]
     finally:
         doc.close()
-    text = '\n'.join(parts).strip()
+    full_text = '\n'.join(parts)
+    page_offsets = []
+    cursor = 0
+    for part in parts:
+        cursor += len(part) + 1
+        page_offsets.append(cursor)
+    try:
+        _cache_put(file_seq, full_text, page_offsets, len(parts))
+    except Exception:
+        pass  # 캐시 저장 실패는 무시(검색 자체는 계속 진행)
+    return {'text': full_text, 'page_offsets': page_offsets, 'pages': len(parts), 'from_cache': False}
+
+
+def download_document_text(file_seq, session=None, max_chars=20000):
+    """첨부 PDF(FILE_SEQ)를 다운로드해 텍스트를 추출한다(로컬 캐시 우선). fitz(PyMuPDF) 필요."""
+    result = _get_full_document_text(file_seq, session=session)
+    text = result['text'].strip()
     truncated = len(text) > max_chars
-    if truncated:
-        text = text[:max_chars]
-    return {'text': text, 'truncated': truncated, 'pages': len(parts)}
+    return {
+        'text': text[:max_chars] if truncated else text,
+        'truncated': truncated,
+        'pages': result['pages'],
+        'from_cache': result['from_cache'],
+    }
 
 
 def search_projects_by_document_keyword(
-    text_query,
+    text_queries,
+    match_mode='any',
     keyword='',
     type_codes=None,
     agency_code='',
@@ -1049,73 +1164,111 @@ def search_projects_by_document_keyword(
     biz_gubun='',
     stages=('협의의견',),
     max_pages=2,
+    offset=0,
     max_candidates=30,
     session=None,
     snippet_chars=250,
 ):
     """검색 필터(협의완료일 범위/진행상태 등)로 후보 사업을 뽑은 뒤, 지정한 단계(기본값
-    '협의의견')의 첨부 PDF 원문에서 text_query가 포함된 사업만 골라낸다.
+    '협의의견')의 첨부 PDF 원문에서 text_queries 키워드가 있는 사업만 골라낸다.
 
-    "최근 1년 내 협의완료된 사업 중 협의의견에 원형보전지 관련 내용이 있는 사업"
-    같은 요청은 이 함수 하나로 처리한다: search_projects()로 날짜/상태 필터링 후,
-    각 후보의 stage_docs에서 대상 단계 문서를 다운로드해 원문에서 text_query를 찾는다.
+    후보 전체(candidates_total)를 한 번에 다 훑지 않고 offset부터 max_candidates개만
+    처리한다. 응답의 next_offset을 다음 호출의 offset으로 넘기면 이어서 진행할 수 있다
+    (has_more가 False면 끝까지 다 본 것). 대량 후보군을 타임아웃 없이 훑으려면
+    search_projects_by_document_keyword를 직접 반복 호출하는 대신
+    eiass_start_document_keyword_scan(백그라운드 job)을 쓰는 편이 낫다.
 
-    주의: 단순 부분문자열(포함) 매칭이다. 동의어("원형보전지" vs "존치녹지" 등)나 문맥상
+    text_queries는 문자열 또는 리스트. 여러 키워드를 한 번의 PDF 다운로드/추출로 함께
+    확인한다(문서를 키워드 수만큼 반복 다운로드하지 않음). match_mode='any'면 하나라도
+    있으면 매칭, 'all'이면 전부 있어야 매칭.
+
+    같은 file_seq의 PDF는 로컬 SQLite 캐시(_get_full_document_text)에 저장되므로, 같은
+    후보군을 다른 키워드로 다시 조회하거나 offset을 이어서 조회할 때 재다운로드하지 않는다.
+
+    주의: 단순 부분문자열(포함) 매칭이다. 동의어(예: "원형보전지" vs "존치녹지")나 문맥상
     유사 내용까지 잡으려면, 이 함수로 1차 후보를 좁힌 뒤 eiass_read_document로 원문을
     받아 AI가 다시 의미 단위로 판단해야 한다. stages를 ('초안','본안') 등으로 넓히면
     검토의견/본문에서도 검색할 수 있지만 다운로드량이 늘어 느려진다.
 
-    반환: {'candidates_total', 'checked', 'skipped_no_target_doc', 'matches': [
-        {..search_projects 항목.., 'fields': {...}, 'matched_snippets': [{'file','seq','snippet'}]}
-    ]}
+    반환: {'candidates_total', 'offset', 'checked', 'next_offset', 'has_more',
+        'skipped': [{'name','eia_cd','reason'}, ...],
+        'matches': [{..search_projects 항목.., 'fields': {...}, 'matched_keywords': [...],
+                     'matched_snippets': [{'file','seq','keyword','page_estimate','snippet'}]}]}
     """
+    if isinstance(text_queries, str):
+        text_queries = [text_queries]
+    text_queries = [q for q in (text_queries or []) if q]
+    if not text_queries:
+        raise EiassError('text_queries에 검색어를 하나 이상 지정해야 합니다.')
+    if match_mode not in ('any', 'all'):
+        raise EiassError("match_mode는 'any' 또는 'all'이어야 합니다.")
+
     session = session or _session()
     candidates = search_projects(
         keyword, type_codes=type_codes, agency_code=agency_code, max_pages=max_pages, session=session,
         consult_date_from=consult_date_from, consult_date_to=consult_date_to, progress_status=progress_status,
         biz_gubun=biz_gubun,
     )
+    total = len(candidates)
+    batch = candidates[offset:offset + max_candidates]
+
     matches = []
-    checked = 0
-    skipped_no_doc = 0
-    for item in candidates:
-        if checked >= max_candidates:
-            break
-        checked += 1
+    skipped = []
+    for item in batch:
         try:
-            detail = get_project_detail(item['view_type'], item['eia_cd'], item['revirpt_seq'], session=session)
-        except Exception:
+            detail = get_project_detail(item['view_type'], item['eia_cd'], item['revirpt_seq'],
+                                         session=session, use_cache=True)
+        except Exception as exc:
+            skipped.append({'name': item['name'], 'eia_cd': item['eia_cd'], 'reason': f'상세조회 실패: {exc}'})
             continue
         stage_docs = detail['stage_docs']
         target_files = []
         for stage in stages:
             for files in (stage_docs.get(stage) or {}).values():
-                target_files.extend(files)
+                target_files.extend(f for f in files if f.get('is_pdf'))
         if not target_files:
-            skipped_no_doc += 1
+            skipped.append({'name': item['name'], 'eia_cd': item['eia_cd'],
+                             'reason': f"{'/'.join(stages)} 단계에 PDF 첨부문서 없음"})
             continue
 
         matched_snippets = []
+        matched_keywords = set()
         for f in target_files:
-            if not f.get('is_pdf'):
-                continue
             try:
-                doc = download_document_text(f['seq'], session=session, max_chars=300000)
-            except Exception:
+                doc = _get_full_document_text(f['seq'], session=session)
+            except Exception as exc:
+                skipped.append({'name': item['name'], 'eia_cd': item['eia_cd'],
+                                 'reason': f"{f['name']} 다운로드/추출 실패: {exc}"})
                 continue
             text = doc['text']
-            idx = text.find(text_query)
-            if idx == -1:
-                continue
-            start = max(0, idx - snippet_chars // 2)
-            end = min(len(text), idx + len(text_query) + snippet_chars // 2)
-            matched_snippets.append({'file': f['name'], 'seq': f['seq'], 'snippet': text[start:end].strip()})
-        if matched_snippets:
-            matches.append({**item, 'fields': detail['fields'], 'matched_snippets': matched_snippets})
+            for q in text_queries:
+                idx = text.find(q)
+                if idx == -1:
+                    continue
+                matched_keywords.add(q)
+                start = max(0, idx - snippet_chars // 2)
+                end = min(len(text), idx + len(q) + snippet_chars // 2)
+                matched_snippets.append({
+                    'file': f['name'], 'seq': f['seq'], 'keyword': q,
+                    'page_estimate': _page_for_offset(doc['page_offsets'], idx),
+                    'snippet': text[start:end].strip(),
+                })
+        is_match = (matched_keywords == set(text_queries)) if match_mode == 'all' else bool(matched_keywords)
+        if is_match:
+            matches.append({
+                **item, 'fields': detail['fields'],
+                'matched_keywords': sorted(matched_keywords), 'matched_snippets': matched_snippets,
+            })
+
+    checked = len(batch)
+    next_offset = offset + checked if (offset + checked) < total else None
     return {
-        'candidates_total': len(candidates),
+        'candidates_total': total,
+        'offset': offset,
         'checked': checked,
-        'skipped_no_target_doc': skipped_no_doc,
+        'next_offset': next_offset,
+        'has_more': next_offset is not None,
+        'skipped': skipped,
         'matches': matches,
     }
 
