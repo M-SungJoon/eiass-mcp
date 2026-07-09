@@ -1,0 +1,5 @@
+mcp>=1.27.0
+requests>=2.33.1
+beautifulsoup4>=4.14.3
+urllib3>=2.7.0
+PyMuPDF>=1.27.2
