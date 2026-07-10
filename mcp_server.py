@@ -47,6 +47,14 @@ def _run_scan_job(job_id, kwargs):
                 job['candidates_total'] = result['candidates_total']
                 job['matches'].extend(result['matches'])
                 job['skipped'].extend(result['skipped'])
+                job['audit_samples'].append(result['audit_sample']) if result['audit_sample'] else None
+                if result['needs_refinement']:
+                    job['needs_refinement'] = True
+                    job['refinement_hints'].append(result['refinement_hint'])
+                for stage, stats in result['stage_stats'].items():
+                    acc = job['stage_stats'].setdefault(stage, {'checked': 0, 'matched': 0})
+                    acc['checked'] += stats['checked']
+                    acc['matched'] += stats['matched']
             if not result['has_more']:
                 break
             offset = result['next_offset']
@@ -101,18 +109,70 @@ def eiass_search_projects(keyword: str = '', types: str = '', agency_code: str =
 
 
 @mcp.tool()
+def eiass_preview_search(
+    text_queries: str, match_mode: str = 'any', keyword: str = '', types: str = '', agency_code: str = '',
+    consult_date_from: str = '', consult_date_to: str = '', progress_status: str = '완료',
+    biz_gubun: str = '', stages: str = '협의의견', max_pages: int = 2, inference_notes: str = '',
+) -> dict:
+    """실제로 문서를 다운로드하지 않고, 이 조건으로 검색하면 무엇을 하게 될지 미리 보여준다.
+    eiass_find_projects_by_document_keyword / eiass_start_document_keyword_scan을
+    confirmed=True 없이 호출하면 내부적으로 이 함수와 같은 내용을 반환하므로, 보통은 이
+    도구를 따로 부르지 않고 그 두 도구를 confirmed=False(기본값)로 먼저 불러도 된다 —
+    이 도구는 "확인 문구만 다시 보고 싶을 때"나 조건을 조정해보며 비교할 때 쓴다.
+
+    반환된 confirmation_message를 사용자에게 그대로 보여주고 승인을 받은 뒤에만
+    같은 조건 + confirmed=true로 실제 실행 도구를 호출하라. 사용자가 명시적으로 말하지
+    않은 필터는 여기 그대로 두면 자동으로 '전체'로 취급된다 — types/biz_gubun 등을
+    AI가 임의로 좁혔다면 반드시 inference_notes에 그 사실과 이유를 적어서 사용자가
+    구분할 수 있게 하라.
+
+    Args:
+        text_queries: 문서 원문에서 찾을 문자열, 콤마 구분(예: 'CALPUFF,CMAQ').
+        match_mode: 'any' | 'all'.
+        keyword/types/agency_code/consult_date_from/consult_date_to/progress_status/biz_gubun/stages/max_pages:
+            eiass_find_projects_by_document_keyword와 동일. 사용자가 말하지 않은 조건은 비워두면
+            '전체'로 표시된다(임의로 좁혀서 넘기지 말 것).
+        inference_notes: 사용자가 직접 말하지 않았는데 AI가 추론/제안해서 좁힌 조건이 있다면
+            그 내용과 이유를 여기 적는다(예: "평가종류를 환경영향평가로 좁혔습니다 — 사용자는
+            '산업단지 사례'라고만 했음"). 없으면 빈 문자열로 둔다.
+    """
+    type_codes = [c.strip().upper() for c in types.split(',') if c.strip()] or None
+    stage_list = tuple(s.strip() for s in stages.split(',') if s.strip()) or ('협의의견',)
+    query_list = [q.strip() for q in text_queries.split(',') if q.strip()]
+    try:
+        return core.preview_document_keyword_search(
+            query_list, match_mode=match_mode, keyword=keyword, type_codes=type_codes, agency_code=agency_code,
+            consult_date_from=consult_date_from or None, consult_date_to=consult_date_to or None,
+            progress_status=progress_status, biz_gubun=biz_gubun, stages=stage_list,
+            max_pages=max(1, min(max_pages, core.MAX_SEARCH_PAGES)), inference_notes=inference_notes,
+        )
+    except core.EiassError as exc:
+        return {'error': str(exc)}
+
+
+@mcp.tool()
 def eiass_find_projects_by_document_keyword(
     text_queries: str, match_mode: str = 'any', keyword: str = '', types: str = '', agency_code: str = '',
     consult_date_from: str = '', consult_date_to: str = '', progress_status: str = '완료',
     biz_gubun: str = '', stages: str = '협의의견', max_pages: int = 2, offset: int = 0, max_candidates: int = 30,
+    inference_notes: str = '', confirmed: bool = False, audit_sample_size: int = 0,
 ) -> dict:
     """필터(협의완료일 범위/진행상태 등)로 사업을 좁힌 뒤, 지정한 단계(기본 협의의견)의
     첨부 PDF 원문에서 키워드가 있는 사업만 골라 리스트로 반환한다. 후보가 적을 때(대략
     50건 이하) 한 번에 끝낼 수 있는 소규모 조회용이다 — 그보다 큰 후보군을 타임아웃 없이
     끝까지 훑으려면 eiass_start_document_keyword_scan(백그라운드 job)을 써라.
 
+    **실행 전 확인 필수**: confirmed=False(기본값)로 호출하면 실제 조회는 하지 않고,
+    적용될 검색조건/문서범위/예상 후보·문서 수/과거 패턴 힌트가 담긴 확인 문구
+    (confirmation_message)만 반환한다. 이걸 사용자에게 보여주고 승인을 받은 뒤,
+    **같은 조건 그대로에 confirmed=true만 추가**해서 다시 호출해야 실제로 실행된다.
+    사용자가 이미 조건을 구체적으로 다 말해서 확인이 필요 없다고 판단되더라도, 이 게이트를
+    건너뛰지 마라 — 특히 stages를 '본안'/'초안'처럼 넓히거나 types/biz_gubun을 AI가
+    추론해서 좁힌 경우는 반드시 확인받아야 한다.
+
     "최근 1년 내 협의완료된 사업 중 협의의견에 원형보전지 관련 내용이 있는 사업을 찾아줘"
-    같은 요청은 이 도구 하나로 처리한다:
+    같은 요청은 이 도구로 처리한다(먼저 confirmed=False로 확인 문구를 받고, 승인 후
+    confirmed=true로 재호출):
       eiass_find_projects_by_document_keyword(text_queries="원형보전지",
           consult_date_from="2025-07-09", consult_date_to="2026-07-09", progress_status="완료")
 
@@ -122,8 +182,12 @@ def eiass_find_projects_by_document_keyword(
     다른 키워드로 재조회해도 이미 받은 문서는 재다운로드하지 않는다.
 
     응답의 next_offset을 다음 호출의 offset으로 넘기면 이어서 검색한다(has_more=false가
-    될 때까지 반복). 후보군이 커서 여러 번 나눠 호출해야 한다면 처음부터
-    eiass_start_document_keyword_scan을 쓰는 편이 낫다.
+    될 때까지 반복 — 매 이어하기 호출도 confirmed=true를 유지해야 한다). 후보군이 커서
+    여러 번 나눠 호출해야 한다면 처음부터 eiass_start_document_keyword_scan을 쓰는 편이 낫다.
+
+    응답의 needs_refinement가 true면 매칭이 과도하거나 참고문헌/부록 문맥으로 보이는
+    비율이 높다는 뜻이다 — refinement_hint를 참고해 바로 최종 답을 내지 말고, 사용자에게
+    문맥 조건을 추가할지 물어봐라.
 
     주의: 부분문자열 매칭이다(예: '원형보전지'가 원문에 그대로 등장해야 함). 동의어나
     문맥상 유사 표현까지 잡으려면, 이 도구로 1차 후보를 좁힌 뒤 필요시 eiass_read_document로
@@ -134,7 +198,8 @@ def eiass_find_projects_by_document_keyword(
         text_queries: 문서 원문에서 찾을 문자열, 콤마 구분(예: '원형보전지' 또는 'CALPUFF,CMAQ').
         match_mode: 'any'(하나라도 포함되면 매칭) | 'all'(전부 포함돼야 매칭).
         keyword: 사업명 검색 키워드(선택). 비워도 날짜/상태 필터만으로 후보를 좁힐 수 있다.
-        types: 평가종류 코드 콤마 구분. 비우면 전체.
+        types: 평가종류 코드 콤마 구분. 비우면 전체 — 사용자가 특정 종류를 말하지 않았다면
+            비워두고, AI 판단으로 좁힐 경우 반드시 inference_notes에 남겨라.
         agency_code: 협의기관 코드(선택).
         consult_date_from/consult_date_to: 'YYYY-MM-DD'. 협의완료일 범위.
         progress_status: '완료' | '진행' | ''. 기본 '완료'(협의의견은 완료 건에만 존재).
@@ -144,16 +209,26 @@ def eiass_find_projects_by_document_keyword(
         max_pages: 평가종류별 최대 검색 페이지 수.
         offset: 후보 목록에서 시작할 위치(이어서 조회할 때 이전 응답의 next_offset을 넘긴다).
         max_candidates: 이번 호출에서 원문까지 내려받아 확인할 최대 후보 수(기본 30).
+        inference_notes: AI가 추론/제안해서 좁힌 조건이 있으면 그 내용과 이유(없으면 빈 문자열).
+        confirmed: 사용자 승인을 받았으면 true. false(기본값)면 미리보기만 반환하고 실행하지 않는다.
+        audit_sample_size: stages 밖의 다른 단계도 이번 배치 중 이 수만큼 표본 검증한다(기본 0=끔).
     """
     type_codes = [c.strip().upper() for c in types.split(',') if c.strip()] or None
     stage_list = tuple(s.strip() for s in stages.split(',') if s.strip()) or ('협의의견',)
     query_list = [q.strip() for q in text_queries.split(',') if q.strip()]
+    common_kwargs = dict(
+        match_mode=match_mode, keyword=keyword, type_codes=type_codes, agency_code=agency_code,
+        consult_date_from=consult_date_from or None, consult_date_to=consult_date_to or None,
+        progress_status=progress_status, biz_gubun=biz_gubun, stages=stage_list,
+        max_pages=max(1, min(max_pages, core.MAX_SEARCH_PAGES)),
+    )
     try:
+        if not confirmed:
+            return core.preview_document_keyword_search(
+                query_list, inference_notes=inference_notes, **common_kwargs)
         return core.search_projects_by_document_keyword(
-            query_list, match_mode=match_mode, keyword=keyword, type_codes=type_codes, agency_code=agency_code,
-            consult_date_from=consult_date_from or None, consult_date_to=consult_date_to or None,
-            progress_status=progress_status, biz_gubun=biz_gubun, stages=stage_list,
-            max_pages=max(1, min(max_pages, core.MAX_SEARCH_PAGES)), offset=offset, max_candidates=max_candidates,
+            query_list, offset=offset, max_candidates=max_candidates,
+            audit_sample_size=audit_sample_size, **common_kwargs,
         )
     except core.EiassError as exc:
         return {'error': str(exc)}
@@ -164,33 +239,50 @@ def eiass_start_document_keyword_scan(
     text_queries: str, match_mode: str = 'any', keyword: str = '', types: str = '', agency_code: str = '',
     consult_date_from: str = '', consult_date_to: str = '', progress_status: str = '완료',
     biz_gubun: str = '', stages: str = '협의의견', max_pages: int = 2, batch_size: int = 10,
+    inference_notes: str = '', confirmed: bool = False, audit_sample_size: int = 0,
 ) -> dict:
     """대량 후보(수십~수백 건)를 타임아웃 걱정 없이 끝까지 훑는 백그라운드 스캔을 시작한다.
     즉시 job_id를 반환하고, 실제 조회(사업 상세조회 + PDF 다운로드/추출 + 키워드 매칭)는
     서버 안에서 백그라운드로 계속 진행된다. eiass_get_scan_status(job_id)로 주기적으로
     진행 상황과 지금까지의 매칭 결과를 확인하라 — done이 될 때까지 몇 번이고 다시 불러도 된다.
+    상태조회/취소는 스캔이 실행 중이어도 즉시 응답한다(백그라운드 스레드와 별도로 처리됨).
+
+    **실행 전 확인 필수**: confirmed=False(기본값)면 스캔을 시작하지 않고 eiass_preview_search와
+    동일한 확인 문구만 반환한다. 사용자 승인 후 같은 조건 + confirmed=true로 다시 호출해야
+    실제 백그라운드 스캔이 시작된다.
 
     파라미터는 eiass_find_projects_by_document_keyword와 동일하되 offset/max_candidates
-    대신 batch_size(백그라운드 루프 1회당 처리 건수, 기본 10)를 쓴다.
+    대신 batch_size(백그라운드 루프 1회당 처리 건수, 기본 10)를 쓴다. needs_refinement 등
+    오탐 신호는 eiass_get_scan_status 결과의 각 배치 처리 시 누적되지 않으므로, 스캔이
+    끝난 뒤 eiass_find_projects_by_document_keyword로 소규모 재확인하거나 매칭 스니펫의
+    reference_like 필드를 직접 검토하라.
     """
     type_codes = [c.strip().upper() for c in types.split(',') if c.strip()] or None
     stage_list = tuple(s.strip() for s in stages.split(',') if s.strip()) or ('협의의견',)
     query_list = [q.strip() for q in text_queries.split(',') if q.strip()]
+    common_kwargs = dict(
+        match_mode=match_mode, keyword=keyword, type_codes=type_codes, agency_code=agency_code,
+        consult_date_from=consult_date_from or None, consult_date_to=consult_date_to or None,
+        progress_status=progress_status, biz_gubun=biz_gubun, stages=stage_list,
+        max_pages=max(1, min(max_pages, core.MAX_SEARCH_PAGES)),
+    )
+    if not confirmed:
+        try:
+            return core.preview_document_keyword_search(query_list, inference_notes=inference_notes, **common_kwargs)
+        except core.EiassError as exc:
+            return {'error': str(exc)}
 
     job_id = uuid.uuid4().hex[:12]
     job = {
         'status': 'running', 'checked': 0, 'candidates_total': None,
         'matches': [], 'skipped': [], 'error': None, 'cancel': False,
+        'stage_stats': {}, 'needs_refinement': False, 'refinement_hints': [], 'audit_samples': [],
     }
     with _jobs_lock:
         _jobs[job_id] = job
 
-    kwargs = dict(
-        text_queries=query_list, match_mode=match_mode, keyword=keyword, type_codes=type_codes,
-        agency_code=agency_code, consult_date_from=consult_date_from or None, consult_date_to=consult_date_to or None,
-        progress_status=progress_status, biz_gubun=biz_gubun, stages=stage_list,
-        max_pages=max(1, min(max_pages, core.MAX_SEARCH_PAGES)), max_candidates=max(1, batch_size),
-    )
+    kwargs = dict(text_queries=query_list, max_candidates=max(1, batch_size),
+                   audit_sample_size=audit_sample_size, **common_kwargs)
     threading.Thread(target=_run_scan_job, args=(job_id, kwargs), daemon=True).start()
     return {'job_id': job_id, 'status': 'running'}
 
@@ -198,7 +290,13 @@ def eiass_start_document_keyword_scan(
 @mcp.tool()
 def eiass_get_scan_status(job_id: str, include_matches: bool = True) -> dict:
     """eiass_start_document_keyword_scan이 반환한 job_id로 진행 상황과 지금까지의 매칭
-    결과를 조회한다. status는 'running' | 'done' | 'cancelled' | 'error'."""
+    결과를 조회한다(스캔이 running이어도 즉시 응답한다). status는
+    'running' | 'done' | 'cancelled' | 'error'.
+
+    needs_refinement가 true면 매칭이 과도하거나 참고문헌/부록 문맥으로 보이는 매칭이 많다는
+    뜻이다 — refinement_hints를 참고해 스캔 결과를 그대로 최종 답으로 쓰지 말고, 사용자에게
+    문맥 조건 추가 여부를 먼저 확인하라. audit_samples는 stages 밖 표본 검증 결과(요청 시)다.
+    """
     with _jobs_lock:
         job = _jobs.get(job_id)
         if not job:
@@ -209,6 +307,10 @@ def eiass_get_scan_status(job_id: str, include_matches: bool = True) -> dict:
             'candidates_total': job['candidates_total'],
             'match_count': len(job['matches']),
             'skipped_count': len(job['skipped']),
+            'stage_stats': dict(job['stage_stats']),
+            'needs_refinement': job['needs_refinement'],
+            'refinement_hints': list(dict.fromkeys(job['refinement_hints'])),
+            'audit_samples': list(job['audit_samples']),
             'error': job['error'],
         }
         if include_matches:

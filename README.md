@@ -7,14 +7,34 @@
 | 도구 | 기능 |
 |---|---|
 | `eiass_search_projects` | 사업명/협의완료일 범위/진행상태/기후변화영향평가/업종 등 필터로 사업 검색 |
-| `eiass_find_projects_by_document_keyword` | 필터로 후보를 좁힌 뒤, 지정 단계(기본 협의의견) 원문에서 키워드가 있는 사업만 추려서 반환. 소규모(~50건) 조회용, `offset`으로 이어서 조회 가능 |
-| `eiass_start_document_keyword_scan` | 대량 후보(수백 건)를 타임아웃 없이 끝까지 훑는 백그라운드 스캔 시작. 즉시 `job_id` 반환 |
-| `eiass_get_scan_status` | `job_id`로 스캔 진행 상황·중간/최종 매칭 결과 조회 |
-| `eiass_cancel_scan` | 진행 중인 백그라운드 스캔 취소 |
+| `eiass_preview_search` | 실제 조회 없이 검색조건/문서범위/예상 후보·문서 수/과거 패턴 힌트를 확인 문구로 반환 |
+| `eiass_find_projects_by_document_keyword` | 필터로 후보를 좁힌 뒤, 지정 단계(기본 협의의견) 원문에서 키워드가 있는 사업만 추려서 반환. `confirmed=true` 없이는 미리보기만 반환(아래 "실행 전 확인" 참고). 소규모(~50건) 조회용, `offset`으로 이어서 조회 가능 |
+| `eiass_start_document_keyword_scan` | 대량 후보(수백 건)를 타임아웃 없이 끝까지 훑는 백그라운드 스캔 시작. `confirmed=true`일 때만 실제로 시작하고 즉시 `job_id` 반환 |
+| `eiass_get_scan_status` | `job_id`로 스캔 진행 상황·중간/최종 매칭 결과 조회(스캔 중에도 즉시 응답) |
+| `eiass_cancel_scan` | 진행 중인 백그라운드 스캔 취소(즉시 응답) |
 | `eiass_get_project_documents` | 사업 개요 필드 + 단계별(초안/본안/협의의견 등) 첨부문서 목록 조회 |
 | `eiass_read_document` | 첨부 PDF를 다운로드해 텍스트 추출(로컬 캐시 우선) |
 | `eiass_check_protected_area_adjacency` | 주소 → 지오코딩 → 반경 내 KDPA 보호지역(국립공원/천연기념물/습지보호지역/야생생물보호구역/OECM) 조회 |
 | `eiass_geocode` | 주소 → 경위도 좌표 |
+
+### 실행 전 확인(confirm) 게이트
+
+`eiass_find_projects_by_document_keyword`/`eiass_start_document_keyword_scan`은 **`confirmed=true`를 명시적으로 넘기지 않으면 실제로 문서를 다운로드하지 않는다.** 대신 아래를 담은 확인 문구를 반환한다:
+- 적용될 검색 조건(평가종류/업종/협의완료일/진행상태/협의기관) — 사용자가 언급하지 않은 필터는 항상 `전체`로 표시
+- AI가 사용자 발화 이상으로 추론/제안해서 좁힌 조건이 있다면 `inference_notes`로 별도 표시(비워두면 "AI가 임의로 좁힌 조건 없음")
+- 확인할 문서 범위(stages)와 키워드 매칭 방식
+- 예상 후보 수, 예상 문서 수(표본 추정)
+- 과거 유사 조건(같은 평가종류+업종) 기록이 있으면 우선순위 힌트로만 표시 — **검색 범위를 줄이는 근거로 쓰지 않으며, 신뢰도(표본 수 기준 low/medium/high)를 함께 표시한다**
+
+사용자 승인 후 **같은 조건 그대로 `confirmed=true`만 추가**해서 다시 호출해야 실제로 실행된다.
+
+### 오탐(참고문헌/부록) 감지와 대응
+
+실행 결과에는 `needs_refinement`(매칭이 과도하거나 참고문헌/부록 문맥으로 보이는 비율이 높으면 true)와 `refinement_hint`가 포함된다. true면 바로 최종 답을 내지 말고 사용자에게 문맥 조건 추가 여부를 물어봐야 한다. 각 `matched_snippets` 항목에도 `reference_like` 플래그가 있어 개별 매칭이 본문인지 참고문헌류인지 구분할 수 있다.
+
+### 범위 밖 표본 검증 (scan scope audit)
+
+`audit_sample_size`(기본 0)를 지정하면, 요청한 stages 밖의 다른 단계도 이번 배치 중 일부를 표본 검증해 `audit_sample`로 함께 반환한다. 좁힌 범위 밖에서도 매칭이 있을 수 있다는 걸 알려주는 안전장치이며, 전수조사가 아니므로 "매칭 없음"이 "확실히 없음"을 뜻하지는 않는다.
 
 ### 대량 문서 키워드 검색이 빨라진 이유
 
@@ -22,6 +42,7 @@
 - `text_queries="CALPUFF,CMAQ"`처럼 **여러 키워드를 한 번에** 넘기면 문서를 한 번만 열어서 전부 확인한다(키워드 수만큼 반복 다운로드하지 않음).
 - 같은 후보군을 **다른 키워드로 다시 조회**하거나 `offset`으로 **이어서 조회**해도 이미 받은 문서는 재다운로드하지 않는다 (실측: 같은 배치를 다른 키워드로 재조회 시 5초대 → 0.3초대).
 - 후보가 많아 한 번의 호출로는 끝낼 수 없을 때는 `eiass_start_document_keyword_scan`으로 백그라운드에 맡기고 `eiass_get_scan_status`로 폴링하면, MCP 호출 하나의 타임아웃과 무관하게 끝까지 진행된다.
+- 같은 (평가종류+업종) 조합으로 실제 실행된 검색은 단계별 확인/매칭 건수가 로컬 패턴 캐시에 누적되어, 다음 유사 요청의 `eiass_preview_search`에서 우선순위 힌트로 쓰인다(범위 축소 근거로는 쓰이지 않음).
 
 ## 설치 — 방법 1: exe로 실행 (Python 설치 불필요, 추천)
 

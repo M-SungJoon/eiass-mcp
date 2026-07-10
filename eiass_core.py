@@ -14,6 +14,7 @@ KDPA 인접 조회는 원본에 없던 반경(DWITHIN) 서버측 공간필터를
 PyInstaller로 mcp_server.py를 exe화해서 배포할 수 있다(build_mcp.py 참고) — Python
 설치 없이도 이 exe 하나만으로 MCP 서버가 동작한다.
 """
+import hashlib
 import json
 import math
 import os
@@ -98,6 +99,8 @@ STAGE_MAP = {
     '변경': '변경',
 }
 
+ALL_KNOWN_STAGES = ('초안', '본안', '협의의견', '협의후조치', '사후조사', '보완', '변경')
+
 
 # ── .env 설정 (원본 dotenv_paths()/read_dotenv_values()와 동일 위치를 조회한다) ──
 
@@ -178,6 +181,112 @@ def _page_for_offset(page_offsets, char_index):
         if char_index < cum:
             return i + 1
     return len(page_offsets) if page_offsets else None
+
+
+# ── 패턴 캐시 (요청 조건별 "어느 단계에서 매칭이 잘 나왔는지" 기록) ──
+# 중요: 이 캐시는 "우선 확인 순서" 힌트로만 쓴다. 검색 범위를 자동으로 줄이는 근거로 쓰면
+# 안 된다 — 신뢰도(표본 수)가 낮으면 반드시 low로 표시하고, 호출부(AI)가 이를 이유로
+# 임의로 단계를 생략하지 않도록 preview 단계에서 항상 "우선순위일 뿐" 문구를 같이 반환한다.
+
+def _pattern_signature(type_codes, biz_gubun):
+    key = json.dumps({'types': sorted(type_codes or []), 'biz_gubun': (biz_gubun or '').strip()},
+                      sort_keys=True, ensure_ascii=False)
+    return hashlib.sha1(key.encode('utf-8')).hexdigest()[:16]
+
+
+def _pattern_cache_connect():
+    conn = sqlite3.connect(_cache_db_path(), timeout=30)
+    conn.execute('PRAGMA journal_mode=WAL')
+    conn.execute('''
+        CREATE TABLE IF NOT EXISTS pattern_cache (
+            signature TEXT NOT NULL,
+            stage TEXT NOT NULL,
+            checked_count INTEGER NOT NULL DEFAULT 0,
+            matched_count INTEGER NOT NULL DEFAULT 0,
+            updated_at TEXT NOT NULL,
+            PRIMARY KEY (signature, stage)
+        )
+    ''')
+    return conn
+
+
+def pattern_cache_record(type_codes, biz_gubun, stage_stats):
+    """stage_stats: {stage: {'checked': N, 'matched': M}}. 실제로 실행된(확인 완료된)
+    검색이 끝날 때마다 호출해 다음 유사 요청의 우선순위 힌트를 누적한다."""
+    if not stage_stats:
+        return
+    sig = _pattern_signature(type_codes, biz_gubun)
+    now = datetime.utcnow().isoformat()
+    with _CACHE_LOCK:
+        conn = _pattern_cache_connect()
+        try:
+            for stage, stats in stage_stats.items():
+                checked = int(stats.get('checked', 0))
+                matched = int(stats.get('matched', 0))
+                if checked <= 0:
+                    continue
+                conn.execute('''
+                    INSERT INTO pattern_cache (signature, stage, checked_count, matched_count, updated_at)
+                    VALUES (?, ?, ?, ?, ?)
+                    ON CONFLICT(signature, stage) DO UPDATE SET
+                        checked_count = checked_count + excluded.checked_count,
+                        matched_count = matched_count + excluded.matched_count,
+                        updated_at = excluded.updated_at
+                ''', (sig, stage, checked, matched, now))
+            conn.commit()
+        finally:
+            conn.close()
+
+
+def pattern_cache_lookup(type_codes, biz_gubun, min_samples_for_medium=5, min_samples_for_high=20):
+    """(평가종류, 업종) 조합 기준 과거 기록을 매칭률 순으로 반환한다.
+    confidence는 표본 수 기준: checked_count < min_samples_for_medium -> 'low'
+    (반드시 저신뢰로 취급, 자동 범위축소 근거 금지), 그 이상 -> 'medium'/'high'."""
+    sig = _pattern_signature(type_codes, biz_gubun)
+    with _CACHE_LOCK:
+        conn = _pattern_cache_connect()
+        try:
+            rows = conn.execute(
+                'SELECT stage, checked_count, matched_count FROM pattern_cache WHERE signature = ?', (sig,)
+            ).fetchall()
+        finally:
+            conn.close()
+    result = []
+    for stage, checked, matched in rows:
+        if checked < min_samples_for_medium:
+            confidence = 'low'
+        elif checked < min_samples_for_high:
+            confidence = 'medium'
+        else:
+            confidence = 'high'
+        result.append({
+            'stage': stage, 'checked_count': checked, 'matched_count': matched,
+            'match_rate': round(matched / checked, 3) if checked else 0.0,
+            'confidence': confidence,
+        })
+    result.sort(key=lambda r: r['match_rate'], reverse=True)
+    return result
+
+
+# ── 키워드 오탐(참고문헌/부록 등) 휴리스틱 ──
+
+_REFERENCE_MARKERS_RE = re.compile(
+    r'참고\s*문헌|참고자료|Reference|References|인용\s*문헌|서지사항|부록\s*[0-9IVXA-Z]*\s*[:\.]|Appendix'
+)
+_CITATION_LIST_RE = re.compile(r'\(\d{4}\)|\[\d+\]|et al\.')
+
+
+def _is_reference_like_context(text, idx, window=400):
+    """매칭 지점 주변이 참고문헌/부록/인용 목록처럼 보이면 True.
+    완벽하지 않은 휴리스틱이며, needs_refinement 판단의 입력값 중 하나일 뿐이다."""
+    start = max(0, idx - window)
+    end = min(len(text), idx + window)
+    ctx = text[start:end]
+    if _REFERENCE_MARKERS_RE.search(ctx):
+        return True
+    if len(_CITATION_LIST_RE.findall(ctx)) >= 2:
+        return True
+    return False
 
 
 def dotenv_paths():
@@ -1152,6 +1261,117 @@ def download_document_text(file_seq, session=None, max_chars=20000):
     }
 
 
+def preview_document_keyword_search(
+    text_queries,
+    match_mode='any',
+    keyword='',
+    type_codes=None,
+    agency_code='',
+    consult_date_from=None,
+    consult_date_to=None,
+    progress_status='완료',
+    biz_gubun='',
+    stages=('협의의견',),
+    max_pages=2,
+    inference_notes='',
+    sample_detail_count=15,
+    session=None,
+):
+    """실제 문서를 다운로드하지 않고 후보 수/예상 문서 수/과거 패턴 우선순위를 미리 계산해
+    확인 문구(confirmation_message)를 만든다. eiass_find_projects_by_document_keyword /
+    eiass_start_document_keyword_scan은 confirmed=True 없이 호출되면 이 함수와 동일한
+    내용을 반환하고 실제 조회(다운로드)는 하지 않는다 — "실행 전 확인" 게이트.
+
+    inference_notes: 사용자가 직접 말하지 않았는데 AI가 추론/제안해서 좁힌 조건이 있다면
+    그 내용을 자연어로 채운다(예: "평가종류를 환경영향평가로만 좁혔습니다 — 사용자는 '산업단지
+    사례'라고만 했음"). 비워두면 "AI 추론 조건 없음"으로 취급된다 — 즉 사용자가 말하지 않은
+    필터는 기본적으로 전체(None/'')로 두고, 좁힐 때만 이 필드로 그 사실을 명시해야 한다.
+    """
+    if isinstance(text_queries, str):
+        text_queries = [text_queries]
+    text_queries = [q for q in (text_queries or []) if q]
+    if not text_queries:
+        raise EiassError('text_queries에 검색어를 하나 이상 지정해야 합니다.')
+
+    session = session or _session()
+    candidates = search_projects(
+        keyword, type_codes=type_codes, agency_code=agency_code, max_pages=max_pages, session=session,
+        consult_date_from=consult_date_from, consult_date_to=consult_date_to, progress_status=progress_status,
+        biz_gubun=biz_gubun,
+    )
+    total = len(candidates)
+
+    # 문서 수는 표본만 상세조회(다운로드 없음, 캐시 활용)해서 추정한다.
+    sample = candidates[:max(0, sample_detail_count)]
+    sample_doc_counts = []
+    for item in sample:
+        try:
+            detail = get_project_detail(item['view_type'], item['eia_cd'], item['revirpt_seq'],
+                                         session=session, use_cache=True)
+        except Exception:
+            continue
+        n = sum(1 for st in stages for files in (detail['stage_docs'].get(st) or {}).values()
+                for f in files if f.get('is_pdf'))
+        sample_doc_counts.append(n)
+    avg_docs = (sum(sample_doc_counts) / len(sample_doc_counts)) if sample_doc_counts else None
+    estimated_documents = round(avg_docs * total) if avg_docs is not None else None
+
+    pattern = pattern_cache_lookup(type_codes, biz_gubun)
+    pattern_note = (
+        '과거 유사 조건(같은 평가종류+업종 조합) 기록이 있습니다. 아래 우선순위는 참고용 힌트일 뿐이며, '
+        '검색 범위를 줄이는 근거로 쓰지 않습니다 — 요청한 stages는 전부 그대로 확인합니다.'
+        if pattern else '이 조건 조합(평가종류+업종)에 대한 과거 기록이 아직 없습니다.'
+    )
+
+    type_label = ', '.join(TYPE_NAME_MAP.get(t, t) for t in type_codes) if type_codes else \
+        '전체(전략환경영향평가/환경영향평가/소규모환경영향평가/사후환경영향조사/사전환경성검토)'
+    biz_label = biz_gubun or '전체'
+    agency_label = agency_code or '전체'
+    date_label = f"{consult_date_from or '제한없음'} ~ {consult_date_to or '제한없음'}"
+
+    lines = [
+        f"적용할 검색 조건 — 평가종류: `{type_label}` / 업종: `{biz_label}` / "
+        f"협의완료일: `{date_label}` / 진행상태: `{progress_status or '전체'}` / 협의기관: `{agency_label}`",
+        f"확인할 문서 범위: `{'/'.join(stages)}` 단계, 키워드 매칭 방식: {match_mode} "
+        f"({', '.join(text_queries)})",
+        f"예상 후보 사업 수: {total}건" + (
+            f", 예상 확인 문서 수: 약 {estimated_documents}건 (표본 {len(sample_doc_counts)}건 기준 추정)"
+            if estimated_documents is not None else ", 예상 문서 수: 표본 추정 실패(상세조회 오류)"
+        ),
+    ]
+    if inference_notes:
+        lines.append(f"※ 사용자가 직접 말하지 않고 AI가 추론/제안한 조건: {inference_notes}")
+    else:
+        lines.append("※ AI가 임의로 좁힌 조건 없음 — 언급되지 않은 필터는 전체로 적용했습니다.")
+    if pattern:
+        top = pattern[0]
+        lines.append(
+            f"과거 유사 조건에서는 `{top['stage']}` 단계 매칭률이 {top['match_rate']:.0%}"
+            f"(신뢰도: {top['confidence']}, 표본 {top['checked_count']}건)로 가장 높았습니다 — "
+            f"우선 확인 순서 참고용이며, 다른 단계를 생략하지는 않습니다."
+        )
+    lines.append("이 조건으로 진행할까요? 승인하시면 같은 조건에 confirmed=true를 더해 다시 호출하겠습니다.")
+
+    return {
+        'candidates_total': total,
+        'estimated_documents': estimated_documents,
+        'document_count_sample_size': len(sample_doc_counts),
+        'pattern_cache': pattern,
+        'pattern_cache_note': pattern_note,
+        'applied_filters': {
+            'keyword': keyword or None, 'types': type_codes or 'ALL', 'agency_code': agency_code or 'ALL',
+            'consult_date_from': consult_date_from, 'consult_date_to': consult_date_to,
+            'progress_status': progress_status or 'ALL', 'biz_gubun': biz_gubun or 'ALL',
+        },
+        'inference_notes': inference_notes or None,
+        'stages_to_check': list(stages),
+        'text_queries': text_queries,
+        'match_mode': match_mode,
+        'confirm_required': True,
+        'confirmation_message': '\n'.join(lines),
+    }
+
+
 def search_projects_by_document_keyword(
     text_queries,
     match_mode='any',
@@ -1168,32 +1388,48 @@ def search_projects_by_document_keyword(
     max_candidates=30,
     session=None,
     snippet_chars=250,
+    audit_sample_size=0,
+    record_pattern=True,
 ):
     """검색 필터(협의완료일 범위/진행상태 등)로 후보 사업을 뽑은 뒤, 지정한 단계(기본값
     '협의의견')의 첨부 PDF 원문에서 text_queries 키워드가 있는 사업만 골라낸다.
 
+    이 함수는 실제로 문서를 다운로드하는 "실행" 단계다 — MCP 도구 계층
+    (eiass_find_projects_by_document_keyword / eiass_start_document_keyword_scan)은
+    confirmed=True가 아니면 이 함수 대신 preview_document_keyword_search를 호출해서
+    사용자 확인을 먼저 받도록 게이트를 건다.
+
     후보 전체(candidates_total)를 한 번에 다 훑지 않고 offset부터 max_candidates개만
-    처리한다. 응답의 next_offset을 다음 호출의 offset으로 넘기면 이어서 진행할 수 있다
-    (has_more가 False면 끝까지 다 본 것). 대량 후보군을 타임아웃 없이 훑으려면
-    search_projects_by_document_keyword를 직접 반복 호출하는 대신
-    eiass_start_document_keyword_scan(백그라운드 job)을 쓰는 편이 낫다.
+    처리한다. 응답의 next_offset을 다음 호출의 offset으로 넘기면 이어서 진행할 수 있다.
 
     text_queries는 문자열 또는 리스트. 여러 키워드를 한 번의 PDF 다운로드/추출로 함께
-    확인한다(문서를 키워드 수만큼 반복 다운로드하지 않음). match_mode='any'면 하나라도
-    있으면 매칭, 'all'이면 전부 있어야 매칭.
+    확인한다. match_mode='any'면 하나라도 있으면 매칭, 'all'이면 전부 있어야 매칭.
 
-    같은 file_seq의 PDF는 로컬 SQLite 캐시(_get_full_document_text)에 저장되므로, 같은
-    후보군을 다른 키워드로 다시 조회하거나 offset을 이어서 조회할 때 재다운로드하지 않는다.
+    같은 file_seq의 PDF/상세조회는 로컬 캐시를 타므로, 같은 후보군을 다른 키워드로
+    다시 조회하거나 offset을 이어서 조회할 때 재다운로드하지 않는다.
 
-    주의: 단순 부분문자열(포함) 매칭이다. 동의어(예: "원형보전지" vs "존치녹지")나 문맥상
-    유사 내용까지 잡으려면, 이 함수로 1차 후보를 좁힌 뒤 eiass_read_document로 원문을
-    받아 AI가 다시 의미 단위로 판단해야 한다. stages를 ('초안','본안') 등으로 넓히면
-    검토의견/본문에서도 검색할 수 있지만 다운로드량이 늘어 느려진다.
+    audit_sample_size>0이면, 이번 배치(batch) 중 그만큼을 골라 stages에 포함되지 않은
+    다른 단계도 표본 검증한다(결과의 'audit_sample'). "지정 범위 밖은 아예 안 본다"가
+    되지 않도록 하는 안전장치이며, 전수조사가 아니므로 없다고 단정하지는 않는다.
+
+    record_pattern=True(기본)면 이번 실행 결과(단계별 확인/매칭 건수)를 로컬 패턴
+    캐시에 누적한다 — 다음 유사 조건 요청의 preview에서 우선순위 힌트로만 쓰인다.
+
+    주의: 단순 부분문자열(포함) 매칭이다. 동의어나 문맥상 유사 내용까지 잡으려면,
+    이 함수로 1차 후보를 좁힌 뒤 eiass_read_document로 원문을 받아 AI가 다시 의미
+    단위로 판단해야 한다. 결과의 needs_refinement가 true면 매칭이 과도하거나
+    참고문헌/부록 문맥으로 보이는 비율이 높다는 뜻이니, 바로 최종 답을 내지 말고
+    사용자에게 문맥 조건 추가 여부를 물어보라.
 
     반환: {'candidates_total', 'offset', 'checked', 'next_offset', 'has_more',
         'skipped': [{'name','eia_cd','reason'}, ...],
         'matches': [{..search_projects 항목.., 'fields': {...}, 'matched_keywords': [...],
-                     'matched_snippets': [{'file','seq','keyword','page_estimate','snippet'}]}]}
+                     'matched_snippets': [{'file','seq','stage','keyword','page_estimate',
+                                            'snippet','reference_like'}]}],
+        'stage_stats': {stage: {'checked','matched'}},
+        'needs_refinement', 'refinement_hint',
+        'audit_sample': {...} | None,
+        'search_summary': '...'}
     """
     if isinstance(text_queries, str):
         text_queries = [text_queries]
@@ -1212,8 +1448,12 @@ def search_projects_by_document_keyword(
     total = len(candidates)
     batch = candidates[offset:offset + max_candidates]
 
+    stage_stats = {stage: {'checked': 0, 'matched': 0} for stage in stages}
     matches = []
     skipped = []
+    total_snippets = 0
+    reference_like_snippets = 0
+
     for item in batch:
         try:
             detail = get_project_detail(item['view_type'], item['eia_cd'], item['revirpt_seq'],
@@ -1222,37 +1462,52 @@ def search_projects_by_document_keyword(
             skipped.append({'name': item['name'], 'eia_cd': item['eia_cd'], 'reason': f'상세조회 실패: {exc}'})
             continue
         stage_docs = detail['stage_docs']
-        target_files = []
+
+        any_stage_has_files = False
+        matched_snippets = []
+        matched_keywords = set()
         for stage in stages:
-            for files in (stage_docs.get(stage) or {}).values():
-                target_files.extend(f for f in files if f.get('is_pdf'))
-        if not target_files:
+            files = [f for cat_files in (stage_docs.get(stage) or {}).values()
+                     for f in cat_files if f.get('is_pdf')]
+            if not files:
+                continue
+            any_stage_has_files = True
+            stage_stats[stage]['checked'] += 1
+            stage_had_match = False
+            for f in files:
+                try:
+                    doc = _get_full_document_text(f['seq'], session=session)
+                except Exception as exc:
+                    skipped.append({'name': item['name'], 'eia_cd': item['eia_cd'],
+                                     'reason': f"{f['name']} 다운로드/추출 실패: {exc}"})
+                    continue
+                text = doc['text']
+                for q in text_queries:
+                    idx = text.find(q)
+                    if idx == -1:
+                        continue
+                    matched_keywords.add(q)
+                    stage_had_match = True
+                    total_snippets += 1
+                    ref_like = _is_reference_like_context(text, idx)
+                    if ref_like:
+                        reference_like_snippets += 1
+                    start = max(0, idx - snippet_chars // 2)
+                    end = min(len(text), idx + len(q) + snippet_chars // 2)
+                    matched_snippets.append({
+                        'file': f['name'], 'seq': f['seq'], 'stage': stage, 'keyword': q,
+                        'page_estimate': _page_for_offset(doc['page_offsets'], idx),
+                        'snippet': text[start:end].strip(),
+                        'reference_like': ref_like,
+                    })
+            if stage_had_match:
+                stage_stats[stage]['matched'] += 1
+
+        if not any_stage_has_files:
             skipped.append({'name': item['name'], 'eia_cd': item['eia_cd'],
                              'reason': f"{'/'.join(stages)} 단계에 PDF 첨부문서 없음"})
             continue
 
-        matched_snippets = []
-        matched_keywords = set()
-        for f in target_files:
-            try:
-                doc = _get_full_document_text(f['seq'], session=session)
-            except Exception as exc:
-                skipped.append({'name': item['name'], 'eia_cd': item['eia_cd'],
-                                 'reason': f"{f['name']} 다운로드/추출 실패: {exc}"})
-                continue
-            text = doc['text']
-            for q in text_queries:
-                idx = text.find(q)
-                if idx == -1:
-                    continue
-                matched_keywords.add(q)
-                start = max(0, idx - snippet_chars // 2)
-                end = min(len(text), idx + len(q) + snippet_chars // 2)
-                matched_snippets.append({
-                    'file': f['name'], 'seq': f['seq'], 'keyword': q,
-                    'page_estimate': _page_for_offset(doc['page_offsets'], idx),
-                    'snippet': text[start:end].strip(),
-                })
         is_match = (matched_keywords == set(text_queries)) if match_mode == 'all' else bool(matched_keywords)
         if is_match:
             matches.append({
@@ -1262,6 +1517,80 @@ def search_projects_by_document_keyword(
 
     checked = len(batch)
     next_offset = offset + checked if (offset + checked) < total else None
+
+    # 오탐 가능성 휴리스틱: 매칭률이 너무 높거나, 매칭된 문맥 상당수가 참고문헌/부록처럼 보이면
+    # 바로 최종 답을 내지 말고 사용자에게 문맥 구체화를 물어보라는 신호를 준다.
+    match_rate = (len(matches) / checked) if checked else 0.0
+    reference_like_ratio = (reference_like_snippets / total_snippets) if total_snippets else 0.0
+    needs_refinement = checked >= 5 and (match_rate > 0.5 or reference_like_ratio > 0.4)
+    refinement_hint = None
+    if needs_refinement:
+        refinement_hint = (
+            f"매칭률이 높거나({match_rate:.0%}) 매칭된 문맥 중 참고문헌/부록처럼 보이는 비율이 높습니다"
+            f"({reference_like_ratio:.0%}, {reference_like_snippets}/{total_snippets}건). "
+            f"최종 답변 전에 실제 의도(예: 특정 단계에서 적용한 모델/기법인지)를 좁히는 문맥 키워드를 "
+            f"추가할지 사용자에게 확인하는 것을 권장합니다."
+        )
+
+    # scan_scope_audit: 지정 stages 밖의 다른 단계도 이번 배치 중 일부는 표본 검증한다.
+    audit_sample = None
+    if audit_sample_size > 0:
+        other_stages = [s for s in ALL_KNOWN_STAGES if s not in stages]
+        if other_stages:
+            audit_candidates = batch[:audit_sample_size]
+            audit_matches = []
+            audit_checked = 0
+            for item in audit_candidates:
+                try:
+                    detail = get_project_detail(item['view_type'], item['eia_cd'], item['revirpt_seq'],
+                                                 session=session, use_cache=True)
+                except Exception:
+                    continue
+                files = [f for st in other_stages for cat_files in (detail['stage_docs'].get(st) or {}).values()
+                         for f in cat_files if f.get('is_pdf')]
+                if not files:
+                    continue
+                audit_checked += 1
+                for f in files[:3]:
+                    try:
+                        doc = _get_full_document_text(f['seq'], session=session)
+                    except Exception:
+                        continue
+                    text = doc['text']
+                    for q in text_queries:
+                        idx = text.find(q)
+                        if idx != -1:
+                            audit_matches.append({'name': item['name'], 'stage': '/'.join(other_stages),
+                                                   'file': f['name'], 'keyword': q})
+            audit_sample = {
+                'other_stages_checked': other_stages,
+                'candidates_sampled': len(audit_candidates),
+                'documents_checked': audit_checked,
+                'matches_found': audit_matches,
+                'note': '지정한 stages 밖에서 표본만 검증한 결과입니다. 전수조사가 아니므로 매칭이 '
+                        '없어도 완전히 없다고 단정할 수 없습니다.',
+            }
+
+    if record_pattern:
+        try:
+            pattern_cache_record(type_codes, biz_gubun, stage_stats)
+        except Exception:
+            pass  # 캐시 기록 실패는 검색 결과에 영향 주지 않음
+
+    summary_parts = [
+        f"검색조건: 평가종류={type_codes or '전체'}, 업종={biz_gubun or '전체'}, "
+        f"협의완료일={consult_date_from or '제한없음'}~{consult_date_to or '제한없음'}, "
+        f"진행상태={progress_status or '전체'}",
+        f"확인범위: {'/'.join(stages)} 단계, 이번 배치 {offset}~{offset + checked - 1} "
+        f"(전체 후보 {total}건 중 {checked}건 확인, {'남은 후보 있음' if next_offset is not None else '전체 확인 완료'})",
+        f"결과: 매칭 {len(matches)}건 / 미확인·제외 {len(skipped)}건",
+    ]
+    if audit_sample:
+        summary_parts.append(
+            f"범위 밖 표본검증: {'/'.join(audit_sample['other_stages_checked'])} 단계 "
+            f"{audit_sample['documents_checked']}건 확인, 매칭 {len(audit_sample['matches_found'])}건"
+        )
+
     return {
         'candidates_total': total,
         'offset': offset,
@@ -1270,6 +1599,11 @@ def search_projects_by_document_keyword(
         'has_more': next_offset is not None,
         'skipped': skipped,
         'matches': matches,
+        'stage_stats': stage_stats,
+        'needs_refinement': needs_refinement,
+        'refinement_hint': refinement_hint,
+        'audit_sample': audit_sample,
+        'search_summary': ' | '.join(summary_parts),
     }
 
 
