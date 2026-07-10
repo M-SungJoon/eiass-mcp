@@ -112,7 +112,8 @@ def eiass_search_projects(keyword: str = '', types: str = '', agency_code: str =
 def eiass_preview_search(
     text_queries: str, match_mode: str = 'any', keyword: str = '', types: str = '', agency_code: str = '',
     consult_date_from: str = '', consult_date_to: str = '', progress_status: str = '완료',
-    biz_gubun: str = '', stages: str = '협의의견', max_pages: int = 2, inference_notes: str = '',
+    biz_gubun: str = '', stages: str = '협의의견', doc_title_contains: str = '', max_pages: int = 2,
+    inference_notes: str = '',
 ) -> dict:
     """실제로 문서를 다운로드하지 않고, 이 조건으로 검색하면 무엇을 하게 될지 미리 보여준다.
     eiass_find_projects_by_document_keyword / eiass_start_document_keyword_scan을
@@ -132,6 +133,11 @@ def eiass_preview_search(
         keyword/types/agency_code/consult_date_from/consult_date_to/progress_status/biz_gubun/stages/max_pages:
             eiass_find_projects_by_document_keyword와 동일. 사용자가 말하지 않은 조건은 비워두면
             '전체'로 표시된다(임의로 좁혀서 넘기지 말 것).
+        doc_title_contains: stages 범위 안에서 파일명에 포함되어야 할 문자열, 콤마 구분(예:
+            '대기질,기상'). 초안~보완 등 여러 단계를 다 열어보지 않고, 그 안에서도 제목에
+            해당 단어가 들어간 문서(챕터별 PDF 파일명에 항목명이 그대로 들어있음, 예:
+            '0922 대기질(...).pdf')만 확인 대상으로 좁힐 때 쓴다. 파일명 문자열 매칭이라
+            실제 표기와 다른 용어를 쓰면 놓칠 수 있다 — 예상 문서 수가 이상하면 용어를 바꿔보라.
         inference_notes: 사용자가 직접 말하지 않았는데 AI가 추론/제안해서 좁힌 조건이 있다면
             그 내용과 이유를 여기 적는다(예: "평가종류를 환경영향평가로 좁혔습니다 — 사용자는
             '산업단지 사례'라고만 했음"). 없으면 빈 문자열로 둔다.
@@ -139,11 +145,13 @@ def eiass_preview_search(
     type_codes = [c.strip().upper() for c in types.split(',') if c.strip()] or None
     stage_list = tuple(s.strip() for s in stages.split(',') if s.strip()) or ('협의의견',)
     query_list = [q.strip() for q in text_queries.split(',') if q.strip()]
+    title_terms = [t.strip() for t in doc_title_contains.split(',') if t.strip()] or None
     try:
         return core.preview_document_keyword_search(
             query_list, match_mode=match_mode, keyword=keyword, type_codes=type_codes, agency_code=agency_code,
             consult_date_from=consult_date_from or None, consult_date_to=consult_date_to or None,
             progress_status=progress_status, biz_gubun=biz_gubun, stages=stage_list,
+            doc_title_contains=title_terms,
             max_pages=max(1, min(max_pages, core.MAX_SEARCH_PAGES)), inference_notes=inference_notes,
         )
     except core.EiassError as exc:
@@ -154,7 +162,8 @@ def eiass_preview_search(
 def eiass_find_projects_by_document_keyword(
     text_queries: str, match_mode: str = 'any', keyword: str = '', types: str = '', agency_code: str = '',
     consult_date_from: str = '', consult_date_to: str = '', progress_status: str = '완료',
-    biz_gubun: str = '', stages: str = '협의의견', max_pages: int = 2, offset: int = 0, max_candidates: int = 30,
+    biz_gubun: str = '', stages: str = '협의의견', doc_title_contains: str = '', max_pages: int = 2,
+    offset: int = 0, max_candidates: int = 30,
     inference_notes: str = '', confirmed: bool = False, audit_sample_size: int = 0,
 ) -> dict:
     """필터(협의완료일 범위/진행상태 등)로 사업을 좁힌 뒤, 지정한 단계(기본 협의의견)의
@@ -206,6 +215,10 @@ def eiass_find_projects_by_document_keyword(
         biz_gubun: 업종(사업구분) 필터 라벨(예: '산업입지 및 산업단지의 조성'). 정확한 목록은
             eiass_search_projects 설명 참고. 사후환경영향조사는 미지원.
         stages: 검색 대상 단계, 콤마 구분(기본 '협의의견'). 예: '협의의견,초안'.
+        doc_title_contains: stages 범위 안에서 파일명에 포함되어야 할 문자열, 콤마 구분(예:
+            '대기질,기상'). 챕터별로 쪼개진 초안/본안/보완 등에서 제목에 특정 단어가 들어간
+            문서만 확인하고 싶을 때 쓴다(예: '0922 대기질(...).pdf'). 비우면 단계 안의 모든
+            PDF를 확인한다.
         max_pages: 평가종류별 최대 검색 페이지 수.
         offset: 후보 목록에서 시작할 위치(이어서 조회할 때 이전 응답의 next_offset을 넘긴다).
         max_candidates: 이번 호출에서 원문까지 내려받아 확인할 최대 후보 수(기본 30).
@@ -216,10 +229,12 @@ def eiass_find_projects_by_document_keyword(
     type_codes = [c.strip().upper() for c in types.split(',') if c.strip()] or None
     stage_list = tuple(s.strip() for s in stages.split(',') if s.strip()) or ('협의의견',)
     query_list = [q.strip() for q in text_queries.split(',') if q.strip()]
+    title_terms = [t.strip() for t in doc_title_contains.split(',') if t.strip()] or None
     common_kwargs = dict(
         match_mode=match_mode, keyword=keyword, type_codes=type_codes, agency_code=agency_code,
         consult_date_from=consult_date_from or None, consult_date_to=consult_date_to or None,
         progress_status=progress_status, biz_gubun=biz_gubun, stages=stage_list,
+        doc_title_contains=title_terms,
         max_pages=max(1, min(max_pages, core.MAX_SEARCH_PAGES)),
     )
     try:
@@ -238,8 +253,8 @@ def eiass_find_projects_by_document_keyword(
 def eiass_start_document_keyword_scan(
     text_queries: str, match_mode: str = 'any', keyword: str = '', types: str = '', agency_code: str = '',
     consult_date_from: str = '', consult_date_to: str = '', progress_status: str = '완료',
-    biz_gubun: str = '', stages: str = '협의의견', max_pages: int = 2, batch_size: int = 10,
-    inference_notes: str = '', confirmed: bool = False, audit_sample_size: int = 0,
+    biz_gubun: str = '', stages: str = '협의의견', doc_title_contains: str = '', max_pages: int = 2,
+    batch_size: int = 10, inference_notes: str = '', confirmed: bool = False, audit_sample_size: int = 0,
 ) -> dict:
     """대량 후보(수십~수백 건)를 타임아웃 걱정 없이 끝까지 훑는 백그라운드 스캔을 시작한다.
     즉시 job_id를 반환하고, 실제 조회(사업 상세조회 + PDF 다운로드/추출 + 키워드 매칭)는
@@ -260,10 +275,12 @@ def eiass_start_document_keyword_scan(
     type_codes = [c.strip().upper() for c in types.split(',') if c.strip()] or None
     stage_list = tuple(s.strip() for s in stages.split(',') if s.strip()) or ('협의의견',)
     query_list = [q.strip() for q in text_queries.split(',') if q.strip()]
+    title_terms = [t.strip() for t in doc_title_contains.split(',') if t.strip()] or None
     common_kwargs = dict(
         match_mode=match_mode, keyword=keyword, type_codes=type_codes, agency_code=agency_code,
         consult_date_from=consult_date_from or None, consult_date_to=consult_date_to or None,
         progress_status=progress_status, biz_gubun=biz_gubun, stages=stage_list,
+        doc_title_contains=title_terms,
         max_pages=max(1, min(max_pages, core.MAX_SEARCH_PAGES)),
     )
     if not confirmed:

@@ -1248,6 +1248,19 @@ def _get_full_document_text(file_seq, session=None):
     return {'text': full_text, 'page_offsets': page_offsets, 'pages': len(parts), 'from_cache': False}
 
 
+def _filter_files_by_title(files, title_terms):
+    """title_terms(문자열 목록)가 있으면 파일명에 그 중 하나라도 포함된 문서만 남긴다
+    (대소문자 무시). 비어 있으면 그대로 반환. 본안/초안 등은 챕터별로 파일이 쪼개져
+    있고 파일명에 챕터명이 그대로 들어있으므로(예: '0922 대기질(...).pdf'), 이 필터로
+    "대기질/기상 항목만" 같은 요청을 단계 전체 대신 관련 파일 몇 개로 좁힐 수 있다."""
+    if not title_terms:
+        return files
+    terms = [t.lower() for t in title_terms if t]
+    if not terms:
+        return files
+    return [f for f in files if any(t in (f.get('name') or '').lower() for t in terms)]
+
+
 def download_document_text(file_seq, session=None, max_chars=20000):
     """첨부 PDF(FILE_SEQ)를 다운로드해 텍스트를 추출한다(로컬 캐시 우선). fitz(PyMuPDF) 필요."""
     result = _get_full_document_text(file_seq, session=session)
@@ -1272,6 +1285,7 @@ def preview_document_keyword_search(
     progress_status='완료',
     biz_gubun='',
     stages=('협의의견',),
+    doc_title_contains=None,
     max_pages=2,
     inference_notes='',
     sample_detail_count=15,
@@ -1286,12 +1300,21 @@ def preview_document_keyword_search(
     그 내용을 자연어로 채운다(예: "평가종류를 환경영향평가로만 좁혔습니다 — 사용자는 '산업단지
     사례'라고만 했음"). 비워두면 "AI 추론 조건 없음"으로 취급된다 — 즉 사용자가 말하지 않은
     필터는 기본적으로 전체(None/'')로 두고, 좁힐 때만 이 필드로 그 사실을 명시해야 한다.
+
+    doc_title_contains: 문자열 목록(또는 None). 지정하면 stages 범위 안에서도 파일명에
+    그 중 하나라도 포함된 문서만 확인 대상으로 잡는다. 초안/본안/보완 등은 챕터별로 PDF가
+    쪼개져 있고 파일명에 챕터명이 그대로 들어있으므로(예: '0922 대기질(...).pdf'), "대기질/
+    기상 항목만" 같은 요청은 이 파라미터로 처리한다(단계 전체가 아니라 항목명 문자열로
+    문서 자체를 필터링). MCP가 "대기질 항목"을 의미 단위로 이해해서 자르는 게 아니라
+    파일명 문자열 매칭이므로, 실제 챕터 파일명 표기와 다른 용어를 쓰면 못 찾을 수 있다 —
+    미리보기의 estimated_documents가 기대보다 너무 적/많으면 용어를 조정해야 한다.
     """
     if isinstance(text_queries, str):
         text_queries = [text_queries]
     text_queries = [q for q in (text_queries or []) if q]
     if not text_queries:
         raise EiassError('text_queries에 검색어를 하나 이상 지정해야 합니다.')
+    doc_title_contains = [t for t in (doc_title_contains or []) if t]
 
     session = session or _session()
     candidates = search_projects(
@@ -1310,8 +1333,11 @@ def preview_document_keyword_search(
                                          session=session, use_cache=True)
         except Exception:
             continue
-        n = sum(1 for st in stages for files in (detail['stage_docs'].get(st) or {}).values()
-                for f in files if f.get('is_pdf'))
+        n = 0
+        for st in stages:
+            for files in (detail['stage_docs'].get(st) or {}).values():
+                pdfs = [f for f in files if f.get('is_pdf')]
+                n += len(_filter_files_by_title(pdfs, doc_title_contains))
         sample_doc_counts.append(n)
     avg_docs = (sum(sample_doc_counts) / len(sample_doc_counts)) if sample_doc_counts else None
     estimated_documents = round(avg_docs * total) if avg_docs is not None else None
@@ -1329,16 +1355,25 @@ def preview_document_keyword_search(
     agency_label = agency_code or '전체'
     date_label = f"{consult_date_from or '제한없음'} ~ {consult_date_to or '제한없음'}"
 
+    doc_scope_label = f"`{'/'.join(stages)}` 단계"
+    if doc_title_contains:
+        doc_scope_label += f", 문서 제목에 `{'/'.join(doc_title_contains)}` 포함된 문서만"
     lines = [
         f"적용할 검색 조건 — 평가종류: `{type_label}` / 업종: `{biz_label}` / "
         f"협의완료일: `{date_label}` / 진행상태: `{progress_status or '전체'}` / 협의기관: `{agency_label}`",
-        f"확인할 문서 범위: `{'/'.join(stages)}` 단계, 키워드 매칭 방식: {match_mode} "
+        f"확인할 문서 범위: {doc_scope_label}, 키워드 매칭 방식: {match_mode} "
         f"({', '.join(text_queries)})",
         f"예상 후보 사업 수: {total}건" + (
             f", 예상 확인 문서 수: 약 {estimated_documents}건 (표본 {len(sample_doc_counts)}건 기준 추정)"
             if estimated_documents is not None else ", 예상 문서 수: 표본 추정 실패(상세조회 오류)"
         ),
     ]
+    if doc_title_contains:
+        lines.append(
+            "※ 문서 제목 필터는 파일명 문자열 매칭입니다(의미 단위 이해 아님) — 실제 챕터 파일명 "
+            "표기와 다른 용어를 쓰면 관련 문서를 놓칠 수 있으니, 위 예상 문서 수가 기대와 다르면 "
+            "용어를 조정해서 다시 미리보기 해보세요."
+        )
     if inference_notes:
         lines.append(f"※ 사용자가 직접 말하지 않고 AI가 추론/제안한 조건: {inference_notes}")
     else:
@@ -1365,6 +1400,7 @@ def preview_document_keyword_search(
         },
         'inference_notes': inference_notes or None,
         'stages_to_check': list(stages),
+        'doc_title_contains': doc_title_contains or None,
         'text_queries': text_queries,
         'match_mode': match_mode,
         'confirm_required': True,
@@ -1383,6 +1419,7 @@ def search_projects_by_document_keyword(
     progress_status='완료',
     biz_gubun='',
     stages=('협의의견',),
+    doc_title_contains=None,
     max_pages=2,
     offset=0,
     max_candidates=30,
@@ -1408,9 +1445,16 @@ def search_projects_by_document_keyword(
     같은 file_seq의 PDF/상세조회는 로컬 캐시를 타므로, 같은 후보군을 다른 키워드로
     다시 조회하거나 offset을 이어서 조회할 때 재다운로드하지 않는다.
 
+    doc_title_contains: 문자열 목록(또는 None). stages 범위 안에서도 파일명에 그 중 하나라도
+    포함된 문서만 확인한다(대소문자 무시, 단순 문자열 매칭). 초안/본안/보완 등은 챕터별로
+    PDF가 쪼개져 있고 파일명에 챕터명이 그대로 들어있으므로(예: '0922 대기질(...).pdf'),
+    "모든 단계의 대기질 항목만" 같은 요청은 stages를 넓히고 doc_title_contains=['대기질','기상']
+    처럼 지정해서 처리한다 — 단계 전체를 다 열어보지 않고 관련 파일만 연다.
+
     audit_sample_size>0이면, 이번 배치(batch) 중 그만큼을 골라 stages에 포함되지 않은
     다른 단계도 표본 검증한다(결과의 'audit_sample'). "지정 범위 밖은 아예 안 본다"가
     되지 않도록 하는 안전장치이며, 전수조사가 아니므로 없다고 단정하지는 않는다.
+    doc_title_contains가 있으면 이 표본 검증에도 동일하게 적용된다.
 
     record_pattern=True(기본)면 이번 실행 결과(단계별 확인/매칭 건수)를 로컬 패턴
     캐시에 누적한다 — 다음 유사 조건 요청의 preview에서 우선순위 힌트로만 쓰인다.
@@ -1438,6 +1482,7 @@ def search_projects_by_document_keyword(
         raise EiassError('text_queries에 검색어를 하나 이상 지정해야 합니다.')
     if match_mode not in ('any', 'all'):
         raise EiassError("match_mode는 'any' 또는 'all'이어야 합니다.")
+    doc_title_contains = [t for t in (doc_title_contains or []) if t]
 
     session = session or _session()
     candidates = search_projects(
@@ -1464,14 +1509,19 @@ def search_projects_by_document_keyword(
         stage_docs = detail['stage_docs']
 
         any_stage_has_files = False
+        any_stage_has_filtered_files = False
         matched_snippets = []
         matched_keywords = set()
         for stage in stages:
-            files = [f for cat_files in (stage_docs.get(stage) or {}).values()
-                     for f in cat_files if f.get('is_pdf')]
-            if not files:
+            raw_files = [f for cat_files in (stage_docs.get(stage) or {}).values()
+                         for f in cat_files if f.get('is_pdf')]
+            if not raw_files:
                 continue
             any_stage_has_files = True
+            files = _filter_files_by_title(raw_files, doc_title_contains)
+            if not files:
+                continue
+            any_stage_has_filtered_files = True
             stage_stats[stage]['checked'] += 1
             stage_had_match = False
             for f in files:
@@ -1506,6 +1556,11 @@ def search_projects_by_document_keyword(
         if not any_stage_has_files:
             skipped.append({'name': item['name'], 'eia_cd': item['eia_cd'],
                              'reason': f"{'/'.join(stages)} 단계에 PDF 첨부문서 없음"})
+            continue
+        if not any_stage_has_filtered_files:
+            skipped.append({'name': item['name'], 'eia_cd': item['eia_cd'],
+                             'reason': f"{'/'.join(stages)} 단계에 PDF는 있으나 문서 제목 필터"
+                                       f"({'/'.join(doc_title_contains)})에 맞는 문서 없음"})
             continue
 
         is_match = (matched_keywords == set(text_queries)) if match_mode == 'all' else bool(matched_keywords)
@@ -1548,6 +1603,7 @@ def search_projects_by_document_keyword(
                     continue
                 files = [f for st in other_stages for cat_files in (detail['stage_docs'].get(st) or {}).values()
                          for f in cat_files if f.get('is_pdf')]
+                files = _filter_files_by_title(files, doc_title_contains)
                 if not files:
                     continue
                 audit_checked += 1
@@ -1581,7 +1637,9 @@ def search_projects_by_document_keyword(
         f"검색조건: 평가종류={type_codes or '전체'}, 업종={biz_gubun or '전체'}, "
         f"협의완료일={consult_date_from or '제한없음'}~{consult_date_to or '제한없음'}, "
         f"진행상태={progress_status or '전체'}",
-        f"확인범위: {'/'.join(stages)} 단계, 이번 배치 {offset}~{offset + checked - 1} "
+        f"확인범위: {'/'.join(stages)} 단계"
+        + (f" 중 제목에 {'/'.join(doc_title_contains)} 포함된 문서만" if doc_title_contains else "")
+        + f", 이번 배치 {offset}~{offset + checked - 1} "
         f"(전체 후보 {total}건 중 {checked}건 확인, {'남은 후보 있음' if next_offset is not None else '전체 확인 완료'})",
         f"결과: 매칭 {len(matches)}건 / 미확인·제외 {len(skipped)}건",
     ]
@@ -1597,6 +1655,7 @@ def search_projects_by_document_keyword(
         'checked': checked,
         'next_offset': next_offset,
         'has_more': next_offset is not None,
+        'doc_title_contains': doc_title_contains or None,
         'skipped': skipped,
         'matches': matches,
         'stage_stats': stage_stats,
