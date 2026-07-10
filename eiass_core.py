@@ -391,6 +391,37 @@ def _parse_result_progress_cell(cell):
 
 DEFAULT_PROGRESS_STAGE_KEYS = ('draft', 'report', 'reconsult', 'simple', 'change')
 
+# (내부 키, 한글 라벨). 원본 앱 PROGRESS_STAGE_OPTIONS과 동일 — 사업 자체의 진행구분이며
+# 첨부문서 stage(초안/본안/협의의견 등)와는 다른 축이다.
+PROGRESS_STAGE_OPTIONS = [
+    ('draft', '초안'),
+    ('report', '평가서'),
+    ('reconsult', '재협의'),
+    ('simple', '약식평가'),
+    ('change', '변경협의'),
+]
+PROGRESS_STAGE_LABEL_TO_KEY = {label: key for key, label in PROGRESS_STAGE_OPTIONS}
+PROGRESS_STAGE_KEY_TO_LABEL = {key: label for key, label in PROGRESS_STAGE_OPTIONS}
+
+
+def progress_stage_keys_from_labels(labels):
+    """한글 라벨 목록(초안/평가서/재협의/약식평가/변경협의)을 search_projects의
+    progress_stage_keys(내부 키)로 변환한다. labels가 비어있으면 None(=전체 선택, 원본
+    UI 기본값과 동일)을 반환한다."""
+    labels = [l for l in (labels or []) if l]
+    if not labels:
+        return None
+    keys, unknown = [], []
+    for label in labels:
+        key = PROGRESS_STAGE_LABEL_TO_KEY.get(label.strip())
+        (keys if key else unknown).append(key or label)
+    if unknown:
+        raise EiassError(
+            f"알 수 없는 진행구분 라벨: {', '.join(unknown)}. "
+            f"사용 가능: {', '.join(label for _, label in PROGRESS_STAGE_OPTIONS)}"
+        )
+    return keys
+
 
 def _normalize_biz_gubun_label(value):
     text = re.sub(r'\s+', ' ', (value or '')).strip()
@@ -1284,6 +1315,7 @@ def preview_document_keyword_search(
     consult_date_to=None,
     progress_status='완료',
     biz_gubun='',
+    progress_stage_keys=None,
     stages=('협의의견',),
     doc_title_contains=None,
     max_pages=2,
@@ -1308,6 +1340,11 @@ def preview_document_keyword_search(
     문서 자체를 필터링). MCP가 "대기질 항목"을 의미 단위로 이해해서 자르는 게 아니라
     파일명 문자열 매칭이므로, 실제 챕터 파일명 표기와 다른 용어를 쓰면 못 찾을 수 있다 —
     미리보기의 estimated_documents가 기대보다 너무 적/많으면 용어를 조정해야 한다.
+
+    progress_stage_keys: 진행구분(사업 자체의 진행 단계 — 첨부문서 stage와는 다른 축) 부분집합
+    {'draft','report','reconsult','simple','change'}. progress_stage_keys_from_labels()로
+    한글 라벨(초안/평가서/재협의/약식평가/변경협의)을 변환해서 넘긴다. None이면 원본 UI
+    기본값과 동일하게 5개 전부 선택된 것으로 취급한다(=전체, 필터 없음).
     """
     if isinstance(text_queries, str):
         text_queries = [text_queries]
@@ -1320,7 +1357,7 @@ def preview_document_keyword_search(
     candidates = search_projects(
         keyword, type_codes=type_codes, agency_code=agency_code, max_pages=max_pages, session=session,
         consult_date_from=consult_date_from, consult_date_to=consult_date_to, progress_status=progress_status,
-        biz_gubun=biz_gubun,
+        biz_gubun=biz_gubun, progress_stage_keys=progress_stage_keys,
     )
     total = len(candidates)
 
@@ -1369,11 +1406,16 @@ def preview_document_keyword_search(
     recommended_tool = 'eiass_start_document_keyword_scan(백그라운드 스캔)' if scale > 50 \
         else 'eiass_find_projects_by_document_keyword(즉시 조회)'
 
+    progress_stage_label = (
+        ', '.join(PROGRESS_STAGE_KEY_TO_LABEL.get(k, k) for k in progress_stage_keys)
+        if progress_stage_keys else '전체'
+    )
     bullets = [
         f"- 평가종류: `{type_label}`",
         f"- 사업유형: `{biz_label}`",
         f"- 협의완료일: `{date_label}`",
         f"- 진행상태: `{progress_status or '전체'}`",
+        f"- 진행구분: `{progress_stage_label}`",
         f"- 협의기관: `{agency_label}`",
         f"- 확인 문서 범위: `{doc_scope_value}`",
         f"- 키워드 매칭: {keyword_phrase}",
@@ -1429,6 +1471,7 @@ def preview_document_keyword_search(
             'keyword': keyword or None, 'types': type_codes or 'ALL', 'agency_code': agency_code or 'ALL',
             'consult_date_from': consult_date_from, 'consult_date_to': consult_date_to,
             'progress_status': progress_status or 'ALL', 'biz_gubun': biz_gubun or 'ALL',
+            'progress_stage_keys': list(progress_stage_keys) if progress_stage_keys else 'ALL',
         },
         'inference_notes': inference_notes or None,
         'stages_to_check': list(stages),
@@ -1450,6 +1493,7 @@ def search_projects_by_document_keyword(
     consult_date_to=None,
     progress_status='완료',
     biz_gubun='',
+    progress_stage_keys=None,
     stages=('협의의견',),
     doc_title_contains=None,
     max_pages=2,
@@ -1460,7 +1504,7 @@ def search_projects_by_document_keyword(
     audit_sample_size=0,
     record_pattern=True,
 ):
-    """검색 필터(협의완료일 범위/진행상태 등)로 후보 사업을 뽑은 뒤, 지정한 단계(기본값
+    """검색 필터(협의완료일 범위/진행상태/진행구분 등)로 후보 사업을 뽑은 뒤, 지정한 단계(기본값
     '협의의견')의 첨부 PDF 원문에서 text_queries 키워드가 있는 사업만 골라낸다.
 
     이 함수는 실제로 문서를 다운로드하는 "실행" 단계다 — MCP 도구 계층
@@ -1482,6 +1526,10 @@ def search_projects_by_document_keyword(
     PDF가 쪼개져 있고 파일명에 챕터명이 그대로 들어있으므로(예: '0922 대기질(...).pdf'),
     "모든 단계의 대기질 항목만" 같은 요청은 stages를 넓히고 doc_title_contains=['대기질','기상']
     처럼 지정해서 처리한다 — 단계 전체를 다 열어보지 않고 관련 파일만 연다.
+
+    progress_stage_keys: 진행구분(사업 자체의 진행 단계) 부분집합 {'draft','report','reconsult',
+    'simple','change'}. progress_stage_keys_from_labels()로 한글 라벨(초안/평가서/재협의/
+    약식평가/변경협의)을 변환해서 넘긴다. None이면 전체(5개 모두)로 취급한다.
 
     audit_sample_size>0이면, 이번 배치(batch) 중 그만큼을 골라 stages에 포함되지 않은
     다른 단계도 표본 검증한다(결과의 'audit_sample'). "지정 범위 밖은 아예 안 본다"가
@@ -1520,7 +1568,7 @@ def search_projects_by_document_keyword(
     candidates = search_projects(
         keyword, type_codes=type_codes, agency_code=agency_code, max_pages=max_pages, session=session,
         consult_date_from=consult_date_from, consult_date_to=consult_date_to, progress_status=progress_status,
-        biz_gubun=biz_gubun,
+        biz_gubun=biz_gubun, progress_stage_keys=progress_stage_keys,
     )
     total = len(candidates)
     batch = candidates[offset:offset + max_candidates]
@@ -1668,7 +1716,8 @@ def search_projects_by_document_keyword(
     summary_parts = [
         f"검색조건: 평가종류={type_codes or '전체'}, 사업유형={biz_gubun or '전체'}, "
         f"협의완료일={consult_date_from or '제한없음'}~{consult_date_to or '제한없음'}, "
-        f"진행상태={progress_status or '전체'}",
+        f"진행상태={progress_status or '전체'}, "
+        f"진행구분={','.join(progress_stage_keys) if progress_stage_keys else '전체'}",
         f"확인범위: {'/'.join(stages)} 단계"
         + (f" 중 제목에 {'/'.join(doc_title_contains)} 포함된 문서만" if doc_title_contains else "")
         + f", 이번 배치 {offset}~{offset + checked - 1} "

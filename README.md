@@ -6,7 +6,7 @@
 
 | 도구 | 기능 |
 |---|---|
-| `eiass_search_projects` | 사업명/협의완료일 범위/진행상태/기후변화영향평가/사업유형 등 필터로 사업 검색 |
+| `eiass_search_projects` | 사업명/협의완료일 범위/진행상태/진행구분/기후변화영향평가/사업유형 등 필터로 사업 검색 |
 | `eiass_preview_search` | 실제 조회 없이 검색조건/문서범위/예상 후보·문서 수/과거 패턴 힌트를 확인 문구로 반환 |
 | `eiass_find_projects_by_document_keyword` | 필터로 후보를 좁힌 뒤, 지정 단계(기본 협의의견) 원문에서 키워드가 있는 사업만 추려서 반환. `confirmed=true` 없이는 미리보기만 반환(아래 "실행 전 확인" 참고). 소규모(~50건) 조회용, `offset`으로 이어서 조회 가능 |
 | `eiass_start_document_keyword_scan` | 대량 후보(수백 건)를 타임아웃 없이 끝까지 훑는 백그라운드 스캔 시작. `confirmed=true`일 때만 실제로 시작하고 즉시 `job_id` 반환 |
@@ -35,6 +35,10 @@
 ### 범위 밖 표본 검증 (scan scope audit)
 
 `audit_sample_size`(기본 0)를 지정하면, 요청한 stages 밖의 다른 단계도 이번 배치 중 일부를 표본 검증해 `audit_sample`로 함께 반환한다. 좁힌 범위 밖에서도 매칭이 있을 수 있다는 걸 알려주는 안전장치이며, 전수조사가 아니므로 "매칭 없음"이 "확실히 없음"을 뜻하지는 않는다.
+
+### 진행구분 다중선택 필터
+
+`progress_stage`로 사업 자체의 진행구분(첨부문서 stage와는 다른 축)을 다중선택할 수 있다. 사용 가능 라벨: `초안`, `평가서`, `재협의`, `약식평가`, `변경협의`(콤마로 여러 개 지정, 예: `"초안,재협의"`). 비우면 원본 앱 기본값과 동일하게 5개 전부 선택된 것으로 취급한다(=전체, 필터 없음). 알 수 없는 라벨을 넣으면 사용 가능한 라벨 목록과 함께 에러를 반환한다. `eiass_search_projects`/`eiass_preview_search`/`eiass_find_projects_by_document_keyword`/`eiass_start_document_keyword_scan` 모두에 적용된다.
 
 ### 문서 제목(항목) 필터
 

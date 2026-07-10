@@ -69,7 +69,8 @@ def _run_scan_job(job_id, kwargs):
 @mcp.tool()
 def eiass_search_projects(keyword: str = '', types: str = '', agency_code: str = '', max_pages: int = 2,
                            consult_date_from: str = '', consult_date_to: str = '',
-                           progress_status: str = '', climate_filter: str = '', biz_gubun: str = '') -> dict:
+                           progress_status: str = '', climate_filter: str = '', biz_gubun: str = '',
+                           progress_stage: str = '') -> dict:
     """EIASS(환경영향평가정보지원시스템)에서 원본 앱과 동일한 필터로 사업을 검색한다.
 
     유사 사업을 찾을 때는 이 도구로 후보 목록을 뽑은 뒤, 각 후보에 대해
@@ -94,14 +95,19 @@ def eiass_search_projects(keyword: str = '', types: str = '', agency_code: str =
             개간 및 공유수면의 매립, 관광단지의 개발, 지역개발/특정지역의 개발, 체육시설의 설치,
             폐기물처리시설 및 분뇨처리시설의 설치, 국방군사시설의 설치, 토석·모래·자갈·광물 등의 채취,
             산지의 개발, 기타
+        progress_stage: 진행구분 다중선택, 콤마 구분. 사용 가능 라벨: 초안, 평가서, 재협의,
+            약식평가, 변경협의. 비우면 5개 전부(=전체, 필터 없음)로 취급한다.
     """
     type_codes = [c.strip().upper() for c in types.split(',') if c.strip()] or None
+    stage_labels = [s.strip() for s in progress_stage.split(',') if s.strip()]
     try:
+        stage_keys = core.progress_stage_keys_from_labels(stage_labels)
         results = core.search_projects(
             keyword, type_codes=type_codes, agency_code=agency_code,
             max_pages=max(1, min(max_pages, core.MAX_SEARCH_PAGES)),
             consult_date_from=consult_date_from or None, consult_date_to=consult_date_to or None,
             progress_status=progress_status, climate_filter=climate_filter, biz_gubun=biz_gubun,
+            progress_stage_keys=stage_keys,
         )
     except core.EiassError as exc:
         return {'error': str(exc)}
@@ -112,8 +118,8 @@ def eiass_search_projects(keyword: str = '', types: str = '', agency_code: str =
 def eiass_preview_search(
     text_queries: str, match_mode: str = 'any', keyword: str = '', types: str = '', agency_code: str = '',
     consult_date_from: str = '', consult_date_to: str = '', progress_status: str = '완료',
-    biz_gubun: str = '', stages: str = '협의의견', doc_title_contains: str = '', max_pages: int = 2,
-    inference_notes: str = '',
+    biz_gubun: str = '', progress_stage: str = '', stages: str = '협의의견', doc_title_contains: str = '',
+    max_pages: int = 2, inference_notes: str = '',
 ) -> dict:
     """실제로 문서를 다운로드하지 않고, 이 조건으로 검색하면 무엇을 하게 될지 미리 보여준다.
     eiass_find_projects_by_document_keyword / eiass_start_document_keyword_scan을
@@ -138,6 +144,8 @@ def eiass_preview_search(
             해당 단어가 들어간 문서(챕터별 PDF 파일명에 항목명이 그대로 들어있음, 예:
             '0922 대기질(...).pdf')만 확인 대상으로 좁힐 때 쓴다. 파일명 문자열 매칭이라
             실제 표기와 다른 용어를 쓰면 놓칠 수 있다 — 예상 문서 수가 이상하면 용어를 바꿔보라.
+        progress_stage: 진행구분 다중선택, 콤마 구분. 사용 가능 라벨: 초안, 평가서, 재협의,
+            약식평가, 변경협의. 비우면 5개 전부(=전체, 필터 없음)로 취급한다.
         inference_notes: 사용자가 직접 말하지 않았는데 AI가 추론/제안해서 좁힌 조건이 있다면
             그 내용과 이유를 여기 적는다(예: "평가종류를 환경영향평가로 좁혔습니다 — 사용자는
             '산업단지 사례'라고만 했음"). 없으면 빈 문자열로 둔다.
@@ -146,12 +154,14 @@ def eiass_preview_search(
     stage_list = tuple(s.strip() for s in stages.split(',') if s.strip()) or ('협의의견',)
     query_list = [q.strip() for q in text_queries.split(',') if q.strip()]
     title_terms = [t.strip() for t in doc_title_contains.split(',') if t.strip()] or None
+    progress_stage_labels = [s.strip() for s in progress_stage.split(',') if s.strip()]
     try:
+        stage_keys = core.progress_stage_keys_from_labels(progress_stage_labels)
         return core.preview_document_keyword_search(
             query_list, match_mode=match_mode, keyword=keyword, type_codes=type_codes, agency_code=agency_code,
             consult_date_from=consult_date_from or None, consult_date_to=consult_date_to or None,
-            progress_status=progress_status, biz_gubun=biz_gubun, stages=stage_list,
-            doc_title_contains=title_terms,
+            progress_status=progress_status, biz_gubun=biz_gubun, progress_stage_keys=stage_keys,
+            stages=stage_list, doc_title_contains=title_terms,
             max_pages=max(1, min(max_pages, core.MAX_SEARCH_PAGES)), inference_notes=inference_notes,
         )
     except core.EiassError as exc:
@@ -162,8 +172,8 @@ def eiass_preview_search(
 def eiass_find_projects_by_document_keyword(
     text_queries: str, match_mode: str = 'any', keyword: str = '', types: str = '', agency_code: str = '',
     consult_date_from: str = '', consult_date_to: str = '', progress_status: str = '완료',
-    biz_gubun: str = '', stages: str = '협의의견', doc_title_contains: str = '', max_pages: int = 2,
-    offset: int = 0, max_candidates: int = 30,
+    biz_gubun: str = '', progress_stage: str = '', stages: str = '협의의견', doc_title_contains: str = '',
+    max_pages: int = 2, offset: int = 0, max_candidates: int = 30,
     inference_notes: str = '', confirmed: bool = False, audit_sample_size: int = 0,
 ) -> dict:
     """필터(협의완료일 범위/진행상태 등)로 사업을 좁힌 뒤, 지정한 단계(기본 협의의견)의
@@ -214,6 +224,8 @@ def eiass_find_projects_by_document_keyword(
         progress_status: '완료' | '진행' | ''. 기본 '완료'(협의의견은 완료 건에만 존재).
         biz_gubun: 사업유형(사업구분) 필터 라벨(예: '산업입지 및 산업단지의 조성'). 정확한 목록은
             eiass_search_projects 설명 참고. 사후환경영향조사는 미지원.
+        progress_stage: 진행구분 다중선택, 콤마 구분. 사용 가능 라벨: 초안, 평가서, 재협의,
+            약식평가, 변경협의. 비우면 5개 전부(=전체, 필터 없음)로 취급한다.
         stages: 검색 대상 단계, 콤마 구분(기본 '협의의견'). 예: '협의의견,초안'.
         doc_title_contains: stages 범위 안에서 파일명에 포함되어야 할 문자열, 콤마 구분(예:
             '대기질,기상'). 챕터별로 쪼개진 초안/본안/보완 등에서 제목에 특정 단어가 들어간
@@ -230,14 +242,16 @@ def eiass_find_projects_by_document_keyword(
     stage_list = tuple(s.strip() for s in stages.split(',') if s.strip()) or ('협의의견',)
     query_list = [q.strip() for q in text_queries.split(',') if q.strip()]
     title_terms = [t.strip() for t in doc_title_contains.split(',') if t.strip()] or None
-    common_kwargs = dict(
-        match_mode=match_mode, keyword=keyword, type_codes=type_codes, agency_code=agency_code,
-        consult_date_from=consult_date_from or None, consult_date_to=consult_date_to or None,
-        progress_status=progress_status, biz_gubun=biz_gubun, stages=stage_list,
-        doc_title_contains=title_terms,
-        max_pages=max(1, min(max_pages, core.MAX_SEARCH_PAGES)),
-    )
+    progress_stage_labels = [s.strip() for s in progress_stage.split(',') if s.strip()]
     try:
+        stage_keys = core.progress_stage_keys_from_labels(progress_stage_labels)
+        common_kwargs = dict(
+            match_mode=match_mode, keyword=keyword, type_codes=type_codes, agency_code=agency_code,
+            consult_date_from=consult_date_from or None, consult_date_to=consult_date_to or None,
+            progress_status=progress_status, biz_gubun=biz_gubun, progress_stage_keys=stage_keys,
+            stages=stage_list, doc_title_contains=title_terms,
+            max_pages=max(1, min(max_pages, core.MAX_SEARCH_PAGES)),
+        )
         if not confirmed:
             return core.preview_document_keyword_search(
                 query_list, inference_notes=inference_notes, **common_kwargs)
@@ -253,8 +267,9 @@ def eiass_find_projects_by_document_keyword(
 def eiass_start_document_keyword_scan(
     text_queries: str, match_mode: str = 'any', keyword: str = '', types: str = '', agency_code: str = '',
     consult_date_from: str = '', consult_date_to: str = '', progress_status: str = '완료',
-    biz_gubun: str = '', stages: str = '협의의견', doc_title_contains: str = '', max_pages: int = 2,
-    batch_size: int = 10, inference_notes: str = '', confirmed: bool = False, audit_sample_size: int = 0,
+    biz_gubun: str = '', progress_stage: str = '', stages: str = '협의의견', doc_title_contains: str = '',
+    max_pages: int = 2, batch_size: int = 10, inference_notes: str = '', confirmed: bool = False,
+    audit_sample_size: int = 0,
 ) -> dict:
     """대량 후보(수십~수백 건)를 타임아웃 걱정 없이 끝까지 훑는 백그라운드 스캔을 시작한다.
     즉시 job_id를 반환하고, 실제 조회(사업 상세조회 + PDF 다운로드/추출 + 키워드 매칭)는
@@ -276,11 +291,16 @@ def eiass_start_document_keyword_scan(
     stage_list = tuple(s.strip() for s in stages.split(',') if s.strip()) or ('협의의견',)
     query_list = [q.strip() for q in text_queries.split(',') if q.strip()]
     title_terms = [t.strip() for t in doc_title_contains.split(',') if t.strip()] or None
+    progress_stage_labels = [s.strip() for s in progress_stage.split(',') if s.strip()]
+    try:
+        stage_keys = core.progress_stage_keys_from_labels(progress_stage_labels)
+    except core.EiassError as exc:
+        return {'error': str(exc)}
     common_kwargs = dict(
         match_mode=match_mode, keyword=keyword, type_codes=type_codes, agency_code=agency_code,
         consult_date_from=consult_date_from or None, consult_date_to=consult_date_to or None,
-        progress_status=progress_status, biz_gubun=biz_gubun, stages=stage_list,
-        doc_title_contains=title_terms,
+        progress_status=progress_status, biz_gubun=biz_gubun, progress_stage_keys=stage_keys,
+        stages=stage_list, doc_title_contains=title_terms,
         max_pages=max(1, min(max_pages, core.MAX_SEARCH_PAGES)),
     )
     if not confirmed:
