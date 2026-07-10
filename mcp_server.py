@@ -88,7 +88,7 @@ def eiass_search_projects(keyword: str = '', types: str = '', agency_code: str =
             예: "최근 1년" → consult_date_from=오늘로부터 1년 전, consult_date_to=오늘.
         progress_status: '완료' | '진행' | ''. 진행현황 필터.
         climate_filter: 'Y' | 'N' | ''. 기후변화영향평가 대상 여부(사후조사 제외).
-        biz_gubun: 업종(사업구분) 필터. 다음 라벨 중 정확히 일치해야 한다(사후환경영향조사는 미지원):
+        biz_gubun: 사업유형(사업구분) 필터. 다음 라벨 중 정확히 일치해야 한다(사후환경영향조사는 미지원):
             도시의 개발, 산업입지 및 산업단지의 조성, 에너지 개발, 항만 건설, 도로의 건설,
             수자원의 개발, 철도(도시철도 포함)의 건설, 공항 또는 비행장의 건설, 하천의 이용 및 개발,
             개간 및 공유수면의 매립, 관광단지의 개발, 지역개발/특정지역의 개발, 체육시설의 설치,
@@ -212,7 +212,7 @@ def eiass_find_projects_by_document_keyword(
         agency_code: 협의기관 코드(선택).
         consult_date_from/consult_date_to: 'YYYY-MM-DD'. 협의완료일 범위.
         progress_status: '완료' | '진행' | ''. 기본 '완료'(협의의견은 완료 건에만 존재).
-        biz_gubun: 업종(사업구분) 필터 라벨(예: '산업입지 및 산업단지의 조성'). 정확한 목록은
+        biz_gubun: 사업유형(사업구분) 필터 라벨(예: '산업입지 및 산업단지의 조성'). 정확한 목록은
             eiass_search_projects 설명 참고. 사후환경영향조사는 미지원.
         stages: 검색 대상 단계, 콤마 구분(기본 '협의의견'). 예: '협의의견,초안'.
         doc_title_contains: stages 범위 안에서 파일명에 포함되어야 할 문자열, 콤마 구분(예:

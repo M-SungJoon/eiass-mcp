@@ -4,7 +4,7 @@
 ProjectGisLayerLoadWorker(KDPA) 로직을 GUI와 분리한 순수 함수로 이식한 모듈이다.
 MCP 서버(`mcp_server.py`)에서 이 모듈의 함수만 호출한다.
 
-검색 필터(협의완료일 범위, 진행상태(완료/진행), 진행구분, 기후변화영향평가, 업종(biz_gubun))와
+검색 필터(협의완료일 범위, 진행상태(완료/진행), 진행구분, 기후변화영향평가, 사업유형(biz_gubun))와
 상세 개요 필드 추출기(_row_value_after_label/_table_value_by_header 등)는 원본
 `run_search`/`_extract_*_from_detail_soup` 로직을 그대로 이식했다.
 
@@ -239,7 +239,7 @@ def pattern_cache_record(type_codes, biz_gubun, stage_stats):
 
 
 def pattern_cache_lookup(type_codes, biz_gubun, min_samples_for_medium=5, min_samples_for_high=20):
-    """(평가종류, 업종) 조합 기준 과거 기록을 매칭률 순으로 반환한다.
+    """(평가종류, 사업유형) 조합 기준 과거 기록을 매칭률 순으로 반환한다.
     confidence는 표본 수 기준: checked_count < min_samples_for_medium -> 'low'
     (반드시 저신뢰로 취급, 자동 범위축소 근거 금지), 그 이상 -> 'medium'/'high'."""
     sig = _pattern_signature(type_codes, biz_gubun)
@@ -542,7 +542,7 @@ def search_projects(keyword='', type_codes=None, agency_code='', max_pages=MAX_S
                      consult_date_from=None, consult_date_to=None, progress_status='', climate_filter='',
                      progress_stage_keys=None, biz_gubun=''):
     """EIASS 사업 검색. 원본 앱(run_search)의 협의완료일 범위/진행상태/기후변화영향평가/
-    진행구분/업종(biz_gubun) 필터를 그대로 지원한다.
+    진행구분/사업유형(biz_gubun) 필터를 그대로 지원한다.
 
     Args:
         keyword: 사업명 등 포함검색 키워드. 비워도 다른 필터(협의일자/진행상태/기관)만으로 검색 가능.
@@ -580,7 +580,7 @@ def search_projects(keyword='', type_codes=None, agency_code='', max_pages=MAX_S
                               f"BIZ_GUBUN_OPTIONS 라벨과 정확히 일치해야 합니다: {', '.join(sorted(known_labels))}")
         if not any(_biz_gubun_code_for_type(biz_gubun, t) for t in target_types):
             raise EiassError(f"'{biz_gubun}'은(는) 선택한 평가종류(target_types={target_types})에서 사용할 수 "
-                              f"없습니다 (사후환경영향조사는 업종 필터를 지원하지 않습니다).")
+                              f"없습니다 (사후환경영향조사는 사업유형 필터를 지원하지 않습니다).")
     headers = {
         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)',
         'X-Requested-With': 'XMLHttpRequest',
@@ -624,7 +624,7 @@ def search_projects(keyword='', type_codes=None, agency_code='', max_pages=MAX_S
 
         biz_gubun_code = _biz_gubun_code_for_type(biz_gubun, t)
         if biz_gubun and not biz_gubun_code:
-            continue  # 이 평가종류는 업종 필터를 지원하지 않음(A) → 건너뜀
+            continue  # 이 평가종류는 사업유형 필터를 지원하지 않음(A) → 건너뜀
 
         if progress_status:
             url_dict['completeFl'] = progress_status
@@ -1344,48 +1344,79 @@ def preview_document_keyword_search(
 
     pattern = pattern_cache_lookup(type_codes, biz_gubun)
     pattern_note = (
-        '과거 유사 조건(같은 평가종류+업종 조합) 기록이 있습니다. 아래 우선순위는 참고용 힌트일 뿐이며, '
+        '과거 유사 조건(같은 평가종류+사업유형 조합) 기록이 있습니다. 아래 우선순위는 참고용 힌트일 뿐이며, '
         '검색 범위를 줄이는 근거로 쓰지 않습니다 — 요청한 stages는 전부 그대로 확인합니다.'
-        if pattern else '이 조건 조합(평가종류+업종)에 대한 과거 기록이 아직 없습니다.'
+        if pattern else '이 조건 조합(평가종류+사업유형)에 대한 과거 기록이 아직 없습니다.'
     )
 
-    type_label = ', '.join(TYPE_NAME_MAP.get(t, t) for t in type_codes) if type_codes else \
-        '전체(전략환경영향평가/환경영향평가/소규모환경영향평가/사후환경영향조사/사전환경성검토)'
+    type_label = ', '.join(TYPE_NAME_MAP.get(t, t) for t in type_codes) if type_codes else '전체'
     biz_label = biz_gubun or '전체'
     agency_label = agency_code or '전체'
     date_label = f"{consult_date_from or '제한없음'} ~ {consult_date_to or '제한없음'}"
 
-    doc_scope_label = f"`{'/'.join(stages)}` 단계"
+    doc_scope_value = '/'.join(stages)
     if doc_title_contains:
-        doc_scope_label += f", 문서 제목에 `{'/'.join(doc_title_contains)}` 포함된 문서만"
-    lines = [
-        f"적용할 검색 조건 — 평가종류: `{type_label}` / 업종: `{biz_label}` / "
-        f"협의완료일: `{date_label}` / 진행상태: `{progress_status or '전체'}` / 협의기관: `{agency_label}`",
-        f"확인할 문서 범위: {doc_scope_label}, 키워드 매칭 방식: {match_mode} "
-        f"({', '.join(text_queries)})",
-        f"예상 후보 사업 수: {total}건" + (
-            f", 예상 확인 문서 수: 약 {estimated_documents}건 (표본 {len(sample_doc_counts)}건 기준 추정)"
-            if estimated_documents is not None else ", 예상 문서 수: 표본 추정 실패(상세조회 오류)"
-        ),
+        doc_scope_value += f" (제목에 {'/'.join(doc_title_contains)} 포함된 문서만)"
+
+    if len(text_queries) == 1:
+        keyword_phrase = f"`{text_queries[0]}` 포함"
+    else:
+        joined = ' 와 '.join(f'`{q}`' for q in text_queries)
+        keyword_phrase = f"{joined} " + ('모두 포함' if match_mode == 'all' else '중 하나 포함')
+
+    # 예상 규모에 따라 소규모 즉시조회/백그라운드 스캔 중 어느 도구가 맞는지 힌트를 준다.
+    scale = estimated_documents if estimated_documents is not None else total
+    recommended_tool = 'eiass_start_document_keyword_scan(백그라운드 스캔)' if scale > 50 \
+        else 'eiass_find_projects_by_document_keyword(즉시 조회)'
+
+    bullets = [
+        f"- 평가종류: `{type_label}`",
+        f"- 사업유형: `{biz_label}`",
+        f"- 협의완료일: `{date_label}`",
+        f"- 진행상태: `{progress_status or '전체'}`",
+        f"- 협의기관: `{agency_label}`",
+        f"- 확인 문서 범위: `{doc_scope_value}`",
+        f"- 키워드 매칭: {keyword_phrase}",
+        f"- 예상 후보 사업 수: `{total}`건",
     ]
+    bullets.append(
+        f"- 예상 확인 문서 수: 약 `{estimated_documents}`건 (표본 {len(sample_doc_counts)}건 기준 추정)"
+        if estimated_documents is not None else "- 예상 확인 문서 수: 표본 추정 실패(상세조회 오류)"
+    )
+
+    notes = []
+    if inference_notes:
+        notes.append(f"※ 사용자가 직접 말하지 않고 AI가 추론/제안한 조건: {inference_notes}")
+    else:
+        notes.append("※ AI가 임의로 좁힌 조건 없음 — 언급되지 않은 필터는 전체로 적용했습니다.")
     if doc_title_contains:
-        lines.append(
+        notes.append(
             "※ 문서 제목 필터는 파일명 문자열 매칭입니다(의미 단위 이해 아님) — 실제 챕터 파일명 "
-            "표기와 다른 용어를 쓰면 관련 문서를 놓칠 수 있으니, 위 예상 문서 수가 기대와 다르면 "
+            "표기와 다른 용어를 쓰면 관련 문서를 놓칠 수 있으니, 예상 문서 수가 기대와 다르면 "
             "용어를 조정해서 다시 미리보기 해보세요."
         )
-    if inference_notes:
-        lines.append(f"※ 사용자가 직접 말하지 않고 AI가 추론/제안한 조건: {inference_notes}")
-    else:
-        lines.append("※ AI가 임의로 좁힌 조건 없음 — 언급되지 않은 필터는 전체로 적용했습니다.")
     if pattern:
         top = pattern[0]
-        lines.append(
-            f"과거 유사 조건에서는 `{top['stage']}` 단계 매칭률이 {top['match_rate']:.0%}"
+        notes.append(
+            f"※ 과거 유사 조건에서는 `{top['stage']}` 단계 매칭률이 {top['match_rate']:.0%}"
             f"(신뢰도: {top['confidence']}, 표본 {top['checked_count']}건)로 가장 높았습니다 — "
             f"우선 확인 순서 참고용이며, 다른 단계를 생략하지는 않습니다."
         )
-    lines.append("이 조건으로 진행할까요? 승인하시면 같은 조건에 confirmed=true를 더해 다시 호출하겠습니다.")
+
+    message_parts = [
+        "아래 조건으로 실제 원문 스캔을 진행해도 될까요?",
+        "",
+        "적용할 검색 조건:",
+        "",
+        '\n'.join(bullets),
+    ]
+    if notes:
+        message_parts += ["", '\n'.join(notes)]
+    message_parts += [
+        "",
+        f"예상 규모상 `{recommended_tool}`으로 진행하는 게 맞습니다. 승인해주시면 같은 조건에 "
+        f"`confirmed=true`를 붙여 실행하고, 결과를 정리해 알려드리겠습니다.",
+    ]
 
     return {
         'candidates_total': total,
@@ -1393,6 +1424,7 @@ def preview_document_keyword_search(
         'document_count_sample_size': len(sample_doc_counts),
         'pattern_cache': pattern,
         'pattern_cache_note': pattern_note,
+        'recommended_execution_tool': recommended_tool,
         'applied_filters': {
             'keyword': keyword or None, 'types': type_codes or 'ALL', 'agency_code': agency_code or 'ALL',
             'consult_date_from': consult_date_from, 'consult_date_to': consult_date_to,
@@ -1404,7 +1436,7 @@ def preview_document_keyword_search(
         'text_queries': text_queries,
         'match_mode': match_mode,
         'confirm_required': True,
-        'confirmation_message': '\n'.join(lines),
+        'confirmation_message': '\n'.join(message_parts),
     }
 
 
@@ -1634,7 +1666,7 @@ def search_projects_by_document_keyword(
             pass  # 캐시 기록 실패는 검색 결과에 영향 주지 않음
 
     summary_parts = [
-        f"검색조건: 평가종류={type_codes or '전체'}, 업종={biz_gubun or '전체'}, "
+        f"검색조건: 평가종류={type_codes or '전체'}, 사업유형={biz_gubun or '전체'}, "
         f"협의완료일={consult_date_from or '제한없음'}~{consult_date_to or '제한없음'}, "
         f"진행상태={progress_status or '전체'}",
         f"확인범위: {'/'.join(stages)} 단계"
