@@ -1,4 +1,4 @@
-# EIASS MCP 자동 등록 스크립트
+﻿# EIASS MCP 자동 등록 스크립트
 # 사용법: 이 폴더(mcp_server.exe가 있는 곳)에서
 #   powershell -ExecutionPolicy Bypass -File install.ps1
 # Claude Code / Claude Desktop / Codex CLI 중 이 PC에 설치된 것을 찾아 자동으로 eiass MCP 서버를 등록한다.
