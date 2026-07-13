@@ -59,25 +59,31 @@
 ## 설치 — 방법 1: exe로 실행 (Python 설치 불필요, 추천)
 
 1. 이 저장소를 clone하거나 zip으로 받아서 `mcp_server.exe`를 꺼낸다(저장소에 이미 빌드되어 포함되어 있다. 직접 최신 소스로 다시 빌드하려면 아래 "직접 빌드하기" 참고).
+
 2. 아무 폴더에나 저장한다 (예: `C:\Tools\eiass-mcp\mcp_server.exe`).
+
 3. 같은 폴더에 `.env` 파일을 만들고 VWorld API 키를 넣는다 (지오코딩/보호구역 조회용, [VWorld 오픈API](https://www.vworld.kr/dev/v4api.do)에서 무료 발급):
    
    ```
    VWORLD_API_KEY=발급받은_키
    ```
-4. Claude/Codex에 등록한다 — `install.ps1`을 실행하면 자동으로 등록된다(아래 "자동 등록" 참고). 수동으로 하려면 "Claude에 등록하기" 참고.
+
+4. Claude/Codex에 등록한다 — `install.bat`을 더블클릭하면 자동으로 등록된다(아래 "자동 등록" 참고). 수동으로 하려면 "Claude에 등록하기" 참고.
 
 ## 자동 등록 + 업데이트 (Claude Code + Codex CLI)
 
 `claude`, `codex` CLI가 PC에 설치되어 있으면 아래 스크립트가 둘 다 자동으로 등록해준다(찾지 못한 CLI는 건너뛴다). VWorld API 키도 대화형으로 물어봐서 `.env`까지 만들어준다.
 
+**PowerShell이 익숙하지 않다면 `install.bat`을 그냥 더블클릭하면 된다** — 우클릭 메뉴나 실행 정책(ExecutionPolicy) 같은 걸 몰라도 된다. 콘솔 창에서 결과를 보여준 뒤 Enter를 눌러야 닫히므로, 성공/실패 여부를 놓치지 않고 확인할 수 있다.
+
+터미널에서 직접 실행하고 싶다면:
 ```
 powershell -ExecutionPolicy Bypass -File install.ps1
 ```
 
 실행 후 Claude Code/Codex를 재시작하면 `eiass_*` 도구를 바로 쓸 수 있다. Claude Desktop은 CLI가 없어 자동 등록은 지원하지 않고, 실행 후 안내되는 JSON 스니펫을 `claude_desktop_config.json`에 직접 추가하면 된다.
 
-**git 없이도 최신 버전으로 갱신된다.** `install.ps1`은 실행될 때마다 GitHub API로 `mcp_server.exe`의 최신 커밋을 확인하고(같은 폴더의 `.eiass_mcp_version`에 기록된 버전과 비교), 다르면 `raw.githubusercontent.com`에서 새 exe를 직접 받아 교체한다 — git clone이나 pull이 전혀 필요 없다. `mcp_server.exe`가 아예 없는 상태로 스크립트만 받아서 실행해도 최초 1회 자동으로 받아온다. 저장소를 push해서 서버 쪽을 고쳐도 각 사용자 PC에는 자동으로 반영되지 않으므로, **업데이트를 받으려면 이 스크립트를 다시 실행해야 한다**(완전 자동 업데이트는 아님). Claude Code/Codex가 실행 중이라 exe가 잠겨 있으면 업데이트를 건너뛰고 기존 버전으로 계속 진행하니, 안내 메시지가 뜨면 앱을 완전히 종료한 뒤 다시 실행한다. 업데이트를 건너뛰려면 `-SkipUpdateCheck` 옵션을 준다.
+**git 없이도 최신 버전으로 갱신된다.** `install.ps1`은 실행될 때마다 GitHub API로 `mcp_server.exe`의 최신 커밋을 확인하고(같은 폴더의 `.eiass_mcp_version`에 기록된 버전과 비교), 다르면 `raw.githubusercontent.com`에서 새 exe를 직접 받아 교체한다 — git clone이나 pull이 전혀 필요 없다. `mcp_server.exe`가 아예 없는 상태로 `install.bat`/`install.ps1`만 받아서 실행해도 최초 1회 자동으로 받아온다. 저장소를 push해서 서버 쪽을 고쳐도 각 사용자 PC에는 자동으로 반영되지 않으므로, **업데이트를 받으려면 이 스크립트를 다시 실행해야 한다**(완전 자동 업데이트는 아님). Claude Code/Codex가 실행 중이라 exe가 잠겨 있으면 업데이트를 건너뛰고 기존 버전으로 계속 진행하니, 안내 메시지가 뜨면 앱을 완전히 종료한 뒤 다시 실행한다. 업데이트를 건너뛰려면 `-SkipUpdateCheck` 옵션을 준다.
 
 ## 설치 — 방법 2: Python으로 실행
 
