@@ -74,9 +74,10 @@ def eiass_search_projects(keyword: str = '', types: str = '', agency_code: str =
     """EIASS(환경영향평가정보지원시스템)에서 원본 앱과 동일한 필터로 사업을 검색한다.
 
     유사 사업을 찾을 때는 이 도구로 후보 목록을 뽑은 뒤, 각 후보에 대해
-    eiass_get_project_documents로 '협의의견' 첨부문서를 확인하고
-    eiass_read_document로 원문을 읽어 내용을 비교하라. 협의완료일 범위 +
-    협의의견 원문 키워드를 한 번에 조회하려면 eiass_find_projects_by_document_keyword를 써라.
+    eiass_get_project_documents로 '초안/본안/보완/협의의견 등' 첨부문서를 확인하고
+    eiass_read_document로 원문을 읽어 내용을 비교하라(협의의견만 우선 확인하면 놓치는
+    경우가 있으니 여러 단계를 함께 확인하는 편이 안전하다). 협의완료일 범위 +
+    문서 원문 키워드를 한 번에 조회하려면 eiass_find_projects_by_document_keyword를 써라.
 
     Args:
         keyword: 사업명 등 검색 키워드. 비워도 다른 필터만으로 검색 가능(전부 비우면 에러).
@@ -120,7 +121,7 @@ def eiass_search_projects(keyword: str = '', types: str = '', agency_code: str =
 def eiass_preview_search(
     text_queries: str, match_mode: str = 'any', keyword: str = '', types: str = '', agency_code: str = '',
     consult_date_from: str = '', consult_date_to: str = '', progress_status: str = '완료',
-    biz_gubun: str = '', progress_stage: str = '', stages: str = '협의의견', doc_title_contains: str = '',
+    biz_gubun: str = '', progress_stage: str = '', stages: str = '초안,본안,보완,협의의견', doc_title_contains: str = '',
     max_pages: int = 0, inference_notes: str = '',
 ) -> dict:
     """실제로 문서를 다운로드하지 않고, 이 조건으로 검색하면 무엇을 하게 될지 미리 보여준다.
@@ -153,7 +154,7 @@ def eiass_preview_search(
             '산업단지 사례'라고만 했음"). 없으면 빈 문자열로 둔다.
     """
     type_codes = [c.strip().upper() for c in types.split(',') if c.strip()] or None
-    stage_list = tuple(s.strip() for s in stages.split(',') if s.strip()) or ('협의의견',)
+    stage_list = tuple(s.strip() for s in stages.split(',') if s.strip()) or ('초안', '본안', '보완', '협의의견')
     query_list = [q.strip() for q in text_queries.split(',') if q.strip()]
     title_terms = [t.strip() for t in doc_title_contains.split(',') if t.strip()] or None
     progress_stage_labels = [s.strip() for s in progress_stage.split(',') if s.strip()]
@@ -174,11 +175,12 @@ def eiass_preview_search(
 def eiass_find_projects_by_document_keyword(
     text_queries: str, match_mode: str = 'any', keyword: str = '', types: str = '', agency_code: str = '',
     consult_date_from: str = '', consult_date_to: str = '', progress_status: str = '완료',
-    biz_gubun: str = '', progress_stage: str = '', stages: str = '협의의견', doc_title_contains: str = '',
+    biz_gubun: str = '', progress_stage: str = '', stages: str = '초안,본안,보완,협의의견', doc_title_contains: str = '',
     max_pages: int = 0, offset: int = 0, max_candidates: int = 30,
     inference_notes: str = '', confirmed: bool = False, audit_sample_size: int = 0,
 ) -> dict:
-    """필터(협의완료일 범위/진행상태 등)로 사업을 좁힌 뒤, 지정한 단계(기본 협의의견)의
+    """필터(협의완료일 범위/진행상태 등)로 사업을 좁힌 뒤, 지정한 단계(기본 초안/본안/보완/
+    협의의견 — 협의의견만 우선 확인하면 놓치는 경우가 있어 여러 단계를 기본으로 함께 확인)의
     첨부 PDF 원문에서 키워드가 있는 사업만 골라 리스트로 반환한다. 후보가 적을 때(대략
     50건 이하) 한 번에 끝낼 수 있는 소규모 조회용이다 — 그보다 큰 후보군을 타임아웃 없이
     끝까지 훑으려면 eiass_start_document_keyword_scan(백그라운드 job)을 써라.
@@ -233,7 +235,8 @@ def eiass_find_projects_by_document_keyword(
             eiass_search_projects 설명 참고. 사후환경영향조사는 미지원.
         progress_stage: 진행구분 다중선택, 콤마 구분. 사용 가능 라벨: 초안, 평가서, 재협의,
             약식평가, 변경협의. 비우면 5개 전부(=전체, 필터 없음)로 취급한다.
-        stages: 검색 대상 단계, 콤마 구분(기본 '협의의견'). 예: '협의의견,초안'.
+        stages: 검색 대상 단계, 콤마 구분(기본 '초안,본안,보완,협의의견'). 특정 단계만 보려면
+            좁혀서 넘긴다(예: '협의의견'만).
         doc_title_contains: stages 범위 안에서 파일명에 포함되어야 할 문자열, 콤마 구분(예:
             '대기질,기상'). 챕터별로 쪼개진 초안/본안/보완 등에서 제목에 특정 단어가 들어간
             문서만 확인하고 싶을 때 쓴다(예: '0922 대기질(...).pdf'). 비우면 단계 안의 모든
@@ -246,7 +249,7 @@ def eiass_find_projects_by_document_keyword(
         audit_sample_size: stages 밖의 다른 단계도 이번 배치 중 이 수만큼 표본 검증한다(기본 0=끔).
     """
     type_codes = [c.strip().upper() for c in types.split(',') if c.strip()] or None
-    stage_list = tuple(s.strip() for s in stages.split(',') if s.strip()) or ('협의의견',)
+    stage_list = tuple(s.strip() for s in stages.split(',') if s.strip()) or ('초안', '본안', '보완', '협의의견')
     query_list = [q.strip() for q in text_queries.split(',') if q.strip()]
     title_terms = [t.strip() for t in doc_title_contains.split(',') if t.strip()] or None
     progress_stage_labels = [s.strip() for s in progress_stage.split(',') if s.strip()]
@@ -274,7 +277,7 @@ def eiass_find_projects_by_document_keyword(
 def eiass_start_document_keyword_scan(
     text_queries: str, match_mode: str = 'any', keyword: str = '', types: str = '', agency_code: str = '',
     consult_date_from: str = '', consult_date_to: str = '', progress_status: str = '완료',
-    biz_gubun: str = '', progress_stage: str = '', stages: str = '협의의견', doc_title_contains: str = '',
+    biz_gubun: str = '', progress_stage: str = '', stages: str = '초안,본안,보완,협의의견', doc_title_contains: str = '',
     max_pages: int = 0, batch_size: int = 10, inference_notes: str = '', confirmed: bool = False,
     audit_sample_size: int = 0,
 ) -> dict:
@@ -300,7 +303,7 @@ def eiass_start_document_keyword_scan(
     '변경 내용 요약'은 matches의 matched_snippets 원문 발췌를 근거로 AI가 직접 작성한다.
     """
     type_codes = [c.strip().upper() for c in types.split(',') if c.strip()] or None
-    stage_list = tuple(s.strip() for s in stages.split(',') if s.strip()) or ('협의의견',)
+    stage_list = tuple(s.strip() for s in stages.split(',') if s.strip()) or ('초안', '본안', '보완', '협의의견')
     query_list = [q.strip() for q in text_queries.split(',') if q.strip()]
     title_terms = [t.strip() for t in doc_title_contains.split(',') if t.strip()] or None
     progress_stage_labels = [s.strip() for s in progress_stage.split(',') if s.strip()]

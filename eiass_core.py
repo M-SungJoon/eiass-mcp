@@ -39,7 +39,7 @@ except ImportError:
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 # 저장소 루트 VERSION 파일과 항상 같은 값으로 맞춰서 커밋할 것(버전 두 곳 중복 관리).
-__version__ = '1.2.0'
+__version__ = '1.2.1'
 
 REQUEST_TIMEOUT = (8, 30)
 
@@ -1326,7 +1326,7 @@ def preview_document_keyword_search(
     progress_status='완료',
     biz_gubun='',
     progress_stage_keys=None,
-    stages=('협의의견',),
+    stages=('초안', '본안', '보완', '협의의견'),
     doc_title_contains=None,
     max_pages=0,
     inference_notes='',
@@ -1507,7 +1507,7 @@ def search_projects_by_document_keyword(
     progress_status='완료',
     biz_gubun='',
     progress_stage_keys=None,
-    stages=('협의의견',),
+    stages=('초안', '본안', '보완', '협의의견'),
     doc_title_contains=None,
     max_pages=0,
     offset=0,
@@ -1518,7 +1518,8 @@ def search_projects_by_document_keyword(
     record_pattern=True,
 ):
     """검색 필터(협의완료일 범위/진행상태/진행구분 등)로 후보 사업을 뽑은 뒤, 지정한 단계(기본값
-    '협의의견')의 첨부 PDF 원문에서 text_queries 키워드가 있는 사업만 골라낸다.
+    '초안,본안,보완,협의의견' — 협의의견만 우선 확인하면 놓치는 경우가 있어 여러 단계를
+    기본으로 함께 확인한다)의 첨부 PDF 원문에서 text_queries 키워드가 있는 사업만 골라낸다.
 
     이 함수는 실제로 문서를 다운로드하는 "실행" 단계다 — MCP 도구 계층
     (eiass_find_projects_by_document_keyword / eiass_start_document_keyword_scan)은
