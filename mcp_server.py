@@ -67,7 +67,7 @@ def _run_scan_job(job_id, kwargs):
 
 
 @mcp.tool()
-def eiass_search_projects(keyword: str = '', types: str = '', agency_code: str = '', max_pages: int = 2,
+def eiass_search_projects(keyword: str = '', types: str = '', agency_code: str = '', max_pages: int = 0,
                            consult_date_from: str = '', consult_date_to: str = '',
                            progress_status: str = '', climate_filter: str = '', biz_gubun: str = '',
                            progress_stage: str = '') -> dict:
@@ -83,7 +83,9 @@ def eiass_search_projects(keyword: str = '', types: str = '', agency_code: str =
         types: 평가종류 코드 콤마 구분 (S=전략환경영향평가, M=소규모환경영향평가,
                E=환경영향평가, A=사후환경영향조사, P=사전환경성검토). 비우면 전체.
         agency_code: 협의기관 코드 (선택, 예: 'HG'=한강유역환경청).
-        max_pages: 평가종류별 최대 조회 페이지 수(1페이지=100건). 과도한 조회 방지를 위해 기본 2.
+        max_pages: 평가종류별 최대 조회 페이지 수(1페이지=100건). 0(기본값)이면 무제한 —
+            검색조건으로 이미 필터링됐다고 보고 결과가 끝날 때까지(다음 페이지가 없을 때까지)
+            전부 조회한다. 후보가 아주 많으면 시간이 오래 걸릴 수 있다.
         consult_date_from: 'YYYY-MM-DD'. 협의완료일(사후조사는 조사년도) 하한.
         consult_date_to: 'YYYY-MM-DD'. 협의완료일(사후조사는 조사년도) 상한.
             예: "최근 1년" → consult_date_from=오늘로부터 1년 전, consult_date_to=오늘.
@@ -104,7 +106,7 @@ def eiass_search_projects(keyword: str = '', types: str = '', agency_code: str =
         stage_keys = core.progress_stage_keys_from_labels(stage_labels)
         results = core.search_projects(
             keyword, type_codes=type_codes, agency_code=agency_code,
-            max_pages=max(1, min(max_pages, core.MAX_SEARCH_PAGES)),
+            max_pages=max(0, max_pages),
             consult_date_from=consult_date_from or None, consult_date_to=consult_date_to or None,
             progress_status=progress_status, climate_filter=climate_filter, biz_gubun=biz_gubun,
             progress_stage_keys=stage_keys,
@@ -119,7 +121,7 @@ def eiass_preview_search(
     text_queries: str, match_mode: str = 'any', keyword: str = '', types: str = '', agency_code: str = '',
     consult_date_from: str = '', consult_date_to: str = '', progress_status: str = '완료',
     biz_gubun: str = '', progress_stage: str = '', stages: str = '협의의견', doc_title_contains: str = '',
-    max_pages: int = 2, inference_notes: str = '',
+    max_pages: int = 0, inference_notes: str = '',
 ) -> dict:
     """실제로 문서를 다운로드하지 않고, 이 조건으로 검색하면 무엇을 하게 될지 미리 보여준다.
     eiass_find_projects_by_document_keyword / eiass_start_document_keyword_scan을
@@ -162,7 +164,7 @@ def eiass_preview_search(
             consult_date_from=consult_date_from or None, consult_date_to=consult_date_to or None,
             progress_status=progress_status, biz_gubun=biz_gubun, progress_stage_keys=stage_keys,
             stages=stage_list, doc_title_contains=title_terms,
-            max_pages=max(1, min(max_pages, core.MAX_SEARCH_PAGES)), inference_notes=inference_notes,
+            max_pages=max(0, max_pages), inference_notes=inference_notes,
         )
     except core.EiassError as exc:
         return {'error': str(exc)}
@@ -173,7 +175,7 @@ def eiass_find_projects_by_document_keyword(
     text_queries: str, match_mode: str = 'any', keyword: str = '', types: str = '', agency_code: str = '',
     consult_date_from: str = '', consult_date_to: str = '', progress_status: str = '완료',
     biz_gubun: str = '', progress_stage: str = '', stages: str = '협의의견', doc_title_contains: str = '',
-    max_pages: int = 2, offset: int = 0, max_candidates: int = 30,
+    max_pages: int = 0, offset: int = 0, max_candidates: int = 30,
     inference_notes: str = '', confirmed: bool = False, audit_sample_size: int = 0,
 ) -> dict:
     """필터(협의완료일 범위/진행상태 등)로 사업을 좁힌 뒤, 지정한 단계(기본 협의의견)의
@@ -236,7 +238,7 @@ def eiass_find_projects_by_document_keyword(
             '대기질,기상'). 챕터별로 쪼개진 초안/본안/보완 등에서 제목에 특정 단어가 들어간
             문서만 확인하고 싶을 때 쓴다(예: '0922 대기질(...).pdf'). 비우면 단계 안의 모든
             PDF를 확인한다.
-        max_pages: 평가종류별 최대 검색 페이지 수.
+        max_pages: 평가종류별 최대 검색 페이지 수(1페이지=100건). 0(기본값)이면 무제한(끝까지 조회).
         offset: 후보 목록에서 시작할 위치(이어서 조회할 때 이전 응답의 next_offset을 넘긴다).
         max_candidates: 이번 호출에서 원문까지 내려받아 확인할 최대 후보 수(기본 30).
         inference_notes: AI가 추론/제안해서 좁힌 조건이 있으면 그 내용과 이유(없으면 빈 문자열).
@@ -255,7 +257,7 @@ def eiass_find_projects_by_document_keyword(
             consult_date_from=consult_date_from or None, consult_date_to=consult_date_to or None,
             progress_status=progress_status, biz_gubun=biz_gubun, progress_stage_keys=stage_keys,
             stages=stage_list, doc_title_contains=title_terms,
-            max_pages=max(1, min(max_pages, core.MAX_SEARCH_PAGES)),
+            max_pages=max(0, max_pages),
         )
         if not confirmed:
             return core.preview_document_keyword_search(
@@ -273,7 +275,7 @@ def eiass_start_document_keyword_scan(
     text_queries: str, match_mode: str = 'any', keyword: str = '', types: str = '', agency_code: str = '',
     consult_date_from: str = '', consult_date_to: str = '', progress_status: str = '완료',
     biz_gubun: str = '', progress_stage: str = '', stages: str = '협의의견', doc_title_contains: str = '',
-    max_pages: int = 2, batch_size: int = 10, inference_notes: str = '', confirmed: bool = False,
+    max_pages: int = 0, batch_size: int = 10, inference_notes: str = '', confirmed: bool = False,
     audit_sample_size: int = 0,
 ) -> dict:
     """대량 후보(수십~수백 건)를 타임아웃 걱정 없이 끝까지 훑는 백그라운드 스캔을 시작한다.
@@ -311,7 +313,7 @@ def eiass_start_document_keyword_scan(
         consult_date_from=consult_date_from or None, consult_date_to=consult_date_to or None,
         progress_status=progress_status, biz_gubun=biz_gubun, progress_stage_keys=stage_keys,
         stages=stage_list, doc_title_contains=title_terms,
-        max_pages=max(1, min(max_pages, core.MAX_SEARCH_PAGES)),
+        max_pages=max(0, max_pages),
     )
     if not confirmed:
         try:

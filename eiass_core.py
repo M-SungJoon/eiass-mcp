@@ -39,10 +39,9 @@ except ImportError:
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 # 저장소 루트 VERSION 파일과 항상 같은 값으로 맞춰서 커밋할 것(버전 두 곳 중복 관리).
-__version__ = '1.1.0'
+__version__ = '1.2.0'
 
 REQUEST_TIMEOUT = (8, 30)
-MAX_SEARCH_PAGES = 5
 
 EIASS_BASE = 'https://www.eiass.go.kr'
 SEARCH_API_URL = EIASS_BASE + '/searchApi/search.do'
@@ -572,7 +571,7 @@ def _passes_extra_filters(item, consult_date_from=None, consult_date_to=None, pr
     return True
 
 
-def search_projects(keyword='', type_codes=None, agency_code='', max_pages=MAX_SEARCH_PAGES, session=None,
+def search_projects(keyword='', type_codes=None, agency_code='', max_pages=0, session=None,
                      consult_date_from=None, consult_date_to=None, progress_status='', climate_filter='',
                      progress_stage_keys=None, biz_gubun=''):
     """EIASS 사업 검색. 원본 앱(run_search)의 협의완료일 범위/진행상태/기후변화영향평가/
@@ -582,6 +581,10 @@ def search_projects(keyword='', type_codes=None, agency_code='', max_pages=MAX_S
         keyword: 사업명 등 포함검색 키워드. 비워도 다른 필터(협의일자/진행상태/기관)만으로 검색 가능.
         type_codes: None이면 5개 평가종류(S/M/E/A/P) 전체.
         agency_code: 협의기관 코드.
+        max_pages: 평가종류별 최대 조회 페이지 수(1페이지=100건). 0(기본값) 또는 None이면
+            무제한 — 검색조건으로 이미 좁혀졌다고 보고, 결과가 100건 미만인 페이지가 나올
+            때까지(=더 이상 다음 페이지가 없을 때까지) 끝까지 조회한다. 후보가 아주 많은
+            조건이면 호출 시간이 오래 걸릴 수 있다.
         consult_date_from/consult_date_to: 'YYYY-MM-DD' 문자열. 협의완료일(사후조사는 조사년도)
             기준 범위 필터. 서버에는 연도 단위로만 먼저 필터링을 걸고, 정확한 날짜 비교는
             결과를 받은 뒤 클라이언트에서 다시 검증한다(원본과 동일한 2단계 필터링).
@@ -684,7 +687,11 @@ def search_projects(keyword='', type_codes=None, agency_code='', max_pages=MAX_S
 
         payload['urlString'] = '&' + urllib.parse.urlencode(url_dict)
 
-        for page_no in range(1, max_pages + 1):
+        page_no = 0
+        while True:
+            page_no += 1
+            if max_pages and max_pages > 0 and page_no > max_pages:
+                break
             payload['currentPage'] = str(page_no)
             res = s.post(SEARCH_API_URL, data=payload, headers=headers, timeout=REQUEST_TIMEOUT, verify=False)
             if res.status_code != 200:
@@ -1321,7 +1328,7 @@ def preview_document_keyword_search(
     progress_stage_keys=None,
     stages=('협의의견',),
     doc_title_contains=None,
-    max_pages=2,
+    max_pages=0,
     inference_notes='',
     sample_detail_count=15,
     session=None,
@@ -1502,7 +1509,7 @@ def search_projects_by_document_keyword(
     progress_stage_keys=None,
     stages=('협의의견',),
     doc_title_contains=None,
-    max_pages=2,
+    max_pages=0,
     offset=0,
     max_candidates=30,
     session=None,
