@@ -1410,13 +1410,16 @@ def preview_document_keyword_search(
         ', '.join(PROGRESS_STAGE_KEY_TO_LABEL.get(k, k) for k in progress_stage_keys)
         if progress_stage_keys else '전체'
     )
+    progress_status_label = {'완료': '완료', '진행': '진행중'}.get(progress_status, '전체')
+    # 사용자에게 보여줄 확인 문구는 반드시 이 10개 항목을 이 순서/라벨 그대로 담아야 한다
+    # (검색조건 항목 하나도 빠뜨리지 말 것) — 순서/라벨을 바꾸지 마라.
     bullets = [
         f"- 평가종류: `{type_label}`",
         f"- 사업유형: `{biz_label}`",
-        f"- 협의완료일: `{date_label}`",
-        f"- 진행상태: `{progress_status or '전체'}`",
-        f"- 진행구분: `{progress_stage_label}`",
         f"- 협의기관: `{agency_label}`",
+        f"- 협의완료일: `{date_label}`",
+        f"- 진행현황: `{progress_status_label}`",
+        f"- 진행구분: `{progress_stage_label}`",
         f"- 확인 문서 범위: `{doc_scope_value}`",
         f"- 키워드 매칭: {keyword_phrase}",
         f"- 예상 후보 사업 수: `{total}`건",
@@ -1745,6 +1748,53 @@ def search_projects_by_document_keyword(
         'audit_sample': audit_sample,
         'search_summary': ' | '.join(summary_parts),
     }
+
+
+# ── 조사 결과 CSV 내보내기 ──
+
+# eiass_find_projects_by_document_keyword / eiass_start_document_keyword_scan 결과를
+# 사용자에게 보고할 때 반드시 이 5개 컬럼을 이 순서 그대로 담아야 한다(하나도 빠짐없이).
+CSV_REPORT_COLUMNS = ['사업명', 'eia_cd', '원문 파일명', '유사내용 페이지번호', '변경 내용 요약']
+
+
+def export_matches_csv(rows, filename=None, out_dir=None):
+    """조사한 사업의 전체 리스트를 CSV 파일로 저장한다.
+
+    rows: dict 리스트. 각 dict는 CSV_REPORT_COLUMNS(사업명/eia_cd/원문 파일명/
+    유사내용 페이지번호/변경 내용 요약)를 전부 키로 가지고 있어야 한다. '변경 내용 요약'은
+    기계적으로 생성할 수 없으므로 AI가 matched_snippets(원문 발췌)를 근거로 직접 요약해서
+    채워 넣어야 한다 — 빈 문자열로 두지 말 것.
+
+    filename: 저장할 파일명(확장자 없으면 .csv 자동 부여). 비우면 타임스탬프로 자동 생성.
+    out_dir: 저장 폴더. 비우면 사용자 Downloads 폴더.
+    """
+    if not rows:
+        raise EiassError('rows가 비어 있습니다 — CSV로 내보낼 조사 결과가 없습니다.')
+    missing_any = set()
+    for row in rows:
+        missing_any |= (set(CSV_REPORT_COLUMNS) - set(row.keys()))
+    if missing_any:
+        raise EiassError(
+            f"rows 항목에 다음 컬럼이 빠져 있습니다: {', '.join(sorted(missing_any))} "
+            f"(필수 컬럼 {len(CSV_REPORT_COLUMNS)}개, 이 순서로 전부 포함해야 함: "
+            f"{', '.join(CSV_REPORT_COLUMNS)})"
+        )
+
+    out_dir = out_dir or os.path.join(os.path.expanduser('~'), 'Downloads')
+    os.makedirs(out_dir, exist_ok=True)
+    if not filename:
+        filename = f"eiass_조사결과_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
+    if not filename.lower().endswith('.csv'):
+        filename += '.csv'
+    path = os.path.join(out_dir, filename)
+
+    import csv as _csv
+    with open(path, 'w', newline='', encoding='utf-8-sig') as f:
+        writer = _csv.DictWriter(f, fieldnames=CSV_REPORT_COLUMNS)
+        writer.writeheader()
+        for row in rows:
+            writer.writerow({col: row.get(col, '') for col in CSV_REPORT_COLUMNS})
+    return path
 
 
 # ── VWorld 지오코딩 ──

@@ -16,18 +16,37 @@
 | `eiass_read_document`                     | 첨부 PDF를 다운로드해 텍스트 추출(로컬 캐시 우선)                                                                                                            |
 | `eiass_check_protected_area_adjacency`    | 주소 → 지오코딩 → 반경 내 KDPA 보호지역(국립공원/천연기념물/습지보호지역/야생생물보호구역/OECM) 조회                                                                            |
 | `eiass_geocode`                           | 주소 → 경위도 좌표                                                                                                                               |
+| `eiass_export_matches_csv`                | 조사 결과(사업명/eia_cd/원문 파일명/유사내용 페이지번호/변경 내용 요약)를 CSV 파일로 저장                                                                                       |
 
 ### 실행 전 확인(confirm) 게이트
 
-`eiass_find_projects_by_document_keyword`/`eiass_start_document_keyword_scan`은 **`confirmed=true`를 명시적으로 넘기지 않으면 실제로 문서를 다운로드하지 않는다.** 대신 아래를 담은 확인 문구를 반환한다:
+`eiass_find_projects_by_document_keyword`/`eiass_start_document_keyword_scan`은 **`confirmed=true`를 명시적으로 넘기지 않으면 실제로 문서를 다운로드하지 않는다.** 대신 아래 10개 항목을 **이 순서 그대로, 하나도 빠짐없이** 담은 확인 문구를 반환한다 — 사용자가 언급하지 않은 필터는 항상 `전체`로 표시:
 
-- 적용될 검색 조건(평가종류/사업유형/협의완료일/진행상태/협의기관) — 사용자가 언급하지 않은 필터는 항상 `전체`로 표시
+1. 평가종류
+2. 사업유형
+3. 협의기관
+4. 협의완료일
+5. 진행현황(완료/진행중/전체)
+6. 진행구분
+7. 확인 문서 범위
+8. 키워드 매칭
+9. 예상 후보 사업 수
+10. 예상 확인 문서 수
+
+추가로:
 - AI가 사용자 발화 이상으로 추론/제안해서 좁힌 조건이 있다면 `inference_notes`로 별도 표시(비워두면 "AI가 임의로 좁힌 조건 없음")
-- 확인할 문서 범위(stages)와 키워드 매칭 방식
-- 예상 후보 수, 예상 문서 수(표본 추정)
 - 과거 유사 조건(같은 평가종류+사업유형) 기록이 있으면 우선순위 힌트로만 표시 — **검색 범위를 줄이는 근거로 쓰지 않으며, 신뢰도(표본 수 기준 low/medium/high)를 함께 표시한다**
 
 사용자 승인 후 **같은 조건 그대로 `confirmed=true`만 추가**해서 다시 호출해야 실제로 실행된다.
+
+### 조사 결과 보고 형식
+
+`eiass_find_projects_by_document_keyword`/`eiass_start_document_keyword_scan`으로 조사를 마치면 AI는 항상:
+
+1. `사업명 | eia_cd | 원문 파일명 | 유사내용 페이지번호 | 변경 내용 요약` 컬럼의 마크다운 표로 결과를 채팅에 보여주고,
+2. 같은 행 데이터를 `eiass_export_matches_csv`로 CSV 파일로도 만들어 저장 경로를 사용자에게 안내한다.
+
+`변경 내용 요약`은 기계적으로 만들 수 없으므로, `matches[].matched_snippets`의 원문 발췌를 근거로 AI가 직접 작성해서 채운다(빈 값 금지). CSV는 기본적으로 사용자 Downloads 폴더에 `utf-8-sig`(엑셀 호환)로 저장된다.
 
 ### 오탐(참고문헌/부록) 감지와 대응
 

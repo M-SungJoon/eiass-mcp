@@ -208,6 +208,11 @@ def eiass_find_projects_by_document_keyword(
     비율이 높다는 뜻이다 — refinement_hint를 참고해 바로 최종 답을 내지 말고, 사용자에게
     문맥 조건을 추가할지 물어봐라.
 
+    **최종 보고 형식(필수)**: 조사가 끝나면 (1) `사업명 | eia_cd | 원문 파일명 |
+    유사내용 페이지번호 | 변경 내용 요약` 컬럼의 마크다운 표로 결과를 보여주고,
+    (2) 같은 행 데이터를 eiass_export_matches_csv로 CSV 파일로도 만들어 경로를 안내하라.
+    '변경 내용 요약'은 matched_snippets 원문 발췌를 근거로 AI가 직접 작성한다.
+
     주의: 부분문자열 매칭이다(예: '원형보전지'가 원문에 그대로 등장해야 함). 동의어나
     문맥상 유사 표현까지 잡으려면, 이 도구로 1차 후보를 좁힌 뒤 필요시 eiass_read_document로
     각 사업의 원문 전체를 받아 직접 의미 단위로 재검토하라. stages를 "초안,본안"처럼 넓히면
@@ -286,6 +291,11 @@ def eiass_start_document_keyword_scan(
     오탐 신호는 eiass_get_scan_status 결과의 각 배치 처리 시 누적되지 않으므로, 스캔이
     끝난 뒤 eiass_find_projects_by_document_keyword로 소규모 재확인하거나 매칭 스니펫의
     reference_like 필드를 직접 검토하라.
+
+    **최종 보고 형식(필수)**: 스캔이 done이 되면 (1) `사업명 | eia_cd | 원문 파일명 |
+    유사내용 페이지번호 | 변경 내용 요약` 컬럼의 마크다운 표로 결과를 보여주고,
+    (2) 같은 행 데이터를 eiass_export_matches_csv로 CSV 파일로도 만들어 경로를 안내하라.
+    '변경 내용 요약'은 matches의 matched_snippets 원문 발췌를 근거로 AI가 직접 작성한다.
     """
     type_codes = [c.strip().upper() for c in types.split(',') if c.strip()] or None
     stage_list = tuple(s.strip() for s in stages.split(',') if s.strip()) or ('협의의견',)
@@ -396,6 +406,41 @@ def eiass_read_document(file_seq: str, max_chars: int = 20000) -> dict:
         return core.download_document_text(file_seq, max_chars=max_chars)
     except core.EiassError as exc:
         return {'error': str(exc)}
+
+
+@mcp.tool()
+def eiass_export_matches_csv(rows_json: str, filename: str = '') -> dict:
+    """조사 결과(eiass_find_projects_by_document_keyword / eiass_start_document_keyword_scan의
+    matches)를 CSV 파일로 저장한다.
+
+    문서 키워드 조사 결과를 사용자에게 보고할 때는 다음 두 가지를 항상 함께 한다:
+    1) 아래와 같은 컬럼으로 마크다운 표를 작성해 채팅에 보여준다:
+       `사업명 | eia_cd | 원문 파일명 | 유사내용 페이지번호 | 변경 내용 요약`
+    2) 조사한 사업의 전체 리스트를 이 도구로 CSV 파일로 만들어 제시한다(생성된 경로를
+       사용자에게 알려준다).
+
+    Args:
+        rows_json: JSON 배열 문자열. 각 원소는 아래 5개 키를 전부 포함한 객체여야 한다
+            (하나도 빠짐없이, 이 키 이름 그대로):
+            "사업명", "eia_cd", "원문 파일명", "유사내용 페이지번호", "변경 내용 요약".
+            "변경 내용 요약"은 matched_snippets의 원문 발췌를 근거로 AI가 직접 작성해야
+            한다(빈 문자열 금지) — 같은 사업/파일이라도 매칭된 위치(페이지)가 다르면
+            행을 나눠서 각각 요약한다.
+            예: '[{"사업명":"OO사업","eia_cd":"E12345","원문 파일명":"협의의견.pdf",
+                "유사내용 페이지번호":"12","변경 내용 요약":"CALPUFF 모델 적용 관련 조건 추가"}]'
+        filename: 저장할 파일명(확장자 생략 가능). 비우면 타임스탬프로 자동 생성.
+    """
+    try:
+        rows = core.json.loads(rows_json)
+    except Exception as exc:
+        return {'error': f'rows_json 파싱 실패: {exc}'}
+    if not isinstance(rows, list):
+        return {'error': 'rows_json은 객체(dict)의 JSON 배열이어야 합니다.'}
+    try:
+        path = core.export_matches_csv(rows, filename=filename or None)
+    except core.EiassError as exc:
+        return {'error': str(exc)}
+    return {'path': path, 'row_count': len(rows), 'columns': core.CSV_REPORT_COLUMNS}
 
 
 @mcp.tool()
