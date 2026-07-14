@@ -14,9 +14,11 @@
 | `eiass_cancel_scan`                       | 진행 중인 백그라운드 스캔 취소(즉시 응답)                                                                                                                  |
 | `eiass_get_project_documents`             | 사업 개요 필드 + 단계별(초안/본안/협의의견 등) 첨부문서 목록 조회                                                                                                   |
 | `eiass_read_document`                     | 첨부 PDF를 다운로드해 텍스트 추출(로컬 캐시 우선)                                                                                                            |
-| `eiass_check_protected_area_adjacency`    | 주소 → 지오코딩 → 반경 내 KDPA 보호지역(국립공원/천연기념물/습지보호지역/야생생물보호구역/OECM) 조회                                                                            |
+| `eiass_check_protected_area_adjacency`    | 단순 주소 문자열 → 지오코딩 → 반경 내 KDPA 보호지역(국립공원/천연기념물/습지보호지역/야생생물보호구역/OECM) 조회. `designations`로 특정 종류만 조회 가능                                              |
+| `eiass_check_project_protected_area_adjacency` | EIASS 사업지 주소(도로명/지번 복합 표기) 전용 — 여러 후보로 분해해 지오코딩 후 보호구역 인접조회. `confirmed=true` 없이는 미리보기만 반환                                                    |
 | `eiass_geocode`                           | 주소 → 경위도 좌표                                                                                                                               |
-| `eiass_export_matches_csv`                | 조사 결과(사업명/eia_cd/원문 파일명/유사내용 페이지번호/변경 내용 요약)를 CSV 파일로 저장                                                                                       |
+| `eiass_export_matches_csv`                | 문서 키워드 조사 결과(사업명/eia_cd/원문 파일명/유사내용 페이지번호/변경 내용 요약)를 CSV 파일로 저장                                                                                  |
+| `eiass_export_spatial_matches_csv`        | 공간조회(보호구역 인접) 결과(사업명/eia_cd/대상 보호구역/거리)를 CSV 파일로 저장                                                                                            |
 | `eiass_version`                           | 현재 실행 중인 서버(exe)의 버전 반환                                                                                                                    |
 
 ### 실행 전 확인(confirm) 게이트
@@ -48,6 +50,31 @@
 2. 같은 행 데이터를 `eiass_export_matches_csv`로 CSV 파일로도 만들어 저장 경로를 사용자에게 안내한다.
 
 `변경 내용 요약`은 기계적으로 만들 수 없으므로, `matches[].matched_snippets`의 원문 발췌를 근거로 AI가 직접 작성해서 채운다(빈 값 금지). CSV는 기본적으로 사용자 Downloads 폴더에 `utf-8-sig`(엑셀 호환)로 저장된다.
+
+### 사업지 주소 지오코딩 (도로명·지번 복합 표기 대응)
+
+EIASS 사업 개요의 사업지 주소는 `경기도 김포시 대곶면 (천호로 210) 대벽리 662-1번지`처럼 도로명과 지번이 괄호로 섞인 복합 문자열인 경우가 많다. `eiass_geocode`/`eiass_check_protected_area_adjacency`는 입력 문자열을 그대로만 조회하므로 이런 복합 표기에서 지오코딩이 실패하기 쉽다.
+
+`eiass_check_project_protected_area_adjacency`는 이 문제를 위해 사업지 주소를 아래 순서로 여러 후보로 분해해 순서대로 지오코딩을 시도한다(성공한 후보에서 멈춤):
+
+1. 원문 그대로
+2. 개행/중복 공백만 정리한 원문
+3. 괄호 안 도로명 + 앞쪽 행정구역 접두어 (예: `경기도 김포시 대곶면 천호로 210`)
+4. 괄호를 제거한 지번 표기 (예: `경기도 김포시 대곶면 대벽리 662-1번지`)
+5. **최후 대체**: 위 후보가 모두 실패했을 때만 읍/면/동 단위 행정구역 (예: `경기도 김포시 대곶면`)
+
+응답의 `location_precision`(raw/normalized/road_address/parcel_address/admin_fallback)과 `fallback_used`로 "사업지 주소 기준 거리"인지 "읍면동 대체 거리"인지 구분할 수 있다. `attempts`에는 시도별 HTTP 상태·에러·매칭 여부가 남아 실패 원인을 진단할 수 있다.
+
+### 보호구역 종류 필터 (조회 속도)
+
+`eiass_check_protected_area_adjacency`/`eiass_check_project_protected_area_adjacency`의 `designations` 인자로 확인할 보호구역 종류를 좁힐 수 있다(콤마 구분, 예: `"천연기념물"`). 비우면 기존처럼 국립공원/천연기념물/습지보호지역/야생생물보호구역/OECM/최신 보호지역 전체 6개 레이어를 모두 조회한다 — 필요한 종류를 미리 알고 있으면 지정해서 불필요한 왕복 요청과 대기 시간을 줄일 수 있다. KDPA 최신 버전 조회(`/getNewVer`)는 5분 TTL로 캐시되어, 같은 세션에서 여러 사업을 연달아 조회해도 매번 다시 부르지 않는다. 서버측 `DWITHIN` 필터는 근사치라 경계 케이스에서 반경을 살짝 넘는 결과가 섞일 수 있어, 폴리곤 경계까지 재계산한 거리 기준으로 반경 초과 결과는 후처리로 제외한다.
+
+### 공간조회(보호구역 인접) — 확인 게이트 + 보고 형식
+
+`eiass_check_project_protected_area_adjacency`도 문서 키워드 조사와 동일한 원칙을 따른다:
+
+- **실행 전 확인**: `confirmed=true` 없이 호출하면 실제 지오코딩/공간조회를 하지 않고 조건(사업지 주소/반경/보호구역 종류/읍면동 대체 허용 여부) 확인 문구만 반환한다. 원문 검색으로 찾은 여러 후보 사업을 이어서 공간조회할 때는, 사업별로 반복 호출하기 전에 전체 대상 사업 목록 + 조건을 사용자에게 한 번에 보여주고 승인받아야 한다.
+- **보고 형식**: 여러 사업을 조회했다면 `사업명 | eia_cd | 대상 보호구역 | 거리` 컬럼의 마크다운 표로 보여주고, 같은 행 데이터를 `eiass_export_spatial_matches_csv`로 CSV 파일로도 만들어 경로를 안내한다(문서 키워드 조사용 `eiass_export_matches_csv`와 컬럼이 다르다).
 
 ### 오탐(참고문헌/부록) 감지와 대응
 

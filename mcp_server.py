@@ -449,13 +449,21 @@ def eiass_export_matches_csv(rows_json: str, filename: str = '') -> dict:
 
 
 @mcp.tool()
-def eiass_check_protected_area_adjacency(address: str, radius_m: int = 1000) -> dict:
-    """사업 위치(주소)와 인근 KDPA 보호지역(국립공원/천연기념물/습지보호지역/야생생물보호구역/OECM)의
+def eiass_check_protected_area_adjacency(address: str, radius_m: int = 1000, designations: str = '') -> dict:
+    """주소와 인근 KDPA 보호지역(국립공원/천연기념물/습지보호지역/야생생물보호구역/OECM)의
     인접 여부와 거리를 확인한다. 내부적으로 VWorld로 지오코딩 후 KDPA WFS를 반경 검색한다.
+
+    사업 개요의 사업지 주소(예: '경기도 김포시 대곶면 (천호로 210) 대벽리 662-1번지'처럼
+    도로명/지번이 괄호로 섞인 복합 표기)를 넘길 때는 이 도구 대신
+    eiass_check_project_protected_area_adjacency를 써라 — 이 도구는 단순 주소 문자열
+    하나만 그대로 지오코딩하므로 복합 표기에서 지오코딩이 실패하기 쉽다.
 
     Args:
         address: 지번 또는 도로명 주소.
         radius_m: 검색 반경(미터). 기본 1000m.
+        designations: 확인할 보호구역 종류, 콤마 구분(예: '천연기념물' 또는 '천연기념물,국립공원').
+            비우면(기본값) 국립공원/천연기념물/습지보호지역/야생생물보호구역/OECM/최신 보호지역
+            전체를 모두 조회한다 — 필요한 종류만 알면 지정해서 조회 시간을 줄여라.
     """
     try:
         coord = core.geocode_address(address)
@@ -464,7 +472,10 @@ def eiass_check_protected_area_adjacency(address: str, radius_m: int = 1000) -> 
     if not coord:
         return {'error': f'주소를 좌표로 변환하지 못했습니다: {address}'}
     lon, lat, source = coord
-    areas = core.find_nearby_protected_areas(lon, lat, radius_m=radius_m)
+    try:
+        areas = core.find_nearby_protected_areas(lon, lat, radius_m=radius_m, designations=designations or None)
+    except core.EiassError as exc:
+        return {'error': str(exc)}
     return {
         'address': address,
         'lon': lon, 'lat': lat, 'geocode_source': source,
@@ -472,6 +483,132 @@ def eiass_check_protected_area_adjacency(address: str, radius_m: int = 1000) -> 
         'nearby_count': len(areas),
         'nearby_protected_areas': areas,
     }
+
+
+@mcp.tool()
+def eiass_check_project_protected_area_adjacency(
+    project_location: str, radius_m: int = 1000, designations: str = '',
+    allow_admin_fallback: bool = True, confirmed: bool = False,
+) -> dict:
+    """EIASS 사업 개요의 사업지 주소(eiass_get_project_documents 결과 fields['location'])를
+    지오코딩해 인근 KDPA 보호지역과의 거리를 확인한다.
+
+    사업지 주소는 '경기도 김포시 대곶면 (천호로 210) 대벽리 662-1번지'처럼 도로명과 지번이
+    괄호로 섞인 복합 표기인 경우가 많다 — 이 도구는 원문을 그대로/괄호만 정리/괄호 안
+    도로명(+앞쪽 행정구역)/괄호 밖 지번, 이 순서로 여러 후보를 만들어 순서대로 지오코딩을
+    시도한다. 사업지 주소 후보가 하나라도 성공하면 그 결과를 쓰고, 전부 실패했을 때만(그리고
+    allow_admin_fallback=True일 때만) 읍/면/동 단위 행정구역으로 최후 대체한다. 응답의
+    `location_precision`/`fallback_used`로 사업지 주소 기준인지 읍면동 대체인지 구분된다.
+
+    **실행 전 확인 필수**: 원문 키워드 검색 등으로 찾은 여러 후보 사업을 이어서 공간조회할
+    때는, 이 도구를 사업별로 반복 호출하기 전에 검토 대상 사업 목록 전체 + radius_m +
+    designations를 사용자에게 한 번에 보여주고 승인을 받아라. confirmed=False(기본값)면
+    실제 지오코딩·공간조회를 하지 않고 위 조건만 요약한 확인 문구를 반환한다. 사용자 승인
+    후 같은 조건 + confirmed=true로 사업마다 호출한다.
+
+    **최종 보고 형식(필수)**: 여러 사업을 조회했다면 (1) `사업명 | eia_cd | 대상 보호구역 |
+    거리` 컬럼의 마크다운 표로 결과를 보여주고, (2) 같은 행 데이터를
+    eiass_export_spatial_matches_csv로 CSV 파일로도 만들어 경로를 안내하라(문서 키워드
+    조사 결과용 eiass_export_matches_csv와는 컬럼이 다르니 혼동하지 말 것).
+
+    Args:
+        project_location: 사업지 주소(사업 개요의 location 필드 원문 그대로 넘기면 된다).
+        radius_m: 검색 반경(미터). 기본 1000m.
+        designations: 확인할 보호구역 종류, 콤마 구분(예: '천연기념물'). 비우면(기본값) 전체
+            레이어를 조회한다 — 필요한 종류만 알면 지정해서 조회 시간을 줄여라(예: 이번 사례처럼
+            천연기념물만 확인하면 되면 다른 5개 레이어를 건너뛴다).
+        allow_admin_fallback: True(기본값)면 사업지 주소 후보가 모두 실패했을 때 읍/면/동
+            단위로 대체 지오코딩한다. False면 대체하지 않고 실패로 반환한다.
+        confirmed: 사용자 승인을 받았으면 true. false(기본값)면 미리보기만 반환.
+    """
+    if not confirmed:
+        designation_label = designations or '전체(국립공원/천연기념물/습지보호지역/야생생물보호구역/OECM/최신 보호지역 전체)'
+        message = '\n'.join([
+            "아래 조건으로 사업지 위치 기반 보호구역 인접조회를 진행해도 될까요?",
+            "",
+            f"- 사업지 주소: `{project_location}`",
+            f"- 검색 반경: `{radius_m}`m",
+            f"- 대상 보호구역: `{designation_label}`",
+            f"- 사업지 주소 지오코딩 실패 시 읍/면/동 대체: `{'허용' if allow_admin_fallback else '허용 안 함'}`",
+            "",
+            "여러 사업을 이어서 조회할 계획이면, 전체 대상 사업 목록도 함께 보여주고 한 번에 "
+            "승인받은 뒤 사업별로 confirmed=true를 붙여 호출하세요.",
+            "",
+            "승인해주시면 같은 조건에 confirmed=true를 붙여 실행하고, 결과를 정리해 알려드리겠습니다.",
+        ])
+        return {
+            'confirm_required': True,
+            'project_location': project_location, 'radius_m': radius_m,
+            'designations': designations or 'ALL', 'allow_admin_fallback': allow_admin_fallback,
+            'confirmation_message': message,
+        }
+
+    try:
+        geocoded = core.geocode_project_location(project_location)
+    except core.EiassError as exc:
+        return {'error': str(exc)}
+    if not geocoded:
+        return {'error': f'사업지 주소가 비어 있습니다: {project_location!r}'}
+    if geocoded['lon'] is None:
+        return {
+            'project_location': project_location,
+            'error': '사업지 주소를 좌표로 변환하지 못했습니다(읍/면/동 대체 포함 모든 후보 실패).',
+            'attempts': geocoded['attempts'],
+        }
+    if geocoded['fallback_used'] and not allow_admin_fallback:
+        return {
+            'project_location': project_location,
+            'error': '사업지 주소 지오코딩에 실패했고 allow_admin_fallback=False라 읍/면/동 대체를 하지 않았습니다.',
+            'attempts': geocoded['attempts'],
+        }
+
+    try:
+        areas = core.find_nearby_protected_areas(
+            geocoded['lon'], geocoded['lat'], radius_m=radius_m, designations=designations or None)
+    except core.EiassError as exc:
+        return {'error': str(exc)}
+
+    return {
+        'project_location': project_location,
+        'lon': geocoded['lon'], 'lat': geocoded['lat'],
+        'geocode_source': geocoded['geocode_source'],
+        'geocode_query_used': geocoded['geocode_query_used'],
+        'location_precision': geocoded['location_precision'],
+        'fallback_used': geocoded['fallback_used'],
+        'radius_m': radius_m,
+        'nearby_count': len(areas),
+        'nearby_protected_areas': areas,
+    }
+
+
+@mcp.tool()
+def eiass_export_spatial_matches_csv(rows_json: str, filename: str = '') -> dict:
+    """공간조회(보호구역 인접) 결과를 CSV 파일로 저장한다.
+
+    eiass_check_project_protected_area_adjacency로 여러 사업을 조회한 뒤 보고할 때는
+    다음 두 가지를 항상 함께 한다:
+    1) `사업명 | eia_cd | 대상 보호구역 | 거리` 컬럼의 마크다운 표로 결과를 채팅에 보여준다.
+    2) 같은 행 데이터를 이 도구로 CSV 파일로 만들어 경로를 안내한다.
+
+    Args:
+        rows_json: JSON 배열 문자열. 각 원소는 "사업명","eia_cd","대상 보호구역","거리" 4개
+            키를 전부 포함해야 한다(하나도 빠짐없이, 이 키 이름 그대로). 한 사업에 인접
+            보호구역이 여러 개면 행을 나눠서 각각 적는다.
+            예: '[{"사업명":"김포 항공산업단지 조성사업","eia_cd":"E12345",
+                "대상 보호구역":"천연기념물 OO","거리":"320.5m"}]'
+        filename: 저장할 파일명(확장자 생략 가능). 비우면 타임스탬프로 자동 생성.
+    """
+    try:
+        rows = core.json.loads(rows_json)
+    except Exception as exc:
+        return {'error': f'rows_json 파싱 실패: {exc}'}
+    if not isinstance(rows, list):
+        return {'error': 'rows_json은 객체(dict)의 JSON 배열이어야 합니다.'}
+    try:
+        path = core.export_spatial_matches_csv(rows, filename=filename or None)
+    except core.EiassError as exc:
+        return {'error': str(exc)}
+    return {'path': path, 'row_count': len(rows), 'columns': core.CSV_SPATIAL_REPORT_COLUMNS}
 
 
 @mcp.tool()

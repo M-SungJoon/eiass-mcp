@@ -23,6 +23,7 @@ import sqlite3
 import sys
 import tempfile
 import threading
+import time
 import urllib.parse
 from collections import OrderedDict
 from datetime import date, datetime
@@ -39,7 +40,7 @@ except ImportError:
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 # 저장소 루트 VERSION 파일과 항상 같은 값으로 맞춰서 커밋할 것(버전 두 곳 중복 관리).
-__version__ = '1.2.1'
+__version__ = '1.3.0'
 
 REQUEST_TIMEOUT = (8, 30)
 
@@ -1767,6 +1768,39 @@ def search_projects_by_document_keyword(
 # 사용자에게 보고할 때 반드시 이 5개 컬럼을 이 순서 그대로 담아야 한다(하나도 빠짐없이).
 CSV_REPORT_COLUMNS = ['사업명', 'eia_cd', '원문 파일명', '유사내용 페이지번호', '변경 내용 요약']
 
+# eiass_check_project_protected_area_adjacency로 여러 사업을 공간조회한 결과를 보고할 때
+# 반드시 이 4개 컬럼을 이 순서 그대로 담아야 한다(하나도 빠짐없이).
+CSV_SPATIAL_REPORT_COLUMNS = ['사업명', 'eia_cd', '대상 보호구역', '거리']
+
+
+def _export_csv_rows(rows, columns, filename, out_dir, default_name_prefix):
+    if not rows:
+        raise EiassError('rows가 비어 있습니다 — CSV로 내보낼 결과가 없습니다.')
+    missing_any = set()
+    for row in rows:
+        missing_any |= (set(columns) - set(row.keys()))
+    if missing_any:
+        raise EiassError(
+            f"rows 항목에 다음 컬럼이 빠져 있습니다: {', '.join(sorted(missing_any))} "
+            f"(필수 컬럼 {len(columns)}개, 이 순서로 전부 포함해야 함: {', '.join(columns)})"
+        )
+
+    out_dir = out_dir or os.path.join(os.path.expanduser('~'), 'Downloads')
+    os.makedirs(out_dir, exist_ok=True)
+    if not filename:
+        filename = f"{default_name_prefix}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
+    if not filename.lower().endswith('.csv'):
+        filename += '.csv'
+    path = os.path.join(out_dir, filename)
+
+    import csv as _csv
+    with open(path, 'w', newline='', encoding='utf-8-sig') as f:
+        writer = _csv.DictWriter(f, fieldnames=columns)
+        writer.writeheader()
+        for row in rows:
+            writer.writerow({col: row.get(col, '') for col in columns})
+    return path
+
 
 def export_matches_csv(rows, filename=None, out_dir=None):
     """조사한 사업의 전체 리스트를 CSV 파일로 저장한다.
@@ -1779,33 +1813,19 @@ def export_matches_csv(rows, filename=None, out_dir=None):
     filename: 저장할 파일명(확장자 없으면 .csv 자동 부여). 비우면 타임스탬프로 자동 생성.
     out_dir: 저장 폴더. 비우면 사용자 Downloads 폴더.
     """
-    if not rows:
-        raise EiassError('rows가 비어 있습니다 — CSV로 내보낼 조사 결과가 없습니다.')
-    missing_any = set()
-    for row in rows:
-        missing_any |= (set(CSV_REPORT_COLUMNS) - set(row.keys()))
-    if missing_any:
-        raise EiassError(
-            f"rows 항목에 다음 컬럼이 빠져 있습니다: {', '.join(sorted(missing_any))} "
-            f"(필수 컬럼 {len(CSV_REPORT_COLUMNS)}개, 이 순서로 전부 포함해야 함: "
-            f"{', '.join(CSV_REPORT_COLUMNS)})"
-        )
+    return _export_csv_rows(rows, CSV_REPORT_COLUMNS, filename, out_dir, 'eiass_조사결과')
 
-    out_dir = out_dir or os.path.join(os.path.expanduser('~'), 'Downloads')
-    os.makedirs(out_dir, exist_ok=True)
-    if not filename:
-        filename = f"eiass_조사결과_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
-    if not filename.lower().endswith('.csv'):
-        filename += '.csv'
-    path = os.path.join(out_dir, filename)
 
-    import csv as _csv
-    with open(path, 'w', newline='', encoding='utf-8-sig') as f:
-        writer = _csv.DictWriter(f, fieldnames=CSV_REPORT_COLUMNS)
-        writer.writeheader()
-        for row in rows:
-            writer.writerow({col: row.get(col, '') for col in CSV_REPORT_COLUMNS})
-    return path
+def export_spatial_matches_csv(rows, filename=None, out_dir=None):
+    """공간조회(보호구역 인접) 결과의 전체 사업 리스트를 CSV 파일로 저장한다.
+
+    rows: dict 리스트. 각 dict는 CSV_SPATIAL_REPORT_COLUMNS(사업명/eia_cd/대상 보호구역/거리)를
+    전부 키로 가지고 있어야 한다. 한 사업에 인접 보호구역이 여러 개면 행을 나눠서 각각 적는다.
+
+    filename: 저장할 파일명(확장자 없으면 .csv 자동 부여). 비우면 타임스탬프로 자동 생성.
+    out_dir: 저장 폴더. 비우면 사용자 Downloads 폴더.
+    """
+    return _export_csv_rows(rows, CSV_SPATIAL_REPORT_COLUMNS, filename, out_dir, 'eiass_공간조회결과')
 
 
 # ── VWorld 지오코딩 ──
@@ -1841,16 +1861,48 @@ def _extract_lon_lat_from_json(value):
     return None
 
 
-def geocode_address(query, api_key=None, domain=None, session=None):
-    """주소 문자열을 (lon, lat, source) 로 변환한다. 실패 시 None."""
+def _geocode_address_attempts(query, api_key=None, domain=None, session=None):
+    """VWorld 여러 API를 순서대로 시도하고, (좌표 또는 None, 시도별 진단 목록)을 함께 반환한다.
+    이전에는 모든 HTTP/파싱 예외를 조용히 삼켜서 "결과 없음"과 "API 오류/타임아웃"을
+    구분할 수 없었다 — 각 시도의 HTTP 상태·에러·매칭 여부를 attempts에 남겨 진단 가능하게 한다.
+    """
     query = (query or '').strip()
+    attempts = []
     if not query:
-        return None
+        return None, attempts
     api_key = api_key or get_vworld_api_key()
     if not api_key:
         raise EiassError('VWORLD_API_KEY가 설정되어 있지 않습니다 (.env).')
     domain = domain or get_vworld_domain()
     s = session or _session()
+
+    def record(label, status_code=None, error=None, matched=False):
+        entry = {'api': label, 'matched': matched}
+        if status_code is not None:
+            entry['status_code'] = status_code
+        if error is not None:
+            entry['error'] = str(error)
+        attempts.append(entry)
+
+    def try_get(url, params, label):
+        try:
+            res = s.get(url, params=params, timeout=8, verify=True)
+        except Exception as exc:
+            record(label, error=exc)
+            return None
+        if res.status_code != 200:
+            record(label, status_code=res.status_code)
+            return None
+        try:
+            coord = _extract_lon_lat_from_json(res.json())
+        except ValueError as exc:
+            record(label, status_code=res.status_code, error=exc)
+            return None
+        if coord:
+            record(label, status_code=res.status_code, matched=True)
+            return coord
+        record(label, status_code=res.status_code)
+        return None
 
     for category, label in [('parcel', 'VWorld 지번'), ('road', 'VWorld 도로명')]:
         params = {
@@ -1858,39 +1910,140 @@ def geocode_address(query, api_key=None, domain=None, session=None):
             'size': '1', 'page': '1', 'query': query, 'type': 'address', 'category': category,
             'format': 'json', 'errorformat': 'json', 'key': api_key,
         }
-        try:
-            res = s.get('https://api.vworld.kr/req/search', params=params, timeout=8, verify=True)
-            if res.status_code == 200:
-                coord = _extract_lon_lat_from_json(res.json())
-                if coord:
-                    return coord[0], coord[1], label
-        except Exception:
-            pass
+        coord = try_get('https://api.vworld.kr/req/search', params, label)
+        if coord:
+            return (coord[0], coord[1], label), attempts
 
     common = {'q': query, 'output': 'json', 'epsg': 'epsg:4326', 'apiKey': api_key, 'domain': domain}
     for endpoint, label in [('https://apis.vworld.kr/new2coord.do', '도로명'),
                              ('https://apis.vworld.kr/jibun2coord.do', '지번')]:
-        try:
-            res = s.get(endpoint, params=common, timeout=8, verify=True)
-            if res.status_code == 200:
-                coord = _extract_lon_lat_from_json(res.json())
-                if coord:
-                    return coord[0], coord[1], label
-        except Exception:
-            pass
+        coord = try_get(endpoint, common, label)
+        if coord:
+            return (coord[0], coord[1], label), attempts
 
     for category, label in [('Juso', '주소검색'), ('Jibun', '지번검색')]:
         params = {'query': query, 'category': category, 'pageUnit': '1', 'pageIndex': '1',
                    'output': 'json', 'apiKey': api_key, 'domain': domain}
-        try:
-            res = s.get('https://map.vworld.kr/search.do', params=params, timeout=8, verify=True)
-            if res.status_code == 200:
-                coord = _extract_lon_lat_from_json(res.json())
-                if coord:
-                    return coord[0], coord[1], label
-        except Exception:
-            pass
-    return None
+        coord = try_get('https://map.vworld.kr/search.do', params, label)
+        if coord:
+            return (coord[0], coord[1], label), attempts
+
+    return None, attempts
+
+
+def geocode_address(query, api_key=None, domain=None, session=None):
+    """주소 문자열을 (lon, lat, source) 로 변환한다. 실패 시 None."""
+    coord, _attempts = _geocode_address_attempts(query, api_key=api_key, domain=domain, session=session)
+    return coord
+
+
+_PAREN_RE = re.compile(r'\(([^()]*)\)')
+_EUPMYEONDONG_RE = re.compile(r'^(.*?[가-힣]+(?:읍|면|동|가))(?=\s|\(|$)')
+
+
+def _location_candidates(location):
+    """사업지 주소 문자열(EIASS 원문, 도로명·지번이 괄호로 섞인 복합 표기일 수 있음)에서
+    지오코딩을 시도할 후보 쿼리를 우선순위 순서로 만든다.
+
+    예: '경기도 김포시 대곶면 (천호로 210) 대벽리 662-1번지' →
+        1. 원문 그대로
+        2. 개행/중복 공백만 정리한 원문
+        3. 괄호 안 도로명 + 앞쪽 행정구역 접두어 → '경기도 김포시 대곶면 천호로 210'
+        4. 괄호를 제거한 지번 표기 → '경기도 김포시 대곶면 대벽리 662-1번지'
+        5(최후 대체): 읍/면/동 단위까지만 → '경기도 김포시 대곶면'
+
+    반환: [(query, precision), ...]. precision ∈
+        {'raw','normalized','road_address','parcel_address','admin_fallback'}.
+    admin_fallback은 다른 후보가 모두 실패했을 때만 시도해야 한다(호출부 책임).
+    """
+    location = (location or '').strip()
+    if not location or location == '-':
+        return []
+    candidates = []
+    seen = set()
+
+    def add(q, precision):
+        q = re.sub(r'\s+', ' ', (q or '')).strip()
+        if q and q not in seen:
+            seen.add(q)
+            candidates.append((q, precision))
+
+    add(location, 'raw')
+
+    cleaned = re.sub(r'[\r\n\t]+', ' ', location)
+    cleaned = re.sub(r'\s+', ' ', cleaned).strip()
+    add(cleaned, 'normalized')
+
+    paren_matches = list(_PAREN_RE.finditer(cleaned))
+    if paren_matches:
+        prefix = cleaned[:paren_matches[0].start()].strip()
+        for m in paren_matches:
+            inner = m.group(1).strip()
+            if inner:
+                road_query = f'{prefix} {inner}'.strip() if prefix else inner
+                add(road_query, 'road_address')
+        parcel_text = _PAREN_RE.sub(' ', cleaned)
+        parcel_text = re.sub(r'\s+', ' ', parcel_text).strip()
+        add(parcel_text, 'parcel_address')
+
+    admin_match = _EUPMYEONDONG_RE.search(cleaned)
+    if admin_match:
+        add(admin_match.group(1), 'admin_fallback')
+
+    return candidates
+
+
+def geocode_project_location(location, api_key=None, domain=None, session=None):
+    """EIASS 사업지 주소(사업 개요의 'location' 필드)를 지오코딩한다.
+
+    사업지 주소 자체가 정확히 지오코딩되면 그 결과를 쓰고, 모든 사업지 주소 후보가
+    실패했을 때만 읍/면/동 단위 행정구역으로 최후 대체한다(fallback_used=True로 표시돼서
+    "사업지 주소 기준 거리"와 "읍면동 대체 거리"를 결과에서 구분할 수 있다).
+
+    반환: {
+        'lon', 'lat', 'geocode_source', 'geocode_query_used', 'location_precision',
+        'fallback_used', 'attempts': [{'precision','query','api','matched',...}, ...],
+    } — location이 비어 있으면 None. 모든 후보(행정구역 대체 포함)가 실패하면 lon/lat 등이
+    None인 채로 attempts만 채워서 반환한다(진단용).
+    """
+    candidates = _location_candidates(location)
+    if not candidates:
+        return None
+    session = session or _session()
+    api_key = api_key or get_vworld_api_key()
+    domain = domain or get_vworld_domain()
+    attempts = []
+
+    def try_candidates(cands):
+        for query, precision in cands:
+            coord, sub_attempts = _geocode_address_attempts(
+                query, api_key=api_key, domain=domain, session=session)
+            for a in sub_attempts:
+                attempts.append({'precision': precision, 'query': query, **a})
+            if coord:
+                return query, precision, coord
+        return None
+
+    primary = [c for c in candidates if c[1] != 'admin_fallback']
+    hit = try_candidates(primary)
+    fallback_used = False
+    if not hit:
+        admin = [c for c in candidates if c[1] == 'admin_fallback']
+        hit = try_candidates(admin)
+        fallback_used = bool(hit)
+
+    if not hit:
+        return {
+            'lon': None, 'lat': None, 'geocode_source': None,
+            'geocode_query_used': None, 'location_precision': None,
+            'fallback_used': False, 'attempts': attempts,
+        }
+    query, precision, (lon, lat, source) = hit
+    return {
+        'lon': lon, 'lat': lat, 'geocode_source': source,
+        'geocode_query_used': query, 'location_precision': precision,
+        'fallback_used': fallback_used, 'attempts': attempts,
+    }
 
 
 # ── KDPA 보호지역 인접 조회 ──
@@ -1958,30 +2111,62 @@ def _kdpa_headers(json_request=False):
     return headers
 
 
+_KDPA_VERSION_CACHE = {'version': None, 'fetched_at': 0.0}
+_KDPA_VERSION_TTL_SECONDS = 300  # 사업지 여러 건을 연달아 조회할 때 매번 /getNewVer를 부르지 않도록 짧게 캐시
+
+
 def _kdpa_latest_version(session):
+    now = time.time()
+    if _KDPA_VERSION_CACHE['version'] and (now - _KDPA_VERSION_CACHE['fetched_at']) < _KDPA_VERSION_TTL_SECONDS:
+        return _KDPA_VERSION_CACHE['version']
     res = session.post(
         KDPA_BASE_URL + '/getNewVer',
         data=json.dumps({'version_nm': ''}, ensure_ascii=False).encode('utf-8'),
         headers=_kdpa_headers(json_request=True), timeout=15,
     )
-    if res.status_code != 200:
-        return KDPA_DEFAULT_VERSION
-    return str(res.json().get('body') or KDPA_DEFAULT_VERSION)
+    version = KDPA_DEFAULT_VERSION
+    if res.status_code == 200:
+        version = str(res.json().get('body') or KDPA_DEFAULT_VERSION)
+    _KDPA_VERSION_CACHE['version'] = version
+    _KDPA_VERSION_CACHE['fetched_at'] = now
+    return version
 
 
-def find_nearby_protected_areas(lon, lat, radius_m=1000, session=None, version=None):
+def find_nearby_protected_areas(lon, lat, radius_m=1000, session=None, version=None, designations=None):
     """지점 기준 radius_m(미터) 이내 KDPA 보호지역을 조회한다.
 
     KDPA GeoServer는 WFS 1.1.0 + EPSG:4326에서 위경도 축순서(lat,lon)를 강제하므로,
     축순서가 명확한 WFS 1.0.0(lon,lat)을 사용해 DWITHIN 공간필터로 서버 측 필터링한다.
-    반환: [{'name','desig','agency','status_year','distance_m'}, ...] (거리 오름차순)
+
+    designations: None(기본)이면 KDPA_DEFAULT_LAYER_DEFS 전체 레이어를 조회한다(기존 동작과
+        동일, 하위 호환). 문자열(콤마 구분) 또는 리스트로 지정하면 KDPA_DEFAULT_LAYER_DEFS의
+        'name'과 정확히 일치하는 레이어만 조회한다(예: '천연기념물'만 필요하면 다른 5개 레이어를
+        조회하지 않아 왕복 요청 수와 시간이 그만큼 줄어든다).
+
+    반환: [{'name','desig','agency','status_year','distance_m'}, ...] (거리 오름차순).
+    서버측 DWITHIN 필터는 근사치라 경계 케이스에서 radius_m을 살짝 넘는 결과가 섞일 수 있어,
+    폴리곤 경계까지 재계산한 distance_m 기준으로 radius_m 초과 결과는 후처리로 제외한다.
     """
+    if designations:
+        if isinstance(designations, str):
+            designations = [d.strip() for d in designations.split(',') if d.strip()]
+        known_names = {layer['name'] for layer in KDPA_DEFAULT_LAYER_DEFS}
+        unknown = [d for d in designations if d not in known_names]
+        if unknown:
+            raise EiassError(
+                f"알 수 없는 designations 값: {', '.join(unknown)}. "
+                f"사용 가능: {', '.join(sorted(known_names))}"
+            )
+        layers = [layer for layer in KDPA_DEFAULT_LAYER_DEFS if layer['name'] in designations]
+    else:
+        layers = KDPA_DEFAULT_LAYER_DEFS
+
     s = session or _session()
     version = version or _kdpa_latest_version(s)
 
     results = []
     seen = set()
-    for layer in KDPA_DEFAULT_LAYER_DEFS:
+    for layer in layers:
         layer_url = (layer.get('layer_url') or '').strip().lower()
         type_name = f'oecm_{version}' if layer_url == 'oecm' else version
         desig = (layer.get('desig') or '').strip()
@@ -2012,6 +2197,8 @@ def find_nearby_protected_areas(lon, lat, radius_m=1000, session=None, version=N
             seen.add(key)
             geometry = feature.get('geometry') or {}
             distance_m = _feature_min_distance_m(lon, lat, geometry)
+            if distance_m is not None and distance_m > radius_m:
+                continue
             results.append({
                 'name': props.get('ORIG_NAME') or props.get('NAME') or '(이름 없음)',
                 'desig': props.get('DESIG') or desig or '보호지역',
