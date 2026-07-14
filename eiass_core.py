@@ -40,7 +40,7 @@ except ImportError:
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 # 저장소 루트 VERSION 파일과 항상 같은 값으로 맞춰서 커밋할 것(버전 두 곳 중복 관리).
-__version__ = '1.3.0'
+__version__ = '1.4.0'
 
 REQUEST_TIMEOUT = (8, 30)
 
@@ -1565,6 +1565,9 @@ def search_projects_by_document_keyword(
         'matches': [{..search_projects 항목.., 'fields': {...}, 'matched_keywords': [...],
                      'matched_snippets': [{'file','seq','stage','keyword','page_estimate',
                                             'snippet','reference_like'}]}],
+        'checked_no_match': [{'name','eia_cd'}, ...] — 문서를 실제로 열어봤지만 키워드가
+            없었던 사업. CSV/보고는 매칭된 사업만이 아니라 이번에 "스캔한 전체"를 대상으로
+            해야 하므로(matches + checked_no_match + skipped 전부), 이 목록도 빠뜨리지 말 것.
         'stage_stats': {stage: {'checked','matched'}},
         'needs_refinement', 'refinement_hint',
         'audit_sample': {...} | None,
@@ -1591,6 +1594,7 @@ def search_projects_by_document_keyword(
     stage_stats = {stage: {'checked': 0, 'matched': 0} for stage in stages}
     matches = []
     skipped = []
+    checked_no_match = []
     total_snippets = 0
     reference_like_snippets = 0
 
@@ -1664,6 +1668,10 @@ def search_projects_by_document_keyword(
                 **item, 'fields': detail['fields'],
                 'matched_keywords': sorted(matched_keywords), 'matched_snippets': matched_snippets,
             })
+        else:
+            # 문서를 실제로 열어봤지만 키워드가 없었던 사업 — CSV/보고 시 "스캔한 전체 리스트"에
+            # 이 사업들도 빠짐없이 포함해야 하므로(매칭된 것만 담지 않도록) 별도로 남겨둔다.
+            checked_no_match.append({'name': item['name'], 'eia_cd': item['eia_cd']})
 
     checked = len(batch)
     next_offset = offset + checked if (offset + checked) < total else None
@@ -1737,7 +1745,7 @@ def search_projects_by_document_keyword(
         + (f" 중 제목에 {'/'.join(doc_title_contains)} 포함된 문서만" if doc_title_contains else "")
         + f", 이번 배치 {offset}~{offset + checked - 1} "
         f"(전체 후보 {total}건 중 {checked}건 확인, {'남은 후보 있음' if next_offset is not None else '전체 확인 완료'})",
-        f"결과: 매칭 {len(matches)}건 / 미확인·제외 {len(skipped)}건",
+        f"결과: 매칭 {len(matches)}건 / 확인했으나 매칭 없음 {len(checked_no_match)}건 / 미확인·제외 {len(skipped)}건",
     ]
     if audit_sample:
         summary_parts.append(
@@ -1754,6 +1762,7 @@ def search_projects_by_document_keyword(
         'doc_title_contains': doc_title_contains or None,
         'skipped': skipped,
         'matches': matches,
+        'checked_no_match': checked_no_match,
         'stage_stats': stage_stats,
         'needs_refinement': needs_refinement,
         'refinement_hint': refinement_hint,
@@ -1809,6 +1818,10 @@ def export_matches_csv(rows, filename=None, out_dir=None):
     유사내용 페이지번호/변경 내용 요약)를 전부 키로 가지고 있어야 한다. '변경 내용 요약'은
     기계적으로 생성할 수 없으므로 AI가 matched_snippets(원문 발췌)를 근거로 직접 요약해서
     채워 넣어야 한다 — 빈 문자열로 두지 말 것.
+
+    rows는 매칭된 사업만이 아니라 이번에 스캔한 전체 후보(matches + checked_no_match +
+    skipped)를 담아야 한다 — 매칭 없는 사업은 원문 파일명/유사내용 페이지번호/변경 내용
+    요약을 '매칭 없음'으로 채운다.
 
     filename: 저장할 파일명(확장자 없으면 .csv 자동 부여). 비우면 타임스탬프로 자동 생성.
     out_dir: 저장 폴더. 비우면 사용자 Downloads 폴더.
@@ -2208,3 +2221,174 @@ def find_nearby_protected_areas(lon, lat, radius_m=1000, session=None, version=N
             })
     results.sort(key=lambda r: (r['distance_m'] is None, r['distance_m'] if r['distance_m'] is not None else 0))
     return results
+
+
+# ── 검색 필터 + 공간조회(보호구역 인접) 결합 ──
+# "최근 6개월 내 협의완료된 도로사업 중 국립공원 5km 이내" 같은 요청은 (1) 검색 필터로 후보를
+# 좁히고 (2) 각 후보의 사업지 주소를 지오코딩해 보호구역까지 거리를 재는 두 단계로 이뤄진다.
+# 문서 키워드 검색과 동일하게, 확인 문구는 AI가 즉흥적으로 요약하지 않도록 여기서 코드가
+# 직접 10개 항목을 고정된 순서/라벨로 조립한다.
+
+def preview_spatial_scan(
+    keyword='', type_codes=None, agency_code='', consult_date_from=None, consult_date_to=None,
+    progress_status='완료', biz_gubun='', progress_stage_keys=None, max_pages=0,
+    radius_m=1000, designations=None, inference_notes='', session=None,
+):
+    """검색 필터 + 공간조회 조건을 하나의 확인 문구로 조립한다(실제 지오코딩/공간조회는 하지
+    않고 후보 수만 미리 계산한다) — 문서 키워드 검색의 "실행 전 확인" 게이트와 동일한 원칙을
+    검색+공간조회 결합 워크플로에도 적용하기 위함이다.
+
+    반환된 confirmation_message를 사용자에게 그대로 보여주고 승인을 받은 뒤에만
+    같은 조건 + confirmed=true로 eiass_find_projects_protected_area_adjacency /
+    eiass_start_spatial_scan을 호출하라.
+    """
+    session = session or _session()
+    candidates = search_projects(
+        keyword, type_codes=type_codes, agency_code=agency_code, max_pages=max_pages, session=session,
+        consult_date_from=consult_date_from, consult_date_to=consult_date_to, progress_status=progress_status,
+        biz_gubun=biz_gubun, progress_stage_keys=progress_stage_keys,
+    )
+    total = len(candidates)
+
+    type_label = ', '.join(TYPE_NAME_MAP.get(t, t) for t in type_codes) if type_codes else '전체'
+    biz_label = biz_gubun or '전체'
+    agency_label = agency_code or '전체'
+    date_label = f"{consult_date_from or '제한없음'} ~ {consult_date_to or '제한없음'}"
+    progress_status_label = {'완료': '완료', '진행': '진행중'}.get(progress_status, '전체')
+    progress_stage_label = (
+        ', '.join(PROGRESS_STAGE_KEY_TO_LABEL.get(k, k) for k in progress_stage_keys)
+        if progress_stage_keys else '전체'
+    )
+    designation_label = ', '.join(designations) if designations else \
+        '전체(국립공원/천연기념물/습지보호지역/야생생물보호구역/OECM/최신 보호지역 전체)'
+
+    # 확인 문구는 문서 키워드 검색과 동일한 10개 항목 구조를 쓰되, 문서조회 전용 3개 항목
+    # (확인 문서 범위/키워드 매칭/예상 확인 문서 수)을 공간조회 전용 3개 항목
+    # (대상 보호구역/반경/기준 위치)으로 바꾼다 — 나머지 6개 검색 필터 + 예상 후보 사업 수는 동일.
+    bullets = [
+        f"- 평가종류: `{type_label}`",
+        f"- 사업유형: `{biz_label}`",
+        f"- 협의기관: `{agency_label}`",
+        f"- 협의완료일: `{date_label}`",
+        f"- 진행현황: `{progress_status_label}`",
+        f"- 진행구분: `{progress_stage_label}`",
+        f"- 대상 보호구역: `{designation_label}`",
+        f"- 반경: `{radius_m}`m",
+        "- 기준 위치: `EIASS 사업개요의 사업지 주소(지오코딩 실패 시에만 읍/면/동으로 대체)`",
+        f"- 예상 후보 사업 수: `{total}`건",
+    ]
+
+    notes = []
+    if inference_notes:
+        notes.append(f"※ 사용자가 직접 말하지 않고 AI가 추론/제안한 조건: {inference_notes}")
+    else:
+        notes.append("※ AI가 임의로 좁힌 조건 없음 — 언급되지 않은 필터는 전체로 적용했습니다.")
+
+    message_parts = [
+        "아래 조건으로 공간조회(보호구역 인접)를 진행해도 될까요?",
+        "",
+        "적용할 검색 조건:",
+        "",
+        '\n'.join(bullets),
+        "",
+        '\n'.join(notes),
+        "",
+        f"승인해주시면 같은 조건에 `confirmed=true`를 붙여 실행하고, 스캔한 사업 {total}건 "
+        f"전체 리스트와 반경 이내 매칭 결과를 정리해 알려드리겠습니다.",
+    ]
+
+    return {
+        'candidates_total': total,
+        'applied_filters': {
+            'keyword': keyword or None, 'types': type_codes or 'ALL', 'agency_code': agency_code or 'ALL',
+            'consult_date_from': consult_date_from, 'consult_date_to': consult_date_to,
+            'progress_status': progress_status or 'ALL', 'biz_gubun': biz_gubun or 'ALL',
+            'progress_stage_keys': list(progress_stage_keys) if progress_stage_keys else 'ALL',
+        },
+        'radius_m': radius_m,
+        'designations': list(designations) if designations else 'ALL',
+        'inference_notes': inference_notes or None,
+        'confirm_required': True,
+        'confirmation_message': '\n'.join(message_parts),
+    }
+
+
+def scan_projects_protected_area_adjacency(
+    keyword='', type_codes=None, agency_code='', consult_date_from=None, consult_date_to=None,
+    progress_status='완료', biz_gubun='', progress_stage_keys=None, max_pages=0,
+    radius_m=1000, designations=None, allow_admin_fallback=True,
+    offset=0, max_candidates=15, session=None,
+):
+    """검색 필터로 후보를 뽑은 뒤, offset부터 max_candidates개를 순서대로 지오코딩+공간조회한다.
+
+    "스캔한 전체 리스트"(scanned)와 "그중 반경 이내 보호구역이 있는 것만"(matches)을 분리해서
+    반환한다 — 보고/CSV는 matches가 아니라 scanned 전체를 기준으로 해야 한다(반경 밖이거나
+    지오코딩 실패한 사업도 '해당 없음'으로 표시해서 포함).
+
+    반환: {'candidates_total','offset','checked','next_offset','has_more',
+        'scanned': [{..search_projects 항목.., 'location','lon','lat','geocode_source',
+                     'location_precision','fallback_used','nearby_protected_areas'}],
+        'match_count', 'matches': [scanned 중 nearby_protected_areas가 1개 이상인 것],
+        'geocode_failures': [{'name','eia_cd','reason'}, ...]}
+    """
+    session = session or _session()
+    candidates = search_projects(
+        keyword, type_codes=type_codes, agency_code=agency_code, max_pages=max_pages, session=session,
+        consult_date_from=consult_date_from, consult_date_to=consult_date_to, progress_status=progress_status,
+        biz_gubun=biz_gubun, progress_stage_keys=progress_stage_keys,
+    )
+    total = len(candidates)
+    batch = candidates[offset:offset + max_candidates]
+
+    scanned = []
+    matches = []
+    geocode_failures = []
+    for item in batch:
+        try:
+            detail = get_project_detail(item['view_type'], item['eia_cd'], item['revirpt_seq'],
+                                         session=session, use_cache=True)
+        except Exception as exc:
+            geocode_failures.append({'name': item['name'], 'eia_cd': item['eia_cd'],
+                                      'reason': f'상세조회 실패: {exc}'})
+            continue
+
+        location = (detail.get('fields') or {}).get('location') or ''
+        geocoded = geocode_project_location(location, session=session)
+        if not geocoded or geocoded.get('lon') is None:
+            geocode_failures.append({
+                'name': item['name'], 'eia_cd': item['eia_cd'],
+                'reason': f'사업지 주소를 좌표로 변환하지 못했습니다: {location!r}',
+                'attempts': (geocoded or {}).get('attempts', []),
+            })
+            continue
+        if geocoded['fallback_used'] and not allow_admin_fallback:
+            geocode_failures.append({
+                'name': item['name'], 'eia_cd': item['eia_cd'],
+                'reason': '읍/면/동 대체가 필요했으나 allow_admin_fallback=False라 건너뜀',
+            })
+            continue
+
+        areas = find_nearby_protected_areas(
+            geocoded['lon'], geocoded['lat'], radius_m=radius_m, designations=designations, session=session)
+        row = {
+            **item,
+            'location': location,
+            'lon': geocoded['lon'], 'lat': geocoded['lat'],
+            'geocode_source': geocoded['geocode_source'],
+            'location_precision': geocoded['location_precision'],
+            'fallback_used': geocoded['fallback_used'],
+            'nearby_protected_areas': areas,
+        }
+        scanned.append(row)
+        if areas:
+            matches.append(row)
+
+    checked = len(batch)
+    next_offset = offset + checked if (offset + checked) < total else None
+    return {
+        'candidates_total': total, 'offset': offset, 'checked': checked,
+        'next_offset': next_offset, 'has_more': next_offset is not None,
+        'radius_m': radius_m, 'designations': list(designations) if designations else 'ALL',
+        'scanned': scanned, 'match_count': len(matches), 'matches': matches,
+        'geocode_failures': geocode_failures,
+    }
