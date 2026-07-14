@@ -846,6 +846,19 @@ def eiass_export_spatial_matches_csv(rows_json: str, filename: str = '') -> dict
 
 
 @mcp.tool()
+def eiass_check_server_status() -> dict:
+    """EIASS 본사이트/검색 API, VWorld 지오코딩 API, KDPA(보호구역) WFS 세 외부 서비스가
+    지금 정상 응답하는지 점검한다. 검색/조회/공간조회 도구가 갑자기 실패하거나 느릴 때,
+    EIASS 자체 장애인지 VWorld/KDPA 쪽 문제인지 원인을 좁히는 용도로 먼저 호출하면 좋다.
+
+    각 서비스별로 ok(정상 여부)/status_code(HTTP 상태코드)/latency_ms(응답시간)/error를
+    반환한다. VWORLD_API_KEY가 .env에 없으면 vworld 항목은 호출 없이 error로 그 사실만
+    알린다. all_ok가 false면 어느 서비스가 문제인지 응답 내용을 사용자에게 그대로 보여줘라.
+    """
+    return core.check_server_status()
+
+
+@mcp.tool()
 def eiass_version() -> dict:
     """이 EIASS MCP 서버(exe)의 버전을 반환한다. 설치된 버전과 최신 버전을 비교하고
     싶을 때 사용자에게 알려줄 용도로 쓴다(최신 버전 확인은 install.ps1/install.bat이 담당)."""

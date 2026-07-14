@@ -23,6 +23,7 @@
 | `eiass_geocode`                           | 주소 → 경위도 좌표                                                                                                                               |
 | `eiass_export_matches_csv`                | 문서 키워드 조사 결과(사업명/eia_cd/원문 파일명/유사내용 페이지번호/변경 내용 요약)를 CSV 파일로 저장 — 스캔한 전체 사업 기준(매칭 없는 사업도 포함)                                                          |
 | `eiass_export_spatial_matches_csv`        | 공간조회(보호구역 인접) 결과(사업명/eia_cd/대상 보호구역/거리)를 CSV 파일로 저장 — 스캔한 전체 사업 기준(반경 밖 사업도 포함)                                                                       |
+| `eiass_check_server_status`               | EIASS 본사이트/검색 API, VWorld 지오코딩 API, KDPA WFS의 접속 가능 여부·상태코드·응답시간 점검                                                                              |
 | `eiass_version`                           | 현재 실행 중인 서버(exe)의 버전 반환                                                                                                                    |
 
 ### 실행 전 확인(confirm) 게이트

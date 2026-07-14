@@ -40,7 +40,7 @@ except ImportError:
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 # 저장소 루트 VERSION 파일과 항상 같은 값으로 맞춰서 커밋할 것(버전 두 곳 중복 관리).
-__version__ = '1.4.0'
+__version__ = '1.5.0'
 
 REQUEST_TIMEOUT = (8, 30)
 
@@ -2392,3 +2392,77 @@ def scan_projects_protected_area_adjacency(
         'scanned': scanned, 'match_count': len(matches), 'matches': matches,
         'geocode_failures': geocode_failures,
     }
+
+
+# ── 서버 상태 확인 ──
+# 검색/조회 도구를 실행하기 전에 EIASS/VWorld/KDPA 세 외부 서비스가 살아있는지 빠르게
+# 확인하고 싶을 때 쓴다. 각 서비스 호출부(search_projects/geocode_address/
+# find_nearby_protected_areas)와 동일한 엔드포인트·verify 설정을 그대로 재사용한다.
+
+def _http_probe(method, url, session, **kwargs):
+    """단순 HTTP 헬스체크 한 번을 수행해 상태코드/응답시간(ms)/에러를 기록한다.
+    5xx나 예외는 실패로 보되, 4xx는 "서비스는 응답했다"는 의미로 성공 취급한다
+    (상태확인 목적상 인증/파라미터 문제까지 서버 장애로 오인하지 않기 위함)."""
+    started = time.monotonic()
+    try:
+        res = session.request(method, url, timeout=REQUEST_TIMEOUT, **kwargs)
+    except Exception as exc:
+        return {'ok': False, 'status_code': None, 'latency_ms': None, 'error': str(exc)}
+    latency_ms = round((time.monotonic() - started) * 1000)
+    return {'ok': res.status_code < 500, 'status_code': res.status_code, 'latency_ms': latency_ms, 'error': None}
+
+
+def check_server_status(session=None):
+    """EIASS 본사이트/검색 API, VWorld 지오코딩 API, KDPA WFS의 접속 가능 여부를 점검한다.
+
+    각 서비스가 정상 응답 중인지, HTTP 상태코드와 응답시간(ms)은 어떤지 즉시 확인할 때
+    쓴다(원본 데스크톱 앱과 동일하게 EIASS는 verify=False로 접속). VWORLD_API_KEY가
+    설정되어 있지 않으면 VWorld 항목은 호출 자체를 생략하고 그 사실을 error로 남긴다.
+
+    반환: {'eiass_site','eiass_search_api','vworld','kdpa': {'ok','status_code',
+        'latency_ms','error'}, 'all_ok': bool, 'checked_at': ISO8601 UTC 문자열}
+    """
+    s = session or _session()
+    result = {}
+
+    result['eiass_site'] = _http_probe(
+        'GET', EIASS_BASE + '/', s,
+        headers={'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'}, verify=False,
+    )
+
+    result['eiass_search_api'] = _http_probe(
+        'POST', SEARCH_API_URL, s,
+        data={
+            'query': '', 'collection': 'business', 'currentPage': '1', 'sort': 'DATE/DESC',
+            'listCount': '1', 'viewName': '/eiass/user/biz/base/info/searchListEia_searchApi',
+            'urlString': '&' + urllib.parse.urlencode({'alias': '1', 'openFl': 'Y', 'completeFl': '완료'}),
+        },
+        headers={
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)', 'X-Requested-With': 'XMLHttpRequest',
+            'Origin': EIASS_BASE, 'Referer': EIASS_BASE + '/biz/base/info/perList.do',
+        },
+        verify=False,
+    )
+
+    api_key = get_vworld_api_key()
+    if not api_key:
+        result['vworld'] = {'ok': False, 'status_code': None, 'latency_ms': None,
+                             'error': 'VWORLD_API_KEY가 설정되어 있지 않습니다 (.env) — 확인을 건너뛰었습니다.'}
+    else:
+        result['vworld'] = _http_probe(
+            'GET', 'https://api.vworld.kr/req/search', s,
+            params={'service': 'search', 'request': 'search', 'version': '2.0', 'crs': 'EPSG:4326',
+                    'size': '1', 'page': '1', 'query': '서울특별시', 'type': 'address',
+                    'category': 'road', 'format': 'json', 'errorformat': 'json', 'key': api_key},
+            verify=True,
+        )
+
+    result['kdpa'] = _http_probe(
+        'POST', KDPA_BASE_URL + '/getNewVer', s,
+        data=json.dumps({'version_nm': ''}, ensure_ascii=False).encode('utf-8'),
+        headers=_kdpa_headers(json_request=True),
+    )
+
+    result['checked_at'] = datetime.utcnow().isoformat() + 'Z'
+    result['all_ok'] = all(v['ok'] for v in result.values() if isinstance(v, dict) and 'ok' in v)
+    return result
