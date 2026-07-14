@@ -17,6 +17,7 @@
 | `eiass_check_protected_area_adjacency`    | 주소 → 지오코딩 → 반경 내 KDPA 보호지역(국립공원/천연기념물/습지보호지역/야생생물보호구역/OECM) 조회                                                                            |
 | `eiass_geocode`                           | 주소 → 경위도 좌표                                                                                                                               |
 | `eiass_export_matches_csv`                | 조사 결과(사업명/eia_cd/원문 파일명/유사내용 페이지번호/변경 내용 요약)를 CSV 파일로 저장                                                                                       |
+| `eiass_version`                           | 현재 실행 중인 서버(exe)의 버전 반환                                                                                                                    |
 
 ### 실행 전 확인(confirm) 게이트
 
@@ -102,7 +103,20 @@ powershell -ExecutionPolicy Bypass -File install.ps1
 
 실행 후 Claude Code/Codex를 재시작하면 `eiass_*` 도구를 바로 쓸 수 있다. Claude Desktop은 CLI가 없어 자동 등록은 지원하지 않고, 실행 후 안내되는 JSON 스니펫을 `claude_desktop_config.json`에 직접 추가하면 된다.
 
-**git 없이도 최신 버전으로 갱신된다.** `install.ps1`은 실행될 때마다 GitHub API로 `mcp_server.exe`의 최신 커밋을 확인하고(같은 폴더의 `.eiass_mcp_version`에 기록된 버전과 비교), 다르면 `raw.githubusercontent.com`에서 새 exe를 직접 받아 교체한다 — git clone이나 pull이 전혀 필요 없다. `mcp_server.exe`가 아예 없는 상태로 `install.bat`/`install.ps1`만 받아서 실행해도 최초 1회 자동으로 받아온다. 저장소를 push해서 서버 쪽을 고쳐도 각 사용자 PC에는 자동으로 반영되지 않으므로, **업데이트를 받으려면 이 스크립트를 다시 실행해야 한다**(완전 자동 업데이트는 아님). Claude Code/Codex가 실행 중이라 exe가 잠겨 있으면 업데이트를 건너뛰고 기존 버전으로 계속 진행하니, 안내 메시지가 뜨면 앱을 완전히 종료한 뒤 다시 실행한다. 업데이트를 건너뛰려면 `-SkipUpdateCheck` 옵션을 준다.
+**git 없이도 최신 버전으로 갱신된다.** `install.ps1`은 실행될 때마다 GitHub API로 `mcp_server.exe`의 최신 커밋을 확인하고(같은 폴더의 `.eiass_mcp_version`에 기록된 커밋과 비교), 다르면 `raw.githubusercontent.com`에서 새 exe를 직접 받아 교체한다 — git clone이나 pull이 전혀 필요 없다. `mcp_server.exe`가 아예 없는 상태로 `install.bat`/`install.ps1`만 받아서 실행해도 최초 1회 자동으로 받아온다. 저장소를 push해서 서버 쪽을 고쳐도 각 사용자 PC에는 자동으로 반영되지 않으므로, **업데이트를 받으려면 이 스크립트를 다시 실행해야 한다**(완전 자동 업데이트는 아님). Claude Code/Codex가 실행 중이라 exe가 잠겨 있으면 업데이트를 건너뛰고 기존 버전으로 계속 진행하니, 안내 메시지가 뜨면 앱을 완전히 종료한 뒤 다시 실행한다. 업데이트를 건너뛰려면 `-SkipUpdateCheck` 옵션을 준다.
+
+### 버전 확인
+
+커밋 ID만으로는 어느 게 더 최신인지 한눈에 알기 어려워서, 저장소 루트에 사람이 읽는 [`VERSION`](VERSION) 파일(예: `1.1.0`, [시맨틱 버저닝](https://semver.org/lang/ko/))을 둔다. `install.ps1`/`install.bat`을 실행하면 매번 (SkipUpdateCheck 여부와 무관하게) 아래 두 줄을 항상 보여준다:
+
+```
+현재 설치된 버전: 1.1.0 (commit ff4a6a6)
+Git에 푸시된 최신 버전: 1.1.0 (commit ff4a6a6)
+```
+
+업데이트 필요 여부 자체는 지금까지처럼 `mcp_server.exe`의 커밋 SHA로 정확히 판단하고, `VERSION`은 그 결과를 사람이 읽기 좋게 보여주는 용도다. 로컬 상태는 `.eiass_mcp_version` 파일에 `커밋 SHA` / `버전` 두 줄로 저장된다. Claude 안에서 직접 확인하고 싶으면 `eiass_version` 도구로 현재 연결된 서버(exe)의 버전을 물어볼 수 있다.
+
+**exe/소스를 수정해서 새로 배포할 때는 반드시 `VERSION` 파일과 `eiass_core.py`의 `__version__` 상수를 같이 올린다**(시맨틱 버저닝: 기존 도구의 동작이 바뀌지 않는 자잘한 수정=PATCH, 새 도구/필드 추가처럼 하위 호환되는 기능 추가=MINOR, 기존 도구 시그니처/동작이 깨지는 변경=MAJOR).
 
 ## 설치 — 방법 2: Python으로 실행
 

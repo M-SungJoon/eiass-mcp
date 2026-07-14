@@ -38,6 +38,9 @@ except ImportError:
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
+# 저장소 루트 VERSION 파일과 항상 같은 값으로 맞춰서 커밋할 것(버전 두 곳 중복 관리).
+__version__ = '1.1.0'
+
 REQUEST_TIMEOUT = (8, 30)
 MAX_SEARCH_PAGES = 5
 

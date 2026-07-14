@@ -29,15 +29,28 @@ try {
     if (-not (Test-Path $ExeDir)) { New-Item -ItemType Directory -Path $ExeDir -Force | Out-Null }
     $ExePath = Join-Path (Resolve-Path $ExeDir).Path (Split-Path $ExePath -Leaf)
 
-    # 0) 최신 버전 확인 및 자동 업데이트 — git 없이 GitHub API/raw 파일 URL만 사용한다.
-    # 이 스크립트를 다시 실행할 때마다 mcp_server.exe를 최신 커밋과 비교해서 다르면 재다운로드한다
-    # (완전 자동은 아니고 "실행할 때마다 최신화"이지만, git이 없는 PC에서도 그대로 동작한다).
-    if (-not $SkipUpdateCheck) {
-        $RepoOwner = "M-SungJoon"
-        $RepoName = "eiass-mcp"
-        $versionFile = Join-Path $ExeDir ".eiass_mcp_version"
-        $ghHeaders = @{ "User-Agent" = "eiass-mcp-install-script" }
+    # 0) 버전 확인 + 자동 업데이트 — git 없이 GitHub API/raw 파일 URL만 사용한다.
+    # 업데이트가 필요한지 여부는 mcp_server.exe의 최신 커밋 SHA로 판단하고(정확함),
+    # 사람이 보는 버전 번호는 저장소 루트의 VERSION 파일(예: "1.1.0")에서 가져온다.
+    # 두 값을 로컬 .eiass_mcp_version 파일에 "SHA<개행>버전" 두 줄로 저장해뒀다가
+    # 다음 실행 때 "현재 설치된 버전"으로 보여준다. 설치된 버전/Git 최신 버전은
+    # SkipUpdateCheck 여부와 무관하게 항상 화면에 표시한다.
+    $RepoOwner = "M-SungJoon"
+    $RepoName = "eiass-mcp"
+    $versionFile = Join-Path $ExeDir ".eiass_mcp_version"
+    $ghHeaders = @{ "User-Agent" = "eiass-mcp-install-script" }
 
+    $localSha = $null
+    $localVersion = "알 수 없음(최초 설치 또는 이전 버전의 설치 스크립트로 설치됨)"
+    if (Test-Path $versionFile) {
+        $versionLines = @(Get-Content $versionFile)
+        if ($versionLines.Count -ge 1 -and $versionLines[0]) { $localSha = $versionLines[0].Trim() }
+        if ($versionLines.Count -ge 2 -and $versionLines[1]) { $localVersion = $versionLines[1].Trim() }
+    }
+    $localShaShort = if ($localSha) { $localSha.Substring(0, [Math]::Min(7, $localSha.Length)) } else { "알 수 없음" }
+    Write-Host "현재 설치된 버전: $localVersion (commit $localShaShort)"
+
+    if (-not $SkipUpdateCheck) {
         $latestSha = $null
         try {
             $apiUrl = "https://api.github.com/repos/$RepoOwner/$RepoName/commits?path=mcp_server.exe&per_page=1"
@@ -47,17 +60,28 @@ try {
             Write-Host "⚠ 최신 버전 확인 실패(네트워크 문제일 수 있음) — 기존 mcp_server.exe로 계속 진행합니다.`n"
         }
 
+        $latestVersion = "알 수 없음"
         if ($latestSha) {
-            $localSha = if (Test-Path $versionFile) { (Get-Content $versionFile -Raw).Trim() } else { $null }
+            try {
+                $versionUrl = "https://raw.githubusercontent.com/$RepoOwner/$RepoName/main/VERSION"
+                $latestVersion = (Invoke-RestMethod -Uri $versionUrl -Headers $ghHeaders -TimeoutSec 10).Trim()
+            } catch {
+                # VERSION 파일이 없던 옛 커밋일 수도 있음 — 버전 번호 표시만 못 할 뿐 업데이트 자체는 진행한다.
+            }
+            $latestShaShort = $latestSha.Substring(0, [Math]::Min(7, $latestSha.Length))
+            Write-Host "Git에 푸시된 최신 버전: $latestVersion (commit $latestShaShort)"
+        }
+
+        if ($latestSha) {
             if (($latestSha -ne $localSha) -or (-not (Test-Path $ExePath))) {
-                Write-Host "새 버전 발견 — mcp_server.exe 다운로드 중... ($latestSha)"
+                Write-Host "새 버전 발견 — mcp_server.exe 다운로드 중... ($latestVersion / $latestSha)"
                 $downloadUrl = "https://raw.githubusercontent.com/$RepoOwner/$RepoName/main/mcp_server.exe"
                 $tmpPath = "$ExePath.new"
                 try {
                     Invoke-WebRequest -Uri $downloadUrl -OutFile $tmpPath -Headers $ghHeaders -TimeoutSec 180
                     Move-Item -Path $tmpPath -Destination $ExePath -Force
-                    Set-Content -Path $versionFile -Value $latestSha -NoNewline -Encoding utf8
-                    Write-Host "✅ mcp_server.exe를 최신 버전으로 업데이트했습니다.`n"
+                    Set-Content -Path $versionFile -Value @($latestSha, $latestVersion) -Encoding utf8
+                    Write-Host "✅ mcp_server.exe를 최신 버전($latestVersion)으로 업데이트했습니다.`n"
                 } catch {
                     Write-Host "⚠ 업데이트 다운로드/교체 실패: $($_.Exception.Message)"
                     Write-Host "   (Claude Code/Codex가 실행 중이면 mcp_server.exe가 잠겨 있을 수 있습니다 — 완전히 종료한 뒤 다시 실행해보세요.)"

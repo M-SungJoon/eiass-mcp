@@ -470,6 +470,13 @@ def eiass_check_protected_area_adjacency(address: str, radius_m: int = 1000) -> 
 
 
 @mcp.tool()
+def eiass_version() -> dict:
+    """이 EIASS MCP 서버(exe)의 버전을 반환한다. 설치된 버전과 최신 버전을 비교하고
+    싶을 때 사용자에게 알려줄 용도로 쓴다(최신 버전 확인은 install.ps1/install.bat이 담당)."""
+    return {'version': core.__version__}
+
+
+@mcp.tool()
 def eiass_geocode(address: str) -> dict:
     """주소를 VWorld API로 경위도 좌표로 변환한다."""
     try:
