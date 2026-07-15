@@ -134,7 +134,9 @@ try {
                 Write-Host "새 버전 발견 — 배포본 다운로드 중... ($latestVersion / $latestSha)"
                 $downloadUrl = "https://raw.githubusercontent.com/$RepoOwner/$RepoName/$latestSha/mcp_server_dist.zip"
                 $manifestUrl = "https://raw.githubusercontent.com/$RepoOwner/$RepoName/$latestSha/mcp_server_dist.zip.sha256"
-                $tmpZip = Join-Path $ExeDir "mcp_server_dist.zip.new"
+                # 확장자가 반드시 .zip이어야 한다 — Expand-Archive는 그 외 확장자를 아예 거부한다
+                # (".zip.new"로 뒀다가 모든 업데이트가 실패했다).
+                $tmpZip = Join-Path $ExeDir "mcp_server_dist.download.zip"
                 $tmpManifestPath = "$tmpZip.sha256"
                 $stageDir = Join-Path $ExeDir "mcp_server.new"
                 $retireDir = Join-Path $ExeDir "mcp_server.old"
