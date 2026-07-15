@@ -26,7 +26,7 @@ SRC = os.path.join(BASE_DIR, 'mcp_server.py')
 VERSION = open(os.path.join(BASE_DIR, 'VERSION'), encoding='utf-8-sig').read().strip()
 VERSION_TAG = VERSION.replace('.', '_')
 DIST_DIR = os.path.join(BASE_DIR, '#AI working', 'release')
-WORK_DIR = os.path.join(BASE_DIR, '#AI working', 'mcp_pyinstaller')
+WORK_DIR = os.path.join(BASE_DIR, '#AI working', 'mcp_pyinstaller_' + VERSION_TAG)
 SPEC_DIR = WORK_DIR
 OUTPUT_NAME = f'mcp_server_{VERSION_TAG}'
 
@@ -56,7 +56,6 @@ def build():
         '--distpath', DIST_DIR,
         '--workpath', WORK_DIR,
         '--specpath', SPEC_DIR,
-        '--collect-all', 'mcp',
         '--hidden-import', 'bs4',
         '--clean',
         SRC,
