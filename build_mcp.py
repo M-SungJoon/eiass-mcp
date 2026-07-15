@@ -4,13 +4,19 @@
 
 PyQt5/WebEngine 의존성이 없는 독립 실행 파일이라 build.py보다 훨씬 단순하다.
 
-주의: 이 스크립트는 반드시 mcp/requests/beautifulsoup4/PyMuPDF/typer/pyinstaller만
-설치된 "깨끗한" venv의 python으로 실행해야 한다. torch/scipy/cv2/matplotlib 같은
-무관한 패키지가 같이 깔린 환경에서 실행하면 --collect-all mcp가 그것들까지
-정적 분석 대상으로 끌어들여 exe가 수백MB로 부풀고 실행이 느려진다(직접 겪은 문제).
-  python -m venv .mcpbuild_venv
-  .mcpbuild_venv\\Scripts\\python.exe -m pip install mcp requests beautifulsoup4 urllib3 PyMuPDF typer pyinstaller
+주의: 이 스크립트는 반드시 requirements.lock만 설치된 "깨끗한" Python 3.12 venv의
+python으로 실행해야 한다. torch/scipy/cv2/matplotlib 같은 무관한 패키지가 같이 깔린
+환경에서 실행하면 --collect-all mcp가 그것들까지 정적 분석 대상으로 끌어들여 exe가
+수백MB로 부풀고 실행이 느려진다(직접 겪은 문제).
+  uv venv --python 3.12 .mcpbuild_venv
+  uv pip install -r requirements.lock --python .mcpbuild_venv\\Scripts\\python.exe
   .mcpbuild_venv\\Scripts\\python.exe build_mcp.py
+
+파이썬은 3.12여야 한다(CI의 setup-python과 같은 버전). exe는 빌드에 쓴 인터프리터를
+그대로 품고 나가므로, 다른 버전으로 빌드하면 사용자가 실행하는 런타임이 조용히 바뀐다.
+3.13은 컴파일 시점에 docstring 들여쓰기를 제거해서(3.12는 보존) FastMCP가 docstring으로
+만드는 도구 설명이 통째로 달라지고, tools/parity_smoke.py가 소스와 exe 불일치로 잡아낸다.
+아래 assert_build_python()이 애초에 막는다.
 
 typer는 mcp 실행에 필요 없지만, mcp.cli.cli가 optional import로 typer를 참조해서
 --collect-all mcp가 정적 분석 중 그 모듈을 import 시도하다 typer가 없으면 빌드가
@@ -50,6 +56,8 @@ ARTIFACT_DIR = os.path.join(BASE_DIR, '#AI working', 'release')
 # 업데이트할 때 MCP 등록을 매번 다시 해야 하기 때문이다. 버전은 zip 파일명에만 붙인다.
 OUTPUT_NAME = 'mcp_server'
 PAYLOAD_ZIP_NAME = 'mcp_server_dist.zip'
+# .github/workflows/windows-ci.yml의 setup-python과 반드시 같은 버전이어야 한다.
+BUILD_PYTHON = (3, 12)
 
 
 def configure_stdio():
@@ -102,6 +110,22 @@ def rmtree_resilient(path, attempts=6):
         sys.exit(5)
 
 
+def assert_build_python():
+    """배포 exe의 런타임 파이썬이 CI가 검증하는 버전과 어긋나는 것을 막는다.
+
+    exe는 빌드에 쓴 인터프리터를 그대로 품고 나간다. 3.13 venv로 빌드했다가 사용자 런타임이
+    3.12에서 3.13으로 조용히 바뀐 적이 있다(도구 설명이 전부 달라져 CI parity가 잡았다).
+    """
+    if sys.version_info[:2] != BUILD_PYTHON:
+        current = '.'.join(str(part) for part in sys.version_info[:3])
+        expected = '.'.join(str(part) for part in BUILD_PYTHON)
+        print(f'❌ 빌드 파이썬이 {current}입니다. 배포본은 {expected}로 빌드해야 합니다'
+              f'(CI의 setup-python과 동일해야 함).')
+        print('   uv venv --python ' + expected + ' .mcpbuild_venv')
+        print('   uv pip install -r requirements.lock --python .mcpbuild_venv\\Scripts\\python.exe')
+        sys.exit(6)
+
+
 def assert_version_in_sync():
     """VERSION 파일과 eiass_core.__version__이 어긋난 채로 빌드되는 것을 막는다.
 
@@ -120,6 +144,7 @@ def assert_version_in_sync():
 
 
 def build(publish_root=False):
+    assert_build_python()
     assert_version_in_sync()
     os.makedirs(DIST_DIR, exist_ok=True)
     os.makedirs(WORK_DIR, exist_ok=True)
