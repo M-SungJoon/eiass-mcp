@@ -44,7 +44,8 @@ except ImportError:
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 # 저장소 루트 VERSION 파일과 항상 같은 값으로 맞춰서 커밋할 것(버전 두 곳 중복 관리).
-__version__ = '1.9.0'
+# 어긋난 채로 커밋되지 않도록 build_mcp.py가 빌드 시작 전에 두 값을 대조한다.
+__version__ = '1.10.0'
 
 REQUEST_TIMEOUT = (8, 30)
 
@@ -315,10 +316,17 @@ def _is_reference_like_context(text, idx, window=400):
 
 
 def dotenv_paths():
-    primary = os.path.join(app_runtime_dir(), '.env')
-    fallback = os.path.join(app_local_data_dir(), '.env')
+    runtime = app_runtime_dir()
+    candidates = [os.path.join(runtime, '.env')]
+    # onedir 배포는 exe가 <설치 폴더>/mcp_server/ 안에 놓이고, 업데이트가 그 mcp_server
+    # 폴더를 통째로 갈아끼운다. 사용자가 넣은 .env를 그 안에 두면 업데이트마다 지워지므로
+    # 설치 폴더(= exe 폴더의 부모)에 두고 여기서 같이 찾는다. 소스 실행 중에는 저장소
+    # 바깥까지 뒤지게 되므로 frozen일 때만 본다.
+    if getattr(sys, 'frozen', False):
+        candidates.append(os.path.join(os.path.dirname(runtime), '.env'))
+    candidates.append(os.path.join(app_local_data_dir(), '.env'))
     paths = []
-    for path in (primary, fallback):
+    for path in candidates:
         if path not in paths:
             paths.append(path)
     return paths

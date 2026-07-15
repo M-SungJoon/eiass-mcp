@@ -19,7 +19,10 @@ import time
 import uuid
 import multiprocessing
 import os
+import re
+import shutil
 import sys
+import tempfile
 
 from mcp.server.fastmcp import FastMCP
 
@@ -983,8 +986,55 @@ def eiass_geocode(address: str) -> dict:
     return {'address': address, 'lon': lon, 'lat': lat, 'source': source}
 
 
+# ── 고아 _MEI 임시 폴더 회수 ──
+# onefile 부트로더는 실행할 때마다 exe 전체(약 74MB)를 %TEMP%/_MEIxxxxxx에 풀고 "정상
+# 종료할 때만" 지운다. MCP 서버는 클라이언트가 끝낼 때 강제 종료되는 일이 잦아서 이 폴더가
+# 계속 남았다(실측: 개발 PC에 280개 20.7GB 잔류). v1.10.0에서 빌드를 onedir로 바꿔 애초에
+# 추출을 없앴지만, 이전 onefile 버전이 이미 남긴 잔재는 사용자 PC에 그대로 있으므로 기동할
+# 때마다 청소한다.
+
+_MEIPASS_DIR_RE = re.compile(r'^_MEI[A-Za-z0-9]{4,}$')
+
+
+def _sweep_orphan_meipass_dirs():
+    """%TEMP%에 남은 고아 _MEI 폴더를 지운다. 실패는 전부 무시한다(부가 기능).
+
+    사용 중인 폴더를 지우지 않으려고 삭제 전에 폴더 이름부터 바꾼다 — Windows는 안에 열린
+    파일이 하나라도 있으면 폴더 rename을 거부하므로, rename 성공 자체가 "이 폴더를 쓰는
+    프로세스가 없다"는 증거다. 실행 중인 서버의 폴더는 rename이 실패해 건너뛴다. mtime으로
+    판정하면 며칠씩 떠 있는 서버의 폴더를 지워버리므로 나이는 기준으로 쓰지 않는다.
+    """
+    try:
+        tmp_root = tempfile.gettempdir()
+        own = getattr(sys, '_MEIPASS', None)
+        own_key = os.path.normcase(os.path.abspath(own)) if own else None
+        for name in os.listdir(tmp_root):
+            path = os.path.join(tmp_root, name)
+            if not os.path.isdir(path):
+                continue
+            # 이전 회수 시도가 중간에 끊겨 남은 잔해는 이미 rename 검사를 통과한 것이라 바로 지운다.
+            if name.startswith('_MEI') and name.endswith('.stale'):
+                shutil.rmtree(path, ignore_errors=True)
+                continue
+            if not _MEIPASS_DIR_RE.match(name):
+                continue
+            if own_key and os.path.normcase(os.path.abspath(path)) == own_key:
+                continue
+            staging = path + '.stale'
+            try:
+                os.rename(path, staging)
+            except OSError:
+                continue  # 사용 중이거나 권한 없음 — 다음 기동 때 다시 시도한다
+            shutil.rmtree(staging, ignore_errors=True)
+    except Exception:
+        pass
+
+
 def run_stdio():
     """MCP 클라이언트가 stdin을 정상적으로 닫을 때 종료 traceback을 남기지 않는다."""
+    # 수백 개가 쌓여 있으면 삭제에 수 분이 걸릴 수 있어 MCP 핸드셰이크를 막지 않도록
+    # 데몬 스레드로 돌린다. 중간에 서버가 죽어도 다음 기동 때 이어서 지운다.
+    threading.Thread(target=_sweep_orphan_meipass_dirs, name='meipass-sweeper', daemon=True).start()
     _jobs_backend()
     try:
         mcp.run(transport='stdio')
