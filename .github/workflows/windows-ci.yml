@@ -21,13 +21,28 @@ jobs:
           python -m py_compile config.py models.py pdf_worker.py job_store.py document_engine.py spatial_engine.py scan_engine.py eiass_core.py mcp_server.py
           python -m unittest discover -s tests -v
       - name: Clean EXE build
+        env:
+          # 빌드 산출물은 저장소 밖에 만든다(build_mcp.py 주석 참고). CI에서는 경로를 고정해야
+          # 뒤 단계에서 방금 빌드한 exe를 집어낼 수 있다.
+          EIASS_MCP_BUILD_ROOT: ${{ runner.temp }}\eiass-mcp-build
         run: python build_mcp.py
       - name: Source and EXE parity smoke test
         shell: pwsh
+        env:
+          EIASS_MCP_BUILD_ROOT: ${{ runner.temp }}\eiass-mcp-build
         run: |
           $versionTag = ((Get-Content VERSION -Raw).Trim()).Replace('.', '_')
-          $exe = Join-Path '#AI working/release' "mcp_server_$versionTag.exe"
-          python tools/parity_smoke.py --exe $exe
-          python tools/verify_release.py $exe "$exe.sha256"
-          python tools/parity_smoke.py --exe mcp_server.exe
-          python tools/verify_release.py mcp_server.exe mcp_server.exe.sha256
+
+          # 1) 방금 빌드한 onedir 배포본이 소스와 같은 도구 표면/버전을 내는지
+          $built = Join-Path $env:EIASS_MCP_BUILD_ROOT 'release\mcp_server\mcp_server.exe'
+          python tools/parity_smoke.py --exe $built
+          $zip = Join-Path '#AI working/release' "mcp_server_dist_$versionTag.zip"
+          python tools/verify_release.py $zip "$zip.sha256"
+
+          # 2) 저장소에 커밋된 배포본(사용자가 install.ps1로 실제 받아가는 그 파일)도 검증한다.
+          # 소스만 고치고 zip 재빌드를 잊으면 여기서 걸린다 — 실제로 VERSION만 올리고 exe를
+          # 안 맞춰서 1.10.0이 1.9.0을 보고한 적이 있다.
+          python tools/verify_release.py mcp_server_dist.zip mcp_server_dist.zip.sha256
+          $shipped = Join-Path $env:RUNNER_TEMP 'shipped'
+          Expand-Archive -Path mcp_server_dist.zip -DestinationPath $shipped -Force
+          python tools/parity_smoke.py --exe (Join-Path $shipped 'mcp_server\mcp_server.exe')
