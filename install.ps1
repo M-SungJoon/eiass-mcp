@@ -63,7 +63,7 @@ try {
         $latestVersion = "알 수 없음"
         if ($latestSha) {
             try {
-                $versionUrl = "https://raw.githubusercontent.com/$RepoOwner/$RepoName/main/VERSION"
+                $versionUrl = "https://raw.githubusercontent.com/$RepoOwner/$RepoName/$latestSha/VERSION"
                 $latestVersion = (Invoke-RestMethod -Uri $versionUrl -Headers $ghHeaders -TimeoutSec 10).Trim()
             } catch {
                 # VERSION 파일이 없던 옛 커밋일 수도 있음 — 버전 번호 표시만 못 할 뿐 업데이트 자체는 진행한다.
@@ -75,17 +75,27 @@ try {
         if ($latestSha) {
             if (($latestSha -ne $localSha) -or (-not (Test-Path $ExePath))) {
                 Write-Host "새 버전 발견 — mcp_server.exe 다운로드 중... ($latestVersion / $latestSha)"
-                $downloadUrl = "https://raw.githubusercontent.com/$RepoOwner/$RepoName/main/mcp_server.exe"
+                $downloadUrl = "https://raw.githubusercontent.com/$RepoOwner/$RepoName/$latestSha/mcp_server.exe"
+                $manifestUrl = "https://raw.githubusercontent.com/$RepoOwner/$RepoName/$latestSha/mcp_server.exe.sha256"
                 $tmpPath = "$ExePath.new"
+                $tmpManifestPath = "$ExePath.new.sha256"
                 try {
                     Invoke-WebRequest -Uri $downloadUrl -OutFile $tmpPath -Headers $ghHeaders -TimeoutSec 180
+                    Invoke-WebRequest -Uri $manifestUrl -OutFile $tmpManifestPath -Headers $ghHeaders -TimeoutSec 30
+                    $expectedHash = ((Get-Content $tmpManifestPath -Raw).Trim() -split '\s+')[0].ToUpperInvariant()
+                    $actualHash = (Get-FileHash -Path $tmpPath -Algorithm SHA256).Hash.ToUpperInvariant()
+                    if ($actualHash -ne $expectedHash) {
+                        throw "SHA-256 불일치: expected=$expectedHash actual=$actualHash"
+                    }
                     Move-Item -Path $tmpPath -Destination $ExePath -Force
                     Set-Content -Path $versionFile -Value @($latestSha, $latestVersion) -Encoding utf8
+                    Remove-Item $tmpManifestPath -Force -ErrorAction SilentlyContinue
                     Write-Host "✅ mcp_server.exe를 최신 버전($latestVersion)으로 업데이트했습니다.`n"
                 } catch {
                     Write-Host "⚠ 업데이트 다운로드/교체 실패: $($_.Exception.Message)"
                     Write-Host "   (Claude Code/Codex가 실행 중이면 mcp_server.exe가 잠겨 있을 수 있습니다 — 완전히 종료한 뒤 다시 실행해보세요.)"
                     if (Test-Path $tmpPath) { Remove-Item $tmpPath -Force -ErrorAction SilentlyContinue }
+                    if (Test-Path $tmpManifestPath) { Remove-Item $tmpManifestPath -Force -ErrorAction SilentlyContinue }
                     if (-not (Test-Path $ExePath)) {
                         throw "mcp_server.exe를 받지 못해 설치를 진행할 수 없습니다."
                     }

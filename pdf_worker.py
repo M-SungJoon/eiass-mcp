@@ -19,8 +19,10 @@ def extract_pdf_bytes(pdf_bytes, max_pages):
     return {'text': '\n'.join(parts), 'page_offsets': offsets, 'pages': len(parts)}
 
 
-def worker_entry(pdf_bytes, max_pages, result_queue):
+def worker_entry(pdf_bytes, max_pages, result_pipe):
     try:
-        result_queue.put(('ok', extract_pdf_bytes(pdf_bytes, max_pages)))
+        result_pipe.send(('ok', extract_pdf_bytes(pdf_bytes, max_pages)))
     except Exception as exc:  # child boundary: serialize only a safe error message
-        result_queue.put(('error', str(exc)))
+        result_pipe.send(('error', str(exc)))
+    finally:
+        result_pipe.close()

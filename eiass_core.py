@@ -44,7 +44,7 @@ except ImportError:
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 # 저장소 루트 VERSION 파일과 항상 같은 값으로 맞춰서 커밋할 것(버전 두 곳 중복 관리).
-__version__ = '1.8.0'
+__version__ = '1.9.0'
 
 REQUEST_TIMEOUT = (8, 30)
 
@@ -1276,7 +1276,34 @@ def _parse_docs_by_stage(soup):
 
 
 _DETAIL_CACHE_LOCK = threading.Lock()
-_DETAIL_CACHE = {}  # (view_type, eia_cd, revirpt_seq) -> detail dict; 프로세스 수명 동안만 유지(메모리)
+_DETAIL_CACHE = OrderedDict()  # cache_key -> (저장 monotonic 시각, detail dict)
+
+
+def _detail_cache_get(cache_key):
+    now = time.monotonic()
+    with _DETAIL_CACHE_LOCK:
+        cached = _DETAIL_CACHE.get(cache_key)
+        if cached is None:
+            return None
+        stored_at, result = cached
+        if now - stored_at > DETAIL_CACHE_TTL_SECONDS:
+            _DETAIL_CACHE.pop(cache_key, None)
+            return None
+        _DETAIL_CACHE.move_to_end(cache_key)
+        return result
+
+
+def _detail_cache_put(cache_key, result):
+    now = time.monotonic()
+    with _DETAIL_CACHE_LOCK:
+        _DETAIL_CACHE[cache_key] = (now, result)
+        _DETAIL_CACHE.move_to_end(cache_key)
+        expired = [key for key, (stored_at, _) in _DETAIL_CACHE.items()
+                   if now - stored_at > DETAIL_CACHE_TTL_SECONDS]
+        for key in expired:
+            _DETAIL_CACHE.pop(key, None)
+        while len(_DETAIL_CACHE) > DETAIL_CACHE_MAX_ITEMS:
+            _DETAIL_CACHE.popitem(last=False)
 
 
 def get_project_detail(view_type, eia_cd, revirpt_seq, session=None, use_cache=False):
@@ -1291,8 +1318,7 @@ def get_project_detail(view_type, eia_cd, revirpt_seq, session=None, use_cache=F
     """
     cache_key = (view_type, eia_cd, revirpt_seq)
     if use_cache:
-        with _DETAIL_CACHE_LOCK:
-            cached = _DETAIL_CACHE.get(cache_key)
+        cached = _detail_cache_get(cache_key)
         if cached is not None:
             return cached
 
@@ -1332,8 +1358,7 @@ def get_project_detail(view_type, eia_cd, revirpt_seq, session=None, use_cache=F
         }
         result = {'fields': fields, 'stage_docs': _parse_after_docs(soup)}
         if use_cache:
-            with _DETAIL_CACHE_LOCK:
-                _DETAIL_CACHE[cache_key] = result
+            _detail_cache_put(cache_key, result)
         return result
 
     if view_type == 'eia':
@@ -1366,8 +1391,7 @@ def get_project_detail(view_type, eia_cd, revirpt_seq, session=None, use_cache=F
     }
     result = {'fields': fields, 'stage_docs': _parse_docs_by_stage(soup)}
     if use_cache:
-        with _DETAIL_CACHE_LOCK:
-            _DETAIL_CACHE[cache_key] = result
+        _detail_cache_put(cache_key, result)
     return result
 
 
@@ -1390,17 +1414,27 @@ def _get_full_document_text(file_seq, session=None):
         raise EiassError(f'문서 크기가 제한({PDF_MAX_BYTES // (1024 * 1024)}MB)을 초과했습니다.')
     # PyMuPDF는 손상 PDF에서 장시간 멈출 수 있어 별도 프로세스에서 제한 시간 안에 추출한다.
     ctx = multiprocessing.get_context('spawn')
-    result_queue = ctx.Queue(maxsize=1)
-    process = ctx.Process(target=worker_entry, args=(res.content, PDF_MAX_PAGES, result_queue), daemon=True)
-    process.start()
-    process.join(PDF_EXTRACT_TIMEOUT_SECONDS)
-    if process.is_alive():
-        process.terminate()
+    parent_pipe, child_pipe = ctx.Pipe(duplex=False)
+    process = ctx.Process(target=worker_entry, args=(res.content, PDF_MAX_PAGES, child_pipe), daemon=True)
+    try:
+        process.start()
+        child_pipe.close()
+        if not parent_pipe.poll(PDF_EXTRACT_TIMEOUT_SECONDS):
+            process.terminate()
+            process.join(5)
+            raise EiassError(f'PDF 텍스트 추출 시간이 제한({PDF_EXTRACT_TIMEOUT_SECONDS}초)을 초과했습니다.')
+        try:
+            status, payload = parent_pipe.recv()
+        except EOFError as exc:
+            raise EiassError(
+                f'PDF 텍스트 추출 프로세스가 결과 없이 종료했습니다 (exit={process.exitcode}).') from exc
         process.join(5)
-        raise EiassError(f'PDF 텍스트 추출 시간이 제한({PDF_EXTRACT_TIMEOUT_SECONDS}초)을 초과했습니다.')
-    if result_queue.empty():
-        raise EiassError(f'PDF 텍스트 추출 프로세스가 결과 없이 종료했습니다 (exit={process.exitcode}).')
-    status, payload = result_queue.get()
+        if process.is_alive():
+            process.terminate()
+            process.join(5)
+    finally:
+        parent_pipe.close()
+        child_pipe.close()
     if status != 'ok':
         raise EiassError(f'PDF 텍스트 추출 실패: {payload}')
     full_text = payload['text']
@@ -1456,6 +1490,7 @@ def preview_document_keyword_search(
     inference_notes='',
     sample_detail_count=15,
     session=None,
+    date_filter_exclusions=None,
 ):
     """실제 문서를 다운로드하지 않고 후보 수/예상 문서 수/과거 패턴 우선순위를 미리 계산해
     확인 문구(confirmation_message)를 만든다. eiass_find_projects_by_document_keyword /
@@ -1488,10 +1523,12 @@ def preview_document_keyword_search(
     doc_title_contains = [t for t in (doc_title_contains or []) if t]
 
     session = session or _session()
+    date_filter_exclusions = date_filter_exclusions if date_filter_exclusions is not None else []
     candidates = search_projects(
         keyword, type_codes=type_codes, agency_code=agency_code, max_pages=max_pages, session=session,
         consult_date_from=consult_date_from, consult_date_to=consult_date_to, progress_status=progress_status,
         biz_gubun=biz_gubun, progress_stage_keys=progress_stage_keys,
+        date_filter_exclusions=date_filter_exclusions,
     )
     total = len(candidates)
 
@@ -1615,6 +1652,7 @@ def preview_document_keyword_search(
         'doc_title_contains': doc_title_contains or None,
         'text_queries': text_queries,
         'match_mode': match_mode,
+        'date_filter_exclusions': date_filter_exclusions,
         'confirm_required': True,
         'confirmation_message': '\n'.join(message_parts),
     }
@@ -1642,6 +1680,7 @@ def search_projects_by_document_keyword(
     record_pattern=True,
     candidates=None,
     should_cancel=None,
+    date_filter_exclusions=None,
 ):
     """검색 필터(협의완료일 범위/진행상태/진행구분 등)로 후보 사업을 뽑은 뒤, 지정한 단계(기본값
     '초안,본안,보완,협의의견' — 협의의견만 우선 확인하면 놓치는 경우가 있어 여러 단계를
@@ -1709,11 +1748,13 @@ def search_projects_by_document_keyword(
     doc_title_contains = [t for t in (doc_title_contains or []) if t]
 
     session = session or _session()
+    date_filter_exclusions = date_filter_exclusions if date_filter_exclusions is not None else []
     if candidates is None:
         candidates = search_projects(
             keyword, type_codes=type_codes, agency_code=agency_code, max_pages=max_pages, session=session,
             consult_date_from=consult_date_from, consult_date_to=consult_date_to, progress_status=progress_status,
             biz_gubun=biz_gubun, progress_stage_keys=progress_stage_keys,
+            date_filter_exclusions=date_filter_exclusions,
         )
     else:
         candidates = list(candidates)
@@ -1904,6 +1945,7 @@ def search_projects_by_document_keyword(
         'needs_refinement': needs_refinement,
         'refinement_hint': refinement_hint,
         'audit_sample': audit_sample,
+        'date_filter_exclusions': date_filter_exclusions,
         'search_summary': ' | '.join(summary_parts),
     }
 
@@ -2445,6 +2487,7 @@ def preview_spatial_scan(
     keyword='', type_codes=None, agency_code='', consult_date_from=None, consult_date_to=None,
     progress_status='완료', biz_gubun='', progress_stage_keys=None, max_pages=0,
     radius_m=1000, designations=None, inference_notes='', session=None,
+    date_filter_exclusions=None,
 ):
     """검색 필터 + 공간조회 조건을 하나의 확인 문구로 조립한다(실제 지오코딩/공간조회는 하지
     않고 후보 수만 미리 계산한다) — 문서 키워드 검색의 "실행 전 확인" 게이트와 동일한 원칙을
@@ -2455,10 +2498,12 @@ def preview_spatial_scan(
     eiass_start_spatial_scan을 호출하라.
     """
     session = session or _session()
+    date_filter_exclusions = date_filter_exclusions if date_filter_exclusions is not None else []
     candidates = search_projects(
         keyword, type_codes=type_codes, agency_code=agency_code, max_pages=max_pages, session=session,
         consult_date_from=consult_date_from, consult_date_to=consult_date_to, progress_status=progress_status,
         biz_gubun=biz_gubun, progress_stage_keys=progress_stage_keys,
+        date_filter_exclusions=date_filter_exclusions,
     )
     total = len(candidates)
 
@@ -2520,6 +2565,7 @@ def preview_spatial_scan(
         'radius_m': radius_m,
         'designations': list(designations) if designations else 'ALL',
         'inference_notes': inference_notes or None,
+        'date_filter_exclusions': date_filter_exclusions,
         'confirm_required': True,
         'confirmation_message': '\n'.join(message_parts),
     }
@@ -2531,6 +2577,7 @@ def scan_projects_protected_area_adjacency(
     radius_m=1000, designations=None, allow_admin_fallback=True,
     offset=0, max_candidates=15, session=None,
     candidates=None, should_cancel=None,
+    date_filter_exclusions=None,
 ):
     """검색 필터로 후보를 뽑은 뒤, offset부터 max_candidates개를 순서대로 지오코딩+공간조회한다.
 
@@ -2546,11 +2593,13 @@ def scan_projects_protected_area_adjacency(
     """
     _validate_paging(offset, max_candidates)
     session = session or _session()
+    date_filter_exclusions = date_filter_exclusions if date_filter_exclusions is not None else []
     if candidates is None:
         candidates = search_projects(
             keyword, type_codes=type_codes, agency_code=agency_code, max_pages=max_pages, session=session,
             consult_date_from=consult_date_from, consult_date_to=consult_date_to, progress_status=progress_status,
             biz_gubun=biz_gubun, progress_stage_keys=progress_stage_keys,
+            date_filter_exclusions=date_filter_exclusions,
         )
     else:
         candidates = list(candidates)
@@ -2617,6 +2666,7 @@ def scan_projects_protected_area_adjacency(
         'radius_m': radius_m, 'designations': list(designations) if designations else 'ALL',
         'scanned': scanned, 'match_count': len(matches), 'matches': matches,
         'geocode_failures': geocode_failures, 'spatial_failures': spatial_failures,
+        'date_filter_exclusions': date_filter_exclusions,
     }
 
 

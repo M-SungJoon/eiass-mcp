@@ -24,6 +24,7 @@ import sys
 from mcp.server.fastmcp import FastMCP
 
 import eiass_core as core
+from config import JOB_RESULT_PAGE_LIMIT
 from job_store import JobStore
 from scan_engine import ScanRunner, document_status, spatial_status
 
@@ -31,8 +32,23 @@ mcp = FastMCP('eiass')
 
 # 작업 상태·후보·결과는 SQLite에 저장한다. 이전 프로세스가 남긴 running 작업은 ScanRunner가
 # queued로 복구해 같은 후보 스냅샷의 미처리분만 다시 실행한다.
-_job_store = JobStore()
-_job_runner = ScanRunner(_job_store)
+_job_store = None
+_job_runner = None
+_backend_lock = threading.Lock()
+
+
+def _jobs_backend():
+    """실제 MCP 서버 프로세스에서만 영속 작업 러너를 지연 초기화한다.
+
+    Windows multiprocessing spawn 자식이 모듈을 다시 import할 때 작업 복구 러너가
+    생기는 것을 막는다.
+    """
+    global _job_store, _job_runner
+    with _backend_lock:
+        if _job_store is None:
+            _job_store = JobStore()
+            _job_runner = ScanRunner(_job_store)
+        return _job_store, _job_runner
 
 # ── 백그라운드 스캔 job 레지스트리 ──
 # 대량 후보(수백 건)를 협의의견/본안 등에서 키워드로 훑을 때, 한 번의 MCP tool 호출 안에서
@@ -457,10 +473,12 @@ def eiass_start_document_keyword_scan(
     job_id = uuid.uuid4().hex[:12]
     kwargs = dict(text_queries=query_list, batch_size=batch_size,
                   audit_sample_size=audit_sample_size, **common_kwargs)
-    _job_store.cleanup()
-    _job_store.create(job_id, 'document', kwargs)
-    if not _job_runner.submit(job_id):
-        _job_store.update(job_id, status='error', phase='queue_full', error='스캔 대기열이 가득 찼습니다. 잠시 후 다시 시도하세요.')
+    job_store, job_runner = _jobs_backend()
+    job_store.cleanup()
+    job_store.create(job_id, 'document', kwargs)
+    if not job_runner.submit(job_id):
+        job_store.update(job_id, status='error', phase='queue_full',
+                         error='스캔 대기열이 가득 찼습니다. 잠시 후 다시 시도하세요.')
         return {'error': '스캔 대기열이 가득 찼습니다. 잠시 후 다시 시도하세요.'}
     return {'job_id': job_id, 'status': 'queued'}
 
@@ -480,15 +498,19 @@ def eiass_get_scan_status(job_id: str, include_matches: bool = False,
     "스캔한 전체"(matches + checked_no_match + skipped)를 대상으로 한다. 매칭 없는 사업은
     `원문 파일명`/`유사내용 페이지번호`/`변경 내용 요약`을 `매칭 없음`으로 채운다.
     """
-    return document_status(_job_store, job_id, include_matches, result_offset, min(result_limit, 500))
+    job_store, _ = _jobs_backend()
+    return document_status(job_store, job_id, include_matches, result_offset,
+                           min(result_limit, JOB_RESULT_PAGE_LIMIT))
 
 
 @mcp.tool()
 def eiass_cancel_scan(job_id: str) -> dict:
     """진행 중인 백그라운드 스캔(eiass_start_document_keyword_scan)을 취소한다."""
-    if not _job_store.get(job_id) or _job_store.get(job_id)['kind'] != 'document':
+    job_store, _ = _jobs_backend()
+    job = job_store.get(job_id)
+    if not job or job['kind'] != 'document':
         return {'error': f'알 수 없는 job_id: {job_id}'}
-    _job_store.request_cancel(job_id)
+    job_store.request_cancel(job_id)
     return {'job_id': job_id, 'status': 'cancelling'}
 
 
@@ -826,10 +848,12 @@ def eiass_start_spatial_scan(
     job_id = uuid.uuid4().hex[:12]
     kwargs = dict(radius_m=radius_m, designations=designation_list, allow_admin_fallback=allow_admin_fallback,
                   batch_size=batch_size, **common_kwargs)
-    _job_store.cleanup()
-    _job_store.create(job_id, 'spatial', kwargs)
-    if not _job_runner.submit(job_id):
-        _job_store.update(job_id, status='error', phase='queue_full', error='스캔 대기열이 가득 찼습니다. 잠시 후 다시 시도하세요.')
+    job_store, job_runner = _jobs_backend()
+    job_store.cleanup()
+    job_store.create(job_id, 'spatial', kwargs)
+    if not job_runner.submit(job_id):
+        job_store.update(job_id, status='error', phase='queue_full',
+                         error='스캔 대기열이 가득 찼습니다. 잠시 후 다시 시도하세요.')
         return {'error': '스캔 대기열이 가득 찼습니다. 잠시 후 다시 시도하세요.'}
     return {'job_id': job_id, 'status': 'queued'}
 
@@ -843,15 +867,19 @@ def eiass_get_spatial_scan_status(job_id: str, include_results: bool = False,
     **최종 보고 형식(필수)**: done이 되면 scanned(스캔한 전체) 기준으로 보고하라 — matches만
     추리지 말 것. 자세한 지침은 eiass_start_spatial_scan 참고.
     """
-    return spatial_status(_job_store, job_id, include_results, result_offset, min(result_limit, 500))
+    job_store, _ = _jobs_backend()
+    return spatial_status(job_store, job_id, include_results, result_offset,
+                          min(result_limit, JOB_RESULT_PAGE_LIMIT))
 
 
 @mcp.tool()
 def eiass_cancel_spatial_scan(job_id: str) -> dict:
     """진행 중인 백그라운드 공간조회(eiass_start_spatial_scan)를 취소한다."""
-    if not _job_store.get(job_id) or _job_store.get(job_id)['kind'] != 'spatial':
+    job_store, _ = _jobs_backend()
+    job = job_store.get(job_id)
+    if not job or job['kind'] != 'spatial':
         return {'error': f'알 수 없는 job_id: {job_id}'}
-    _job_store.request_cancel(job_id)
+    job_store.request_cancel(job_id)
     return {'job_id': job_id, 'status': 'cancelling'}
 
 
@@ -929,6 +957,7 @@ def eiass_geocode(address: str) -> dict:
 
 def run_stdio():
     """MCP 클라이언트가 stdin을 정상적으로 닫을 때 종료 traceback을 남기지 않는다."""
+    _jobs_backend()
     try:
         mcp.run(transport='stdio')
     except (BrokenPipeError, EOFError):
