@@ -17,7 +17,9 @@ typer는 mcp 실행에 필요 없지만, mcp.cli.cli가 optional import로 typer
 실패한다. 그래서 빌드 시점에만 설치해둔다.
 """
 import os
+import argparse
 import hashlib
+import shutil
 import subprocess
 import sys
 
@@ -42,7 +44,18 @@ def configure_stdio():
                 pass
 
 
-def build():
+def write_manifest(path):
+    digest = hashlib.sha256()
+    with open(path, 'rb') as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b''):
+            digest.update(chunk)
+    manifest_path = path + '.sha256'
+    with open(manifest_path, 'w', encoding='utf-8', newline='\n') as manifest:
+        manifest.write(digest.hexdigest().upper() + '  ' + os.path.basename(path) + '\n')
+    return manifest_path
+
+
+def build(publish_root=False):
     os.makedirs(DIST_DIR, exist_ok=True)
     os.makedirs(WORK_DIR, exist_ok=True)
     os.environ['PYTHONHASHSEED'] = '0'
@@ -66,15 +79,23 @@ def build():
         print(f'\n❌ 빌드 실패 (exit code {result.returncode})')
         sys.exit(result.returncode)
     out_path = os.path.join(DIST_DIR, OUTPUT_NAME + '.exe')
-    digest = hashlib.sha256()
-    with open(out_path, 'rb') as stream:
-        for chunk in iter(lambda: stream.read(1024 * 1024), b''):
-            digest.update(chunk)
-    with open(out_path + '.sha256', 'w', encoding='utf-8', newline='\n') as manifest:
-        manifest.write(digest.hexdigest().upper() + '  ' + os.path.basename(out_path) + '\n')
+    write_manifest(out_path)
+    if publish_root:
+        stable_path = os.path.join(BASE_DIR, 'mcp_server.exe')
+        try:
+            shutil.copyfile(out_path, stable_path)
+        except PermissionError:
+            print('⚠ 저장소 mcp_server.exe가 실행 중이라 교체할 수 없습니다. '
+                  '버전 아티팩트와 manifest는 정상 생성됐습니다.')
+            sys.exit(3)
+        write_manifest(stable_path)
+        print(f'✅ 저장소 배포본 갱신: {stable_path}')
     print(f'\n✅ 빌드 완료: {out_path}')
 
 
 if __name__ == '__main__':
     configure_stdio()
-    build()
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--publish-root', action='store_true',
+                        help='검증용 버전 실행 파일을 저장소의 mcp_server.exe에도 반영')
+    build(parser.parse_args().publish_root)

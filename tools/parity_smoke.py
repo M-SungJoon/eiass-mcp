@@ -27,13 +27,17 @@ def run(label, command, cwd):
                                             'clientInfo': {'name': 'parity-smoke', 'version': '1'}})
     listed = request(2, 'tools/list')
     version = request(3, 'tools/call', {'name': 'eiass_version', 'arguments': {}})
-    tool_names = sorted(tool['name'] for tool in listed['tools'])
+    tools = sorted(listed['tools'], key=lambda tool: tool['name'])
     process.stdin.close()
     process.wait(timeout=15)
     stderr = process.stderr.read()
     if process.returncode != 0 or 'Traceback' in stderr:
         raise RuntimeError(f'{label}: normal stdin close failed exit={process.returncode} stderr={stderr!r}')
-    return initialized['serverInfo']['name'], tool_names, version
+    return {
+        'server_name': initialized['serverInfo']['name'],
+        'tools': tools,
+        'version': version,
+    }
 
 
 def main():
@@ -45,9 +49,10 @@ def main():
     target = source
     if args.exe:
         target = run('exe', [str(args.exe.resolve())], root)
-    if target[:2] != source[:2] or target[1] != source[1]:
-        raise SystemExit(f'parity mismatch: source={source[:2]} target={target[:2]}')
-    print(f'PARITY OK server={source[0]} tools={len(source[1])}')
+    if target != source:
+        raise SystemExit('parity mismatch:\nsource=' + json.dumps(source, ensure_ascii=False, sort_keys=True)
+                         + '\ntarget=' + json.dumps(target, ensure_ascii=False, sort_keys=True))
+    print(f"PARITY OK server={source['server_name']} version={source['version']} tools={len(source['tools'])}")
 
 
 if __name__ == '__main__':

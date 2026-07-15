@@ -1,9 +1,10 @@
 """영속 JobStore를 사용하는 bounded worker 기반 스캔 실행기."""
 import queue
 import threading
+import uuid
 
 import eiass_core as core
-from config import JOB_QUEUE_SIZE, JOB_WORKER_COUNT
+from config import JOB_HEARTBEAT_INTERVAL_SECONDS, JOB_QUEUE_SIZE, JOB_WORKER_COUNT
 from document_engine import outcomes as document_outcomes, run_batch as run_document_batch
 from job_store import JobStore
 from spatial_engine import outcomes as spatial_outcomes, run_batch as run_spatial_batch
@@ -12,6 +13,7 @@ from spatial_engine import outcomes as spatial_outcomes, run_batch as run_spatia
 class ScanRunner:
     def __init__(self, store=None, worker_count=JOB_WORKER_COUNT, queue_size=JOB_QUEUE_SIZE):
         self.store = store or JobStore()
+        self.owner_id = uuid.uuid4().hex
         self.queue = queue.Queue(maxsize=queue_size)
         self._queued = set()
         self._lock = threading.Lock()
@@ -20,9 +22,27 @@ class ScanRunner:
             worker = threading.Thread(target=self._worker, name=f'eiass-scan-{index + 1}', daemon=True)
             worker.start()
             self._workers.append(worker)
-        for job_id in self.store.recover_interrupted():
-            self.submit(job_id)
+        self.store.register_runner(self.owner_id)
+        self._maintenance_once()
+        self._maintenance_thread = threading.Thread(
+            target=self._maintenance, name='eiass-scan-maintenance', daemon=True)
+        self._maintenance_thread.start()
         self.store.cleanup()
+
+    def _maintenance_once(self):
+        self.store.heartbeat_runner(self.owner_id)
+        for job_id in self.store.recover_interrupted(self.owner_id):
+            if not self.submit(job_id):
+                break
+
+    def _maintenance(self):
+        while True:
+            threading.Event().wait(JOB_HEARTBEAT_INTERVAL_SECONDS)
+            try:
+                self._maintenance_once()
+            except Exception:
+                # 일시적인 SQLite 잠금은 다음 heartbeat에서 다시 시도한다.
+                continue
 
     def submit(self, job_id):
         with self._lock:
@@ -46,24 +66,30 @@ class ScanRunner:
                 self.queue.task_done()
 
     def _run(self, job_id):
+        if not self.store.claim(job_id, self.owner_id):
+            return
         job = self.store.get(job_id)
         if not job or job['cancel']:
             if job:
-                self.store.update(job_id, status='cancelled', phase='cancelled')
+                self.store.update(job_id, status='cancelled', phase='cancelled', clear_owner=True)
             return
         payload = job['payload']
         kind = job['kind']
         session = core._session()
         try:
-            if not self.store.has_candidates(job_id):
+            if not job['snapshot_complete']:
                 self.store.update(job_id, status='discovering', phase='candidate_snapshot')
+                date_filter_exclusions = []
                 candidates = core.search_projects(
                     payload.get('keyword', ''), type_codes=payload.get('type_codes'),
                     agency_code=payload.get('agency_code', ''), max_pages=payload.get('max_pages', 0), session=session,
                     consult_date_from=payload.get('consult_date_from'), consult_date_to=payload.get('consult_date_to'),
                     progress_status=payload.get('progress_status', ''), biz_gubun=payload.get('biz_gubun', ''),
-                    progress_stage_keys=payload.get('progress_stage_keys'))
-                self.store.save_candidates(job_id, candidates)
+                    progress_stage_keys=payload.get('progress_stage_keys'),
+                    date_filter_exclusions=date_filter_exclusions)
+                meta = job['meta']
+                meta['date_filter_exclusions'] = date_filter_exclusions
+                self.store.save_candidates(job_id, candidates, meta=meta)
             self.store.update(job_id, status='running', phase='document_scan' if kind == 'document' else 'spatial_scan')
             pending = self.store.candidates(job_id, only_pending=True)
             batch_size = int(payload['batch_size'])
@@ -82,17 +108,18 @@ class ScanRunner:
                     if result.get('needs_refinement'):
                         meta['needs_refinement'] = True
                         meta.setdefault('refinement_hints', []).append(result.get('refinement_hint'))
+                    if result.get('audit_sample'):
+                        meta.setdefault('audit_samples', []).append(result['audit_sample'])
                 else:
                     result = run_spatial_batch(payload, candidates, should_cancel, session)
                     normalized = spatial_outcomes(candidates, result, ordinal_by_key)
                     meta = self.store.get(job_id)['meta']
-                self.store.save_outcomes(job_id, normalized)
-                self.store.update(job_id, meta=meta)
-            self.store.update(job_id, status='done', phase='completed')
+                self.store.save_outcomes(job_id, normalized, meta=meta)
+            self.store.update(job_id, status='done', phase='completed', clear_owner=True)
         except core.ScanCancelled:
-            self.store.update(job_id, status='cancelled', phase='cancelled')
+            self.store.update(job_id, status='cancelled', phase='cancelled', clear_owner=True)
         except Exception as exc:
-            self.store.update(job_id, status='error', phase='failed', error=str(exc))
+            self.store.update(job_id, status='error', phase='failed', error=str(exc), clear_owner=True)
         finally:
             session.close()
 
@@ -115,7 +142,9 @@ def document_status(store, job_id, include_results=False, offset=0, limit=100):
               'skipped_count': counts.get('skipped', 0), 'stage_stats': job['meta'].get('stage_stats', {}),
               'needs_refinement': bool(job['meta'].get('needs_refinement')),
               'refinement_hints': list(dict.fromkeys(filter(None, job['meta'].get('refinement_hints', [])))),
-              'audit_samples': [], 'error': job['error'], 'current_phase': job['current_phase'],
+              'audit_samples': job['meta'].get('audit_samples', []),
+              'date_filter_exclusions': job['meta'].get('date_filter_exclusions', []),
+              'error': job['error'], 'current_phase': job['current_phase'],
               'updated_at': job['updated_at'], 'heartbeat_at': job['heartbeat_at'], 'resume_count': job['resume_count']}
     if include_results:
         if offset < 0 or limit <= 0:
@@ -136,12 +165,14 @@ def spatial_status(store, job_id, include_results=False, offset=0, limit=100):
               'scanned_count': counts.get('match', 0) + counts.get('no_match', 0) + counts.get('spatial_failure', 0),
               'match_count': counts.get('match', 0), 'geocode_failure_count': counts.get('geocode_failure', 0),
               'spatial_failure_count': counts.get('spatial_failure', 0), 'error': job['error'],
+              'date_filter_exclusions': job['meta'].get('date_filter_exclusions', []),
               'current_phase': job['current_phase'], 'updated_at': job['updated_at'],
               'heartbeat_at': job['heartbeat_at'], 'resume_count': job['resume_count']}
     if include_results:
         if offset < 0 or limit <= 0:
             return {'error': 'result_offset은 0 이상, result_limit은 1 이상이어야 합니다.'}
-        result.update(scanned=store.results(job_id, 'match', offset, limit) + store.results(job_id, 'no_match', offset, limit),
+        result.update(scanned=store.results_for_outcomes(
+                          job_id, ('match', 'no_match', 'spatial_failure'), offset, limit),
                       matches=store.results(job_id, 'match', offset, limit),
                       geocode_failures=store.results(job_id, 'geocode_failure', offset, limit),
                       spatial_failures=store.results(job_id, 'spatial_failure', offset, limit),

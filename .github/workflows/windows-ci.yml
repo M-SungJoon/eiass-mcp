@@ -25,6 +25,9 @@ jobs:
       - name: Source and EXE parity smoke test
         shell: pwsh
         run: |
-          $exe = Join-Path '#AI working/release' 'mcp_server_1_8_0.exe'
+          $versionTag = ((Get-Content VERSION -Raw).Trim()).Replace('.', '_')
+          $exe = Join-Path '#AI working/release' "mcp_server_$versionTag.exe"
           python tools/parity_smoke.py --exe $exe
           python tools/verify_release.py $exe "$exe.sha256"
+          python tools/parity_smoke.py --exe mcp_server.exe
+          python tools/verify_release.py mcp_server.exe mcp_server.exe.sha256
