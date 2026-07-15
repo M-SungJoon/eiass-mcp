@@ -17,14 +17,18 @@ typer는 mcp 실행에 필요 없지만, mcp.cli.cli가 optional import로 typer
 실패한다. 그래서 빌드 시점에만 설치해둔다.
 """
 import os
+import hashlib
 import subprocess
 import sys
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 SRC = os.path.join(BASE_DIR, 'mcp_server.py')
-DIST_DIR = BASE_DIR
+VERSION = open(os.path.join(BASE_DIR, 'VERSION'), encoding='utf-8-sig').read().strip()
+VERSION_TAG = VERSION.replace('.', '_')
+DIST_DIR = os.path.join(BASE_DIR, '#AI working', 'release')
 WORK_DIR = os.path.join(BASE_DIR, '#AI working', 'mcp_pyinstaller')
 SPEC_DIR = WORK_DIR
+OUTPUT_NAME = f'mcp_server_{VERSION_TAG}'
 
 
 def configure_stdio():
@@ -39,13 +43,16 @@ def configure_stdio():
 
 
 def build():
+    os.makedirs(DIST_DIR, exist_ok=True)
     os.makedirs(WORK_DIR, exist_ok=True)
+    os.environ['PYTHONHASHSEED'] = '0'
+    os.environ.setdefault('SOURCE_DATE_EPOCH', '0')
     cmd = [
         sys.executable, '-m', 'PyInstaller',
         '--noconfirm',
         '--onefile',
         '--console',
-        '--name', 'mcp_server',
+        '--name', OUTPUT_NAME,
         '--distpath', DIST_DIR,
         '--workpath', WORK_DIR,
         '--specpath', SPEC_DIR,
@@ -59,7 +66,13 @@ def build():
     if result.returncode != 0:
         print(f'\n❌ 빌드 실패 (exit code {result.returncode})')
         sys.exit(result.returncode)
-    out_path = os.path.join(DIST_DIR, 'mcp_server.exe')
+    out_path = os.path.join(DIST_DIR, OUTPUT_NAME + '.exe')
+    digest = hashlib.sha256()
+    with open(out_path, 'rb') as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b''):
+            digest.update(chunk)
+    with open(out_path + '.sha256', 'w', encoding='utf-8', newline='\n') as manifest:
+        manifest.write(digest.hexdigest().upper() + '  ' + os.path.basename(out_path) + '\n')
     print(f'\n✅ 빌드 완료: {out_path}')
 
 

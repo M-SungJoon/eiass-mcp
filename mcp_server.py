@@ -18,6 +18,8 @@ import threading
 import time
 import uuid
 import multiprocessing
+import os
+import sys
 
 from mcp.server.fastmcp import FastMCP
 
@@ -925,6 +927,24 @@ def eiass_geocode(address: str) -> dict:
     return {'address': address, 'lon': lon, 'lat': lat, 'source': source}
 
 
+def run_stdio():
+    """MCP 클라이언트가 stdin을 정상적으로 닫을 때 종료 traceback을 남기지 않는다."""
+    try:
+        mcp.run(transport='stdio')
+    except (BrokenPipeError, EOFError):
+        return
+    except ValueError as exc:
+        if 'closed file' in str(exc).lower() or 'i/o operation on closed' in str(exc).lower():
+            return
+        raise
+    else:
+        # PyInstaller 콘솔 부트로더가 종료 시 닫힌 TextIOWrapper를 flush하는 환경이 있어,
+        # 정상적인 stdio 종료 후에만 표준 스트림을 devnull로 바꿔 shutdown traceback을 막는다.
+        if getattr(sys, 'frozen', False):
+            sys.stdout = open(os.devnull, 'w', encoding='utf-8')
+            sys.stderr = open(os.devnull, 'w', encoding='utf-8')
+
+
 if __name__ == '__main__':
     multiprocessing.freeze_support()
-    mcp.run(transport='stdio')
+    run_stdio()

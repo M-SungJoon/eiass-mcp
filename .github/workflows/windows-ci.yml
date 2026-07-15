@@ -1,0 +1,30 @@
+name: Windows CI
+
+on:
+  push:
+    branches: [main, codex/**]
+  pull_request:
+    branches: [main]
+
+jobs:
+  test-build-smoke:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install locked dependencies
+        run: python -m pip install -r requirements.lock
+      - name: Compile and unit test
+        run: |
+          python -m py_compile config.py models.py pdf_worker.py job_store.py document_engine.py spatial_engine.py scan_engine.py eiass_core.py mcp_server.py
+          python -m unittest discover -s tests -v
+      - name: Clean EXE build
+        run: python build_mcp.py
+      - name: Source and EXE parity smoke test
+        shell: pwsh
+        run: |
+          $exe = Join-Path '#AI working/release' 'mcp_server_1_8_0.exe'
+          python tools/parity_smoke.py --exe $exe
+          python tools/verify_release.py $exe "$exe.sha256"
