@@ -1473,6 +1473,25 @@ def download_document_text(file_seq, session=None, max_chars=20000):
     }
 
 
+def render_scan_confirmation(conditions):
+    """스캔 종류와 무관하게 사용자 승인 문구를 동일한 형식으로 렌더링한다."""
+    lines = [
+        '실제 스캔 전 확인이 필요합니다.',
+        '',
+        '적용 조건:',
+    ]
+    lines.extend(f'- {label}: {value}' for label, value in conditions)
+    lines.extend([
+        '',
+        '이 조건으로 스캔을 진행해도 될까요?',
+    ])
+    return '\n'.join(lines)
+
+
+def _climate_filter_label(climate_filter):
+    return {'Y': '대상', 'N': '비대상'}.get(climate_filter, '전체')
+
+
 def preview_document_keyword_search(
     text_queries,
     match_mode='any',
@@ -1491,6 +1510,8 @@ def preview_document_keyword_search(
     sample_detail_count=15,
     session=None,
     date_filter_exclusions=None,
+    climate_filter='',
+    audit_sample_size=0,
 ):
     """실제 문서를 다운로드하지 않고 후보 수/예상 문서 수/과거 패턴 우선순위를 미리 계산해
     확인 문구(confirmation_message)를 만든다. eiass_find_projects_by_document_keyword /
@@ -1527,7 +1548,7 @@ def preview_document_keyword_search(
     candidates = search_projects(
         keyword, type_codes=type_codes, agency_code=agency_code, max_pages=max_pages, session=session,
         consult_date_from=consult_date_from, consult_date_to=consult_date_to, progress_status=progress_status,
-        biz_gubun=biz_gubun, progress_stage_keys=progress_stage_keys,
+        climate_filter=climate_filter, biz_gubun=biz_gubun, progress_stage_keys=progress_stage_keys,
         date_filter_exclusions=date_filter_exclusions,
     )
     total = len(candidates)
@@ -1562,16 +1583,6 @@ def preview_document_keyword_search(
     agency_label = agency_code or '전체'
     date_label = f"{consult_date_from or '제한없음'} ~ {consult_date_to or '제한없음'}"
 
-    doc_scope_value = '/'.join(stages)
-    if doc_title_contains:
-        doc_scope_value += f" (제목에 {'/'.join(doc_title_contains)} 포함된 문서만)"
-
-    if len(text_queries) == 1:
-        keyword_phrase = f"`{text_queries[0]}` 포함"
-    else:
-        joined = ' 와 '.join(f'`{q}`' for q in text_queries)
-        keyword_phrase = f"{joined} " + ('모두 포함' if match_mode == 'all' else '중 하나 포함')
-
     # 예상 규모에 따라 소규모 즉시조회/백그라운드 스캔 중 어느 도구가 맞는지 힌트를 준다.
     scale = estimated_documents if estimated_documents is not None else total
     recommended_tool = 'eiass_start_document_keyword_scan(백그라운드 스캔)' if scale > 50 \
@@ -1582,56 +1593,27 @@ def preview_document_keyword_search(
         if progress_stage_keys else '전체'
     )
     progress_status_label = {'완료': '완료', '진행': '진행중'}.get(progress_status, '전체')
-    # 사용자에게 보여줄 확인 문구는 반드시 이 10개 항목을 이 순서/라벨 그대로 담아야 한다
-    # (검색조건 항목 하나도 빠뜨리지 말 것) — 순서/라벨을 바꾸지 마라.
-    bullets = [
-        f"- 평가종류: `{type_label}`",
-        f"- 사업유형: `{biz_label}`",
-        f"- 협의기관: `{agency_label}`",
-        f"- 협의완료일: `{date_label}`",
-        f"- 진행현황: `{progress_status_label}`",
-        f"- 진행구분: `{progress_stage_label}`",
-        f"- 확인 문서 범위: `{doc_scope_value}`",
-        f"- 키워드 매칭: {keyword_phrase}",
-        f"- 예상 후보 사업 수: `{total}`건",
-    ]
-    bullets.append(
-        f"- 예상 확인 문서 수: 약 `{estimated_documents}`건 (표본 {len(sample_doc_counts)}건 기준 추정)"
-        if estimated_documents is not None else "- 예상 확인 문서 수: 표본 추정 실패(상세조회 오류)"
+    estimated_documents_label = (
+        f"약 {estimated_documents}건 (표본 {len(sample_doc_counts)}건 기준 추정)"
+        if estimated_documents is not None else '표본 추정 실패(상세조회 오류)'
     )
-
-    notes = []
-    if inference_notes:
-        notes.append(f"※ 사용자가 직접 말하지 않고 AI가 추론/제안한 조건: {inference_notes}")
-    else:
-        notes.append("※ AI가 임의로 좁힌 조건 없음 — 언급되지 않은 필터는 전체로 적용했습니다.")
-    if doc_title_contains:
-        notes.append(
-            "※ 문서 제목 필터는 파일명 문자열 매칭입니다(의미 단위 이해 아님) — 실제 챕터 파일명 "
-            "표기와 다른 용어를 쓰면 관련 문서를 놓칠 수 있으니, 예상 문서 수가 기대와 다르면 "
-            "용어를 조정해서 다시 미리보기 해보세요."
-        )
-    if pattern:
-        top = pattern[0]
-        notes.append(
-            f"※ 과거 유사 조건에서는 `{top['stage']}` 단계 매칭률이 {top['match_rate']:.0%}"
-            f"(신뢰도: {top['confidence']}, 표본 {top['checked_count']}건)로 가장 높았습니다 — "
-            f"우선 확인 순서 참고용이며, 다른 단계를 생략하지는 않습니다."
-        )
-
-    message_parts = [
-        "아래 조건으로 실제 원문 스캔을 진행해도 될까요?",
-        "",
-        "적용할 검색 조건:",
-        "",
-        '\n'.join(bullets),
-    ]
-    if notes:
-        message_parts += ["", '\n'.join(notes)]
-    message_parts += [
-        "",
-        f"예상 규모상 `{recommended_tool}`으로 진행하는 게 맞습니다. 승인해주시면 같은 조건에 "
-        f"`confirmed=true`를 붙여 실행하고, 결과를 정리해 알려드리겠습니다.",
+    conditions = [
+        ('사업명 키워드', keyword or '전체'),
+        ('평가종류', type_label),
+        ('사업유형', biz_label),
+        ('협의기관', agency_label),
+        ('협의완료일', date_label),
+        ('진행현황', progress_status_label),
+        ('진행구분', progress_stage_label),
+        ('기후변화영향평가 대상', _climate_filter_label(climate_filter)),
+        ('검색 페이지 제한', '제한 없음' if max_pages == 0 else f'평가종류별 최대 {max_pages}페이지'),
+        ('확인 문서 범위', '/'.join(stages)),
+        ('문서 제목 필터', '/'.join(doc_title_contains) if doc_title_contains else '전체'),
+        ('원문 키워드', ', '.join(text_queries)),
+        ('키워드 매칭 방식', '모두 포함' if match_mode == 'all' else '하나 이상 포함'),
+        ('확인 범위 밖 표본 검증', '미적용' if audit_sample_size <= 0 else f'실행 배치당 {audit_sample_size}건'),
+        ('예상 후보 사업 수', f'{total}건'),
+        ('예상 확인 문서 수', estimated_documents_label),
     ]
 
     return {
@@ -1644,7 +1626,8 @@ def preview_document_keyword_search(
         'applied_filters': {
             'keyword': keyword or None, 'types': type_codes or 'ALL', 'agency_code': agency_code or 'ALL',
             'consult_date_from': consult_date_from, 'consult_date_to': consult_date_to,
-            'progress_status': progress_status or 'ALL', 'biz_gubun': biz_gubun or 'ALL',
+            'progress_status': progress_status or 'ALL', 'climate_filter': climate_filter or 'ALL',
+            'biz_gubun': biz_gubun or 'ALL',
             'progress_stage_keys': list(progress_stage_keys) if progress_stage_keys else 'ALL',
         },
         'inference_notes': inference_notes or None,
@@ -1652,9 +1635,12 @@ def preview_document_keyword_search(
         'doc_title_contains': doc_title_contains or None,
         'text_queries': text_queries,
         'match_mode': match_mode,
+        'audit_sample_size': audit_sample_size,
         'date_filter_exclusions': date_filter_exclusions,
         'confirm_required': True,
-        'confirmation_message': '\n'.join(message_parts),
+        'confirmation_required': True,
+        'display_mode': 'verbatim',
+        'confirmation_message': render_scan_confirmation(conditions),
     }
 
 
@@ -1681,6 +1667,7 @@ def search_projects_by_document_keyword(
     candidates=None,
     should_cancel=None,
     date_filter_exclusions=None,
+    climate_filter='',
 ):
     """검색 필터(협의완료일 범위/진행상태/진행구분 등)로 후보 사업을 뽑은 뒤, 지정한 단계(기본값
     '초안,본안,보완,협의의견' — 협의의견만 우선 확인하면 놓치는 경우가 있어 여러 단계를
@@ -1753,7 +1740,7 @@ def search_projects_by_document_keyword(
         candidates = search_projects(
             keyword, type_codes=type_codes, agency_code=agency_code, max_pages=max_pages, session=session,
             consult_date_from=consult_date_from, consult_date_to=consult_date_to, progress_status=progress_status,
-            biz_gubun=biz_gubun, progress_stage_keys=progress_stage_keys,
+            climate_filter=climate_filter, biz_gubun=biz_gubun, progress_stage_keys=progress_stage_keys,
             date_filter_exclusions=date_filter_exclusions,
         )
     else:
@@ -2481,13 +2468,13 @@ def find_nearby_protected_areas(lon, lat, radius_m=1000, session=None, version=N
 # "최근 6개월 내 협의완료된 도로사업 중 국립공원 5km 이내" 같은 요청은 (1) 검색 필터로 후보를
 # 좁히고 (2) 각 후보의 사업지 주소를 지오코딩해 보호구역까지 거리를 재는 두 단계로 이뤄진다.
 # 문서 키워드 검색과 동일하게, 확인 문구는 AI가 즉흥적으로 요약하지 않도록 여기서 코드가
-# 직접 10개 항목을 고정된 순서/라벨로 조립한다.
+# 모든 적용 조건을 고정된 순서/라벨로 조립한다.
 
 def preview_spatial_scan(
     keyword='', type_codes=None, agency_code='', consult_date_from=None, consult_date_to=None,
     progress_status='완료', biz_gubun='', progress_stage_keys=None, max_pages=0,
-    radius_m=1000, designations=None, inference_notes='', session=None,
-    date_filter_exclusions=None,
+    radius_m=1000, designations=None, allow_admin_fallback=True, inference_notes='', session=None,
+    date_filter_exclusions=None, climate_filter='',
 ):
     """검색 필터 + 공간조회 조건을 하나의 확인 문구로 조립한다(실제 지오코딩/공간조회는 하지
     않고 후보 수만 미리 계산한다) — 문서 키워드 검색의 "실행 전 확인" 게이트와 동일한 원칙을
@@ -2502,7 +2489,7 @@ def preview_spatial_scan(
     candidates = search_projects(
         keyword, type_codes=type_codes, agency_code=agency_code, max_pages=max_pages, session=session,
         consult_date_from=consult_date_from, consult_date_to=consult_date_to, progress_status=progress_status,
-        biz_gubun=biz_gubun, progress_stage_keys=progress_stage_keys,
+        climate_filter=climate_filter, biz_gubun=biz_gubun, progress_stage_keys=progress_stage_keys,
         date_filter_exclusions=date_filter_exclusions,
     )
     total = len(candidates)
@@ -2519,39 +2506,21 @@ def preview_spatial_scan(
     designation_label = ', '.join(designations) if designations else \
         '전체(국립공원/천연기념물/습지보호지역/야생생물보호구역/OECM/최신 보호지역 전체)'
 
-    # 확인 문구는 문서 키워드 검색과 동일한 10개 항목 구조를 쓰되, 문서조회 전용 3개 항목
-    # (확인 문서 범위/키워드 매칭/예상 확인 문서 수)을 공간조회 전용 3개 항목
-    # (대상 보호구역/반경/기준 위치)으로 바꾼다 — 나머지 6개 검색 필터 + 예상 후보 사업 수는 동일.
-    bullets = [
-        f"- 평가종류: `{type_label}`",
-        f"- 사업유형: `{biz_label}`",
-        f"- 협의기관: `{agency_label}`",
-        f"- 협의완료일: `{date_label}`",
-        f"- 진행현황: `{progress_status_label}`",
-        f"- 진행구분: `{progress_stage_label}`",
-        f"- 대상 보호구역: `{designation_label}`",
-        f"- 반경: `{radius_m}`m",
-        "- 기준 위치: `EIASS 사업개요의 사업지 주소(지오코딩 실패 시에만 읍/면/동으로 대체)`",
-        f"- 예상 후보 사업 수: `{total}`건",
-    ]
-
-    notes = []
-    if inference_notes:
-        notes.append(f"※ 사용자가 직접 말하지 않고 AI가 추론/제안한 조건: {inference_notes}")
-    else:
-        notes.append("※ AI가 임의로 좁힌 조건 없음 — 언급되지 않은 필터는 전체로 적용했습니다.")
-
-    message_parts = [
-        "아래 조건으로 공간조회(보호구역 인접)를 진행해도 될까요?",
-        "",
-        "적용할 검색 조건:",
-        "",
-        '\n'.join(bullets),
-        "",
-        '\n'.join(notes),
-        "",
-        f"승인해주시면 같은 조건에 `confirmed=true`를 붙여 실행하고, 스캔한 사업 {total}건 "
-        f"전체 리스트와 반경 이내 매칭 결과를 정리해 알려드리겠습니다.",
+    conditions = [
+        ('사업명 키워드', keyword or '전체'),
+        ('평가종류', type_label),
+        ('사업유형', biz_label),
+        ('협의기관', agency_label),
+        ('협의완료일', date_label),
+        ('진행현황', progress_status_label),
+        ('진행구분', progress_stage_label),
+        ('기후변화영향평가 대상', _climate_filter_label(climate_filter)),
+        ('검색 페이지 제한', '제한 없음' if max_pages == 0 else f'평가종류별 최대 {max_pages}페이지'),
+        ('대상 보호구역', designation_label),
+        ('반경', f'{radius_m}m'),
+        ('기준 위치', 'EIASS 사업개요의 사업지 주소'),
+        ('행정구역 대체 지오코딩', '허용' if allow_admin_fallback else '허용 안 함'),
+        ('예상 후보 사업 수', f'{total}건'),
     ]
 
     return {
@@ -2559,15 +2528,19 @@ def preview_spatial_scan(
         'applied_filters': {
             'keyword': keyword or None, 'types': type_codes or 'ALL', 'agency_code': agency_code or 'ALL',
             'consult_date_from': consult_date_from, 'consult_date_to': consult_date_to,
-            'progress_status': progress_status or 'ALL', 'biz_gubun': biz_gubun or 'ALL',
+            'progress_status': progress_status or 'ALL', 'climate_filter': climate_filter or 'ALL',
+            'biz_gubun': biz_gubun or 'ALL',
             'progress_stage_keys': list(progress_stage_keys) if progress_stage_keys else 'ALL',
         },
         'radius_m': radius_m,
         'designations': list(designations) if designations else 'ALL',
+        'allow_admin_fallback': allow_admin_fallback,
         'inference_notes': inference_notes or None,
         'date_filter_exclusions': date_filter_exclusions,
         'confirm_required': True,
-        'confirmation_message': '\n'.join(message_parts),
+        'confirmation_required': True,
+        'display_mode': 'verbatim',
+        'confirmation_message': render_scan_confirmation(conditions),
     }
 
 
@@ -2577,7 +2550,7 @@ def scan_projects_protected_area_adjacency(
     radius_m=1000, designations=None, allow_admin_fallback=True,
     offset=0, max_candidates=15, session=None,
     candidates=None, should_cancel=None,
-    date_filter_exclusions=None,
+    date_filter_exclusions=None, climate_filter='',
 ):
     """검색 필터로 후보를 뽑은 뒤, offset부터 max_candidates개를 순서대로 지오코딩+공간조회한다.
 
@@ -2598,7 +2571,7 @@ def scan_projects_protected_area_adjacency(
         candidates = search_projects(
             keyword, type_codes=type_codes, agency_code=agency_code, max_pages=max_pages, session=session,
             consult_date_from=consult_date_from, consult_date_to=consult_date_to, progress_status=progress_status,
-            biz_gubun=biz_gubun, progress_stage_keys=progress_stage_keys,
+            climate_filter=climate_filter, biz_gubun=biz_gubun, progress_stage_keys=progress_stage_keys,
             date_filter_exclusions=date_filter_exclusions,
         )
     else:

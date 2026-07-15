@@ -50,6 +50,18 @@ def _jobs_backend():
             _job_runner = ScanRunner(_job_store)
         return _job_store, _job_runner
 
+
+def _confirmation_only(result):
+    """AI가 조건을 재구성하지 않고 고정 문구만 전달하도록 미리보기 응답을 최소화한다."""
+    if result.get('error'):
+        return result
+    return {
+        'confirm_required': True,
+        'confirmation_required': True,
+        'display_mode': 'verbatim',
+        'confirmation_message': result['confirmation_message'],
+    }
+
 # ── 백그라운드 스캔 job 레지스트리 ──
 # 대량 후보(수백 건)를 협의의견/본안 등에서 키워드로 훑을 때, 한 번의 MCP tool 호출 안에서
 # 다 끝내려 하면 타임아웃이 난다. eiass_start_document_keyword_scan은 즉시 반환하고,
@@ -80,7 +92,8 @@ def _snapshot_candidates(kwargs, session):
         kwargs.get('keyword', ''), type_codes=kwargs.get('type_codes'), agency_code=kwargs.get('agency_code', ''),
         max_pages=kwargs.get('max_pages', 0), session=session,
         consult_date_from=kwargs.get('consult_date_from'), consult_date_to=kwargs.get('consult_date_to'),
-        progress_status=kwargs.get('progress_status', ''), biz_gubun=kwargs.get('biz_gubun', ''),
+        progress_status=kwargs.get('progress_status', ''), climate_filter=kwargs.get('climate_filter', ''),
+        biz_gubun=kwargs.get('biz_gubun', ''),
         progress_stage_keys=kwargs.get('progress_stage_keys'),
     )
 
@@ -259,8 +272,9 @@ def eiass_search_projects(keyword: str = '', types: str = '', agency_code: str =
 def eiass_preview_search(
     text_queries: str, match_mode: str = 'any', keyword: str = '', types: str = '', agency_code: str = '',
     consult_date_from: str = '', consult_date_to: str = '', progress_status: str = '완료',
-    biz_gubun: str = '', progress_stage: str = '', stages: str = '초안,본안,보완,협의의견', doc_title_contains: str = '',
-    max_pages: int = 0, inference_notes: str = '',
+    climate_filter: str = '', biz_gubun: str = '', progress_stage: str = '',
+    stages: str = '초안,본안,보완,협의의견', doc_title_contains: str = '',
+    max_pages: int = 0, inference_notes: str = '', audit_sample_size: int = 0,
 ) -> dict:
     """실제로 문서를 다운로드하지 않고, 이 조건으로 검색하면 무엇을 하게 될지 미리 보여준다.
     eiass_find_projects_by_document_keyword / eiass_start_document_keyword_scan을
@@ -268,7 +282,8 @@ def eiass_preview_search(
     도구를 따로 부르지 않고 그 두 도구를 confirmed=False(기본값)로 먼저 불러도 된다 —
     이 도구는 "확인 문구만 다시 보고 싶을 때"나 조건을 조정해보며 비교할 때 쓴다.
 
-    반환된 confirmation_message를 사용자에게 그대로 보여주고 승인을 받은 뒤에만
+    반환된 confirmation_message만 사용자에게 **한 글자도 바꾸지 말고 그대로** 보여라.
+    요약·생략·순서 변경·설명 추가를 금지한다. 승인을 받은 뒤에만
     같은 조건 + confirmed=true로 실제 실행 도구를 호출하라. 사용자가 명시적으로 말하지
     않은 필터는 여기 그대로 두면 자동으로 '전체'로 취급된다 — types/biz_gubun 등을
     AI가 임의로 좁혔다면 반드시 inference_notes에 그 사실과 이유를 적어서 사용자가
@@ -298,13 +313,15 @@ def eiass_preview_search(
     progress_stage_labels = [s.strip() for s in progress_stage.split(',') if s.strip()]
     try:
         stage_keys = core.progress_stage_keys_from_labels(progress_stage_labels)
-        return core.preview_document_keyword_search(
+        return _confirmation_only(core.preview_document_keyword_search(
             query_list, match_mode=match_mode, keyword=keyword, type_codes=type_codes, agency_code=agency_code,
             consult_date_from=consult_date_from or None, consult_date_to=consult_date_to or None,
-            progress_status=progress_status, biz_gubun=biz_gubun, progress_stage_keys=stage_keys,
+            progress_status=progress_status, climate_filter=climate_filter,
+            biz_gubun=biz_gubun, progress_stage_keys=stage_keys,
             stages=stage_list, doc_title_contains=title_terms,
             max_pages=max_pages, inference_notes=inference_notes,
-        )
+            audit_sample_size=audit_sample_size,
+        ))
     except core.EiassError as exc:
         return {'error': str(exc)}
 
@@ -313,7 +330,8 @@ def eiass_preview_search(
 def eiass_find_projects_by_document_keyword(
     text_queries: str, match_mode: str = 'any', keyword: str = '', types: str = '', agency_code: str = '',
     consult_date_from: str = '', consult_date_to: str = '', progress_status: str = '완료',
-    biz_gubun: str = '', progress_stage: str = '', stages: str = '초안,본안,보완,협의의견', doc_title_contains: str = '',
+    climate_filter: str = '', biz_gubun: str = '', progress_stage: str = '',
+    stages: str = '초안,본안,보완,협의의견', doc_title_contains: str = '',
     max_pages: int = 0, offset: int = 0, max_candidates: int = 30,
     inference_notes: str = '', confirmed: bool = False, audit_sample_size: int = 0,
 ) -> dict:
@@ -325,7 +343,8 @@ def eiass_find_projects_by_document_keyword(
 
     **실행 전 확인 필수**: confirmed=False(기본값)로 호출하면 실제 조회는 하지 않고,
     적용될 검색조건/문서범위/예상 후보·문서 수/과거 패턴 힌트가 담긴 확인 문구
-    (confirmation_message)만 반환한다. 이걸 사용자에게 보여주고 승인을 받은 뒤,
+    (confirmation_message)만 반환한다. confirmation_message만 사용자에게 한 글자도 바꾸지
+    말고 그대로 보여라. 요약·생략·순서 변경·설명 추가를 금지한다. 승인을 받은 뒤,
     **같은 조건 그대로에 confirmed=true만 추가**해서 다시 호출해야 실제로 실행된다.
     사용자가 이미 조건을 구체적으로 다 말해서 확인이 필요 없다고 판단되더라도, 이 게이트를
     건너뛰지 마라 — 특히 stages를 '본안'/'초안'처럼 넓히거나 types/biz_gubun을 AI가
@@ -372,6 +391,7 @@ def eiass_find_projects_by_document_keyword(
         agency_code: 협의기관 코드(선택).
         consult_date_from/consult_date_to: 'YYYY-MM-DD'. 협의완료일 범위.
         progress_status: '완료' | '진행' | ''. 기본 '완료'(협의의견은 완료 건에만 존재).
+        climate_filter: 'Y' | 'N' | ''. 기후변화영향평가 대상 여부. 비우면 전체.
         biz_gubun: 사업유형(사업구분) 필터 라벨(예: '산업입지 및 산업단지의 조성'). 정확한 목록은
             eiass_search_projects 설명 참고. 사후환경영향조사는 미지원.
         progress_stage: 진행구분 다중선택, 콤마 구분. 사용 가능 라벨: 초안, 평가서, 재협의,
@@ -399,13 +419,15 @@ def eiass_find_projects_by_document_keyword(
         common_kwargs = dict(
             match_mode=match_mode, keyword=keyword, type_codes=type_codes, agency_code=agency_code,
             consult_date_from=consult_date_from or None, consult_date_to=consult_date_to or None,
-            progress_status=progress_status, biz_gubun=biz_gubun, progress_stage_keys=stage_keys,
+            progress_status=progress_status, climate_filter=climate_filter,
+            biz_gubun=biz_gubun, progress_stage_keys=stage_keys,
             stages=stage_list, doc_title_contains=title_terms,
             max_pages=max_pages,
         )
         if not confirmed:
-            return core.preview_document_keyword_search(
-                query_list, inference_notes=inference_notes, **common_kwargs)
+            return _confirmation_only(core.preview_document_keyword_search(
+                query_list, inference_notes=inference_notes,
+                audit_sample_size=audit_sample_size, **common_kwargs))
         return core.search_projects_by_document_keyword(
             query_list, offset=offset, max_candidates=max_candidates,
             audit_sample_size=audit_sample_size, **common_kwargs,
@@ -418,7 +440,8 @@ def eiass_find_projects_by_document_keyword(
 def eiass_start_document_keyword_scan(
     text_queries: str, match_mode: str = 'any', keyword: str = '', types: str = '', agency_code: str = '',
     consult_date_from: str = '', consult_date_to: str = '', progress_status: str = '완료',
-    biz_gubun: str = '', progress_stage: str = '', stages: str = '초안,본안,보완,협의의견', doc_title_contains: str = '',
+    climate_filter: str = '', biz_gubun: str = '', progress_stage: str = '',
+    stages: str = '초안,본안,보완,협의의견', doc_title_contains: str = '',
     max_pages: int = 0, batch_size: int = 10, inference_notes: str = '', confirmed: bool = False,
     audit_sample_size: int = 0,
 ) -> dict:
@@ -429,7 +452,8 @@ def eiass_start_document_keyword_scan(
     상태조회/취소는 스캔이 실행 중이어도 즉시 응답한다(백그라운드 스레드와 별도로 처리됨).
 
     **실행 전 확인 필수**: confirmed=False(기본값)면 스캔을 시작하지 않고 eiass_preview_search와
-    동일한 확인 문구만 반환한다. 사용자 승인 후 같은 조건 + confirmed=true로 다시 호출해야
+    동일한 확인 문구만 반환한다. confirmation_message만 한 글자도 바꾸지 말고 그대로 보여라.
+    요약·생략·순서 변경·설명 추가를 금지한다. 사용자 승인 후 같은 조건 + confirmed=true로 다시 호출해야
     실제 백그라운드 스캔이 시작된다.
 
     파라미터는 eiass_find_projects_by_document_keyword와 동일하되 offset/max_candidates
@@ -458,13 +482,16 @@ def eiass_start_document_keyword_scan(
     common_kwargs = dict(
         match_mode=match_mode, keyword=keyword, type_codes=type_codes, agency_code=agency_code,
         consult_date_from=consult_date_from or None, consult_date_to=consult_date_to or None,
-        progress_status=progress_status, biz_gubun=biz_gubun, progress_stage_keys=stage_keys,
+        progress_status=progress_status, climate_filter=climate_filter,
+        biz_gubun=biz_gubun, progress_stage_keys=stage_keys,
         stages=stage_list, doc_title_contains=title_terms,
         max_pages=max_pages,
     )
     if not confirmed:
         try:
-            return core.preview_document_keyword_search(query_list, inference_notes=inference_notes, **common_kwargs)
+            return _confirmation_only(core.preview_document_keyword_search(
+                query_list, inference_notes=inference_notes,
+                audit_sample_size=audit_sample_size, **common_kwargs))
         except core.EiassError as exc:
             return {'error': str(exc)}
 
@@ -649,7 +676,9 @@ def eiass_check_project_protected_area_adjacency(
     **실행 전 확인 필수**: 원문 키워드 검색 등으로 찾은 여러 후보 사업을 이어서 공간조회할
     때는, 이 도구를 사업별로 반복 호출하기 전에 검토 대상 사업 목록 전체 + radius_m +
     designations를 사용자에게 한 번에 보여주고 승인을 받아라. confirmed=False(기본값)면
-    실제 지오코딩·공간조회를 하지 않고 위 조건만 요약한 확인 문구를 반환한다. 사용자 승인
+    실제 지오코딩·공간조회를 하지 않고 위 조건을 모두 담은 고정 확인 문구를 반환한다.
+    confirmation_message만 한 글자도 바꾸지 말고 그대로 보여라. 요약·생략·순서 변경·설명
+    추가를 금지한다. 사용자 승인
     후 같은 조건 + confirmed=true로 사업마다 호출한다.
 
     **최종 보고 형식(필수)**: 여러 사업을 조회했다면 (1) `사업명 | eia_cd | 대상 보호구역 |
@@ -671,25 +700,16 @@ def eiass_check_project_protected_area_adjacency(
     """
     if not confirmed:
         designation_label = designations or '전체(국립공원/천연기념물/습지보호지역/야생생물보호구역/OECM/최신 보호지역 전체)'
-        message = '\n'.join([
-            "아래 조건으로 사업지 위치 기반 보호구역 인접조회를 진행해도 될까요?",
-            "",
-            f"- 사업지 주소: `{project_location}`",
-            f"- 검색 반경: `{radius_m}`m",
-            f"- 대상 보호구역: `{designation_label}`",
-            f"- 사업지 주소 지오코딩 실패 시 읍/면/동 대체: `{'허용' if allow_admin_fallback else '허용 안 함'}`",
-            "",
-            "여러 사업을 이어서 조회할 계획이면, 전체 대상 사업 목록도 함께 보여주고 한 번에 "
-            "승인받은 뒤 사업별로 confirmed=true를 붙여 호출하세요.",
-            "",
-            "승인해주시면 같은 조건에 confirmed=true를 붙여 실행하고, 결과를 정리해 알려드리겠습니다.",
-        ])
-        return {
-            'confirm_required': True,
-            'project_location': project_location, 'radius_m': radius_m,
-            'designations': designations or 'ALL', 'allow_admin_fallback': allow_admin_fallback,
-            'confirmation_message': message,
-        }
+        conditions = [
+            ('사업지 주소', project_location),
+            ('대상 보호구역', designation_label),
+            ('반경', f'{radius_m}m'),
+            ('기준 위치', 'EIASS 사업개요의 사업지 주소'),
+            ('행정구역 대체 지오코딩', '허용' if allow_admin_fallback else '허용 안 함'),
+        ]
+        return _confirmation_only({
+            'confirmation_message': core.render_scan_confirmation(conditions),
+        })
 
     try:
         geocoded = core.geocode_project_location(project_location)
@@ -735,7 +755,8 @@ def eiass_check_project_protected_area_adjacency(
 @mcp.tool()
 def eiass_find_projects_protected_area_adjacency(
     keyword: str = '', types: str = '', agency_code: str = '', consult_date_from: str = '',
-    consult_date_to: str = '', progress_status: str = '완료', biz_gubun: str = '', progress_stage: str = '',
+    consult_date_to: str = '', progress_status: str = '완료', climate_filter: str = '',
+    biz_gubun: str = '', progress_stage: str = '',
     max_pages: int = 0, radius_m: int = 1000, designations: str = '', allow_admin_fallback: bool = True,
     offset: int = 0, max_candidates: int = 15, inference_notes: str = '', confirmed: bool = False,
 ) -> dict:
@@ -747,10 +768,9 @@ def eiass_find_projects_protected_area_adjacency(
     도구다 — 검색 필터로 후보 자체를 뽑아야 하면 이 도구를 써라).
 
     **실행 전 확인 필수**: confirmed=False(기본값)로 호출하면 실제 지오코딩/공간조회는 하지
-    않고, 아래 10개 항목을 **이 순서 그대로, 하나도 빠짐없이** 담은 확인 문구(confirmation_message)
-    만 반환한다 — 원문 키워드 검색의 확인 게이트와 동일한 원칙이다:
-    평가종류/사업유형/협의기관/협의완료일/진행현황/진행구분/대상 보호구역/반경/기준 위치/
-    예상 후보 사업 수. 이 문구를 사용자에게 그대로 보여주고 승인을 받은 뒤에만, **같은 조건
+    않고, 모든 검색·공간 조건을 고정 순서로 하나도 빠짐없이 담은 확인 문구
+    (confirmation_message)만 반환한다. confirmation_message만 한 글자도 바꾸지 말고 그대로
+    보여라. 요약·생략·순서 변경·설명 추가를 금지한다. 승인을 받은 뒤에만, **같은 조건
     그대로에 confirmed=true만 추가**해서 다시 호출해야 실제로 실행된다. AI가 임의로 좁힌
     필터가 있다면 inference_notes에 남겨라.
 
@@ -767,6 +787,7 @@ def eiass_find_projects_protected_area_adjacency(
     Args:
         keyword/types/agency_code/consult_date_from/consult_date_to/progress_status/biz_gubun/
         progress_stage/max_pages: eiass_search_projects와 동일한 검색 필터.
+        climate_filter: 'Y' | 'N' | ''. 기후변화영향평가 대상 여부. 비우면 전체.
         radius_m: 검색 반경(미터). 기본 1000m.
         designations: 확인할 보호구역 종류, 콤마 구분(예: '국립공원'). 비우면(기본값) 전체
             레이어를 조회한다.
@@ -784,13 +805,15 @@ def eiass_find_projects_protected_area_adjacency(
         common_kwargs = dict(
             keyword=keyword, type_codes=type_codes, agency_code=agency_code,
             consult_date_from=consult_date_from or None, consult_date_to=consult_date_to or None,
-            progress_status=progress_status, biz_gubun=biz_gubun, progress_stage_keys=stage_keys,
+            progress_status=progress_status, climate_filter=climate_filter,
+            biz_gubun=biz_gubun, progress_stage_keys=stage_keys,
             max_pages=max_pages,
         )
         if not confirmed:
-            return core.preview_spatial_scan(
-                radius_m=radius_m, designations=designation_list, inference_notes=inference_notes,
-                **common_kwargs)
+            return _confirmation_only(core.preview_spatial_scan(
+                radius_m=radius_m, designations=designation_list,
+                allow_admin_fallback=allow_admin_fallback, inference_notes=inference_notes,
+                **common_kwargs))
         return core.scan_projects_protected_area_adjacency(
             radius_m=radius_m, designations=designation_list, allow_admin_fallback=allow_admin_fallback,
             offset=offset, max_candidates=max_candidates, **common_kwargs)
@@ -801,7 +824,8 @@ def eiass_find_projects_protected_area_adjacency(
 @mcp.tool()
 def eiass_start_spatial_scan(
     keyword: str = '', types: str = '', agency_code: str = '', consult_date_from: str = '',
-    consult_date_to: str = '', progress_status: str = '완료', biz_gubun: str = '', progress_stage: str = '',
+    consult_date_to: str = '', progress_status: str = '완료', climate_filter: str = '',
+    biz_gubun: str = '', progress_stage: str = '',
     max_pages: int = 0, radius_m: int = 1000, designations: str = '', allow_admin_fallback: bool = True,
     batch_size: int = 10, inference_notes: str = '', confirmed: bool = False,
 ) -> dict:
@@ -811,7 +835,9 @@ def eiass_start_spatial_scan(
     eiass_get_spatial_scan_status(job_id)로 주기적으로 진행 상황을 확인하라.
 
     **실행 전 확인 필수**: confirmed=False(기본값)면 스캔을 시작하지 않고
-    eiass_find_projects_protected_area_adjacency와 동일한 10개 항목 확인 문구만 반환한다.
+    eiass_find_projects_protected_area_adjacency와 동일한 전체 조건 확인 문구만 반환한다.
+    confirmation_message만 한 글자도 바꾸지 말고 그대로 보여라. 요약·생략·순서 변경·설명
+    추가를 금지한다.
     사용자 승인 후 같은 조건 + confirmed=true로 다시 호출해야 실제 백그라운드 스캔이 시작된다.
 
     파라미터는 eiass_find_projects_protected_area_adjacency와 동일하되 offset/max_candidates
@@ -832,14 +858,16 @@ def eiass_start_spatial_scan(
     common_kwargs = dict(
         keyword=keyword, type_codes=type_codes, agency_code=agency_code,
         consult_date_from=consult_date_from or None, consult_date_to=consult_date_to or None,
-        progress_status=progress_status, biz_gubun=biz_gubun, progress_stage_keys=stage_keys,
+        progress_status=progress_status, climate_filter=climate_filter,
+        biz_gubun=biz_gubun, progress_stage_keys=stage_keys,
         max_pages=max_pages,
     )
     if not confirmed:
         try:
-            return core.preview_spatial_scan(
-                radius_m=radius_m, designations=designation_list, inference_notes=inference_notes,
-                **common_kwargs)
+            return _confirmation_only(core.preview_spatial_scan(
+                radius_m=radius_m, designations=designation_list,
+                allow_admin_fallback=allow_admin_fallback, inference_notes=inference_notes,
+                **common_kwargs))
         except core.EiassError as exc:
             return {'error': str(exc)}
 

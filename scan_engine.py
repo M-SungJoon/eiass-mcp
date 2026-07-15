@@ -84,7 +84,8 @@ class ScanRunner:
                     payload.get('keyword', ''), type_codes=payload.get('type_codes'),
                     agency_code=payload.get('agency_code', ''), max_pages=payload.get('max_pages', 0), session=session,
                     consult_date_from=payload.get('consult_date_from'), consult_date_to=payload.get('consult_date_to'),
-                    progress_status=payload.get('progress_status', ''), biz_gubun=payload.get('biz_gubun', ''),
+                    progress_status=payload.get('progress_status', ''),
+                    climate_filter=payload.get('climate_filter', ''), biz_gubun=payload.get('biz_gubun', ''),
                     progress_stage_keys=payload.get('progress_stage_keys'),
                     date_filter_exclusions=date_filter_exclusions)
                 meta = job['meta']
