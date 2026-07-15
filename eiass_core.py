@@ -27,10 +27,14 @@ import time
 import urllib.parse
 from collections import OrderedDict
 from datetime import date, datetime
+import multiprocessing
 
 import requests
 import urllib3
 from bs4 import BeautifulSoup
+from config import (DETAIL_CACHE_MAX_ITEMS, DETAIL_CACHE_TTL_SECONDS, DOC_CACHE_MAX_CHARS,
+                    DOC_CACHE_TTL_SECONDS, PDF_EXTRACT_TIMEOUT_SECONDS, PDF_MAX_BYTES, PDF_MAX_PAGES)
+from pdf_worker import worker_entry
 
 try:
     import fitz  # PyMuPDF
@@ -40,7 +44,7 @@ except ImportError:
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 # 저장소 루트 VERSION 파일과 항상 같은 값으로 맞춰서 커밋할 것(버전 두 곳 중복 관리).
-__version__ = '1.6.0'
+__version__ = '1.7.0'
 
 REQUEST_TIMEOUT = (8, 30)
 
@@ -154,13 +158,25 @@ def _cache_get(file_seq):
         conn = _cache_connect()
         try:
             row = conn.execute(
-                'SELECT text, page_offsets, pages FROM doc_text_cache WHERE file_seq = ?', (file_seq,)
+                'SELECT text, page_offsets, pages, fetched_at FROM doc_text_cache WHERE file_seq = ?', (file_seq,)
             ).fetchone()
         finally:
             conn.close()
     if not row:
         return None
-    text, page_offsets_json, pages = row
+    text, page_offsets_json, pages, fetched_at = row
+    try:
+        if (datetime.utcnow() - datetime.fromisoformat(fetched_at)).total_seconds() > DOC_CACHE_TTL_SECONDS:
+            with _CACHE_LOCK:
+                conn = _cache_connect()
+                try:
+                    conn.execute('DELETE FROM doc_text_cache WHERE file_seq=?', (file_seq,))
+                    conn.commit()
+                finally:
+                    conn.close()
+            return None
+    except (TypeError, ValueError):
+        return None
     return {'text': text, 'page_offsets': json.loads(page_offsets_json), 'pages': pages}
 
 
@@ -173,6 +189,12 @@ def _cache_put(file_seq, text, page_offsets, pages):
                 '(file_seq, text, page_offsets, pages, char_count, fetched_at) VALUES (?, ?, ?, ?, ?, ?)',
                 (file_seq, text, json.dumps(page_offsets), pages, len(text), datetime.utcnow().isoformat()),
             )
+            conn.execute('''DELETE FROM doc_text_cache WHERE file_seq IN (
+                SELECT file_seq FROM doc_text_cache ORDER BY fetched_at ASC
+                LIMIT MAX(0, (SELECT COUNT(*) FROM doc_text_cache) - 5000)
+            )''')
+            while conn.execute('SELECT COALESCE(SUM(char_count), 0) FROM doc_text_cache').fetchone()[0] > DOC_CACHE_MAX_CHARS:
+                conn.execute('DELETE FROM doc_text_cache WHERE file_seq=(SELECT file_seq FROM doc_text_cache ORDER BY fetched_at ASC LIMIT 1)')
             conn.commit()
         finally:
             conn.close()
@@ -601,7 +623,8 @@ def _completion_date_or_dash(value):
     return date_value.strftime('%Y.%m.%d') if date_value else '-'
 
 
-def _passes_extra_filters(item, consult_date_from=None, consult_date_to=None, progress_status=None):
+def _passes_extra_filters(item, consult_date_from=None, consult_date_to=None, progress_status=None,
+                          date_filter_exclusions=None):
     """원본 _passes_extra_filters 이식. 서버측 년도 필터는 성기므로 클라이언트에서 정확히 재검증한다."""
     if progress_status and item.get('progress_status') != progress_status:
         return False
@@ -610,6 +633,9 @@ def _passes_extra_filters(item, consult_date_from=None, consult_date_to=None, pr
         if item.get('type') == '사후환경영향조사':
             year_match = re.search(r'\d{4}', _first_nonblank(item.get('date'), item.get('comp_date')))
             if not year_match:
+                if date_filter_exclusions is not None:
+                    date_filter_exclusions.append({'name': item.get('name'), 'eia_cd': item.get('eia_cd'),
+                                                   'reason': '사후환경영향조사 연도를 확인할 수 없습니다.'})
                 return False
             survey_year = int(year_match.group(0))
             if start and survey_year < start.year:
@@ -619,6 +645,9 @@ def _passes_extra_filters(item, consult_date_from=None, consult_date_to=None, pr
             return True
         date_value = _date_from_text(item.get('comp_date', '')) or _date_from_text(item.get('date', ''))
         if not date_value:
+            if date_filter_exclusions is not None:
+                date_filter_exclusions.append({'name': item.get('name'), 'eia_cd': item.get('eia_cd'),
+                                               'reason': '협의완료일을 확인할 수 없습니다.'})
             return False
         if start and date_value < start:
             return False
@@ -629,7 +658,7 @@ def _passes_extra_filters(item, consult_date_from=None, consult_date_to=None, pr
 
 def search_projects(keyword='', type_codes=None, agency_code='', max_pages=0, session=None,
                      consult_date_from=None, consult_date_to=None, progress_status='', climate_filter='',
-                     progress_stage_keys=None, biz_gubun=''):
+                     progress_stage_keys=None, biz_gubun='', date_filter_exclusions=None):
     """EIASS 사업 검색. 원본 앱(run_search)의 협의완료일 범위/진행상태/기후변화영향평가/
     진행구분/사업유형(biz_gubun) 필터를 그대로 지원한다.
 
@@ -827,7 +856,8 @@ def search_projects(keyword='', type_codes=None, agency_code='', max_pages=0, se
                     'eia_cd': m.group(2),
                     'revirpt_seq': m.group(3),
                 }
-                if not _passes_extra_filters(item_data, consult_start, consult_end, progress_status):
+                if not _passes_extra_filters(item_data, consult_start, consult_end, progress_status,
+                                             date_filter_exclusions):
                     continue
                 results.append(item_data)
             if len(rows) >= 100 and new_on_page == 0:
@@ -1356,22 +1386,31 @@ def _get_full_document_text(file_seq, session=None):
                 timeout=(8, 60), verify=False)
     if res.status_code != 200 or not res.content:
         raise EiassError(f'문서 다운로드 실패: HTTP {res.status_code}')
-    doc = fitz.open(stream=res.content, filetype='pdf')
+    if len(res.content) > PDF_MAX_BYTES:
+        raise EiassError(f'문서 크기가 제한({PDF_MAX_BYTES // (1024 * 1024)}MB)을 초과했습니다.')
+    # PyMuPDF는 손상 PDF에서 장시간 멈출 수 있어 별도 프로세스에서 제한 시간 안에 추출한다.
+    ctx = multiprocessing.get_context('spawn')
+    result_queue = ctx.Queue(maxsize=1)
+    process = ctx.Process(target=worker_entry, args=(res.content, PDF_MAX_PAGES, result_queue), daemon=True)
+    process.start()
+    process.join(PDF_EXTRACT_TIMEOUT_SECONDS)
+    if process.is_alive():
+        process.terminate()
+        process.join(5)
+        raise EiassError(f'PDF 텍스트 추출 시간이 제한({PDF_EXTRACT_TIMEOUT_SECONDS}초)을 초과했습니다.')
+    if result_queue.empty():
+        raise EiassError(f'PDF 텍스트 추출 프로세스가 결과 없이 종료했습니다 (exit={process.exitcode}).')
+    status, payload = result_queue.get()
+    if status != 'ok':
+        raise EiassError(f'PDF 텍스트 추출 실패: {payload}')
+    full_text = payload['text']
+    page_offsets = payload['page_offsets']
+    pages = payload['pages']
     try:
-        parts = [page.get_text() for page in doc]
-    finally:
-        doc.close()
-    full_text = '\n'.join(parts)
-    page_offsets = []
-    cursor = 0
-    for part in parts:
-        cursor += len(part) + 1
-        page_offsets.append(cursor)
-    try:
-        _cache_put(file_seq, full_text, page_offsets, len(parts))
+        _cache_put(file_seq, full_text, page_offsets, pages)
     except Exception:
         pass  # 캐시 저장 실패는 무시(검색 자체는 계속 진행)
-    return {'text': full_text, 'page_offsets': page_offsets, 'pages': len(parts), 'from_cache': False}
+    return {'text': full_text, 'page_offsets': page_offsets, 'pages': pages, 'from_cache': False}
 
 
 def _filter_files_by_title(files, title_terms):

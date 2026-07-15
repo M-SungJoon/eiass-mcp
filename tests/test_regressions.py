@@ -58,6 +58,13 @@ class RegressionTests(unittest.TestCase):
         item = {'type': core.TYPE_NAME_MAP['A'], 'date': '-', 'comp_date': '2024.01.01', 'progress_status': ''}
         self.assertTrue(core._passes_extra_filters(item, date(2024, 1, 1), date(2024, 12, 31)))
 
+    def test_unknown_completion_date_is_reported_as_date_filter_exclusion(self):
+        exclusions = []
+        item = {'name': 'unknown', 'eia_cd': 'x', 'type': 'E', 'date': '-', 'comp_date': '-', 'progress_status': ''}
+        self.assertFalse(core._passes_extra_filters(item, date(2024, 1, 1), date(2024, 12, 31),
+                                                    date_filter_exclusions=exclusions))
+        self.assertEqual(exclusions[0]['eia_cd'], 'x')
+
     def test_invalid_paging_is_rejected(self):
         candidates = [{'name': 'A', 'eia_cd': '1', 'view_type': 'eia', 'revirpt_seq': '1'}]
         with self.assertRaises(core.EiassError):
