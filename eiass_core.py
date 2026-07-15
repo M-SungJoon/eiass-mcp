@@ -27,10 +27,14 @@ import time
 import urllib.parse
 from collections import OrderedDict
 from datetime import date, datetime
+import multiprocessing
 
 import requests
 import urllib3
 from bs4 import BeautifulSoup
+from config import (DETAIL_CACHE_MAX_ITEMS, DETAIL_CACHE_TTL_SECONDS, DOC_CACHE_MAX_CHARS,
+                    DOC_CACHE_TTL_SECONDS, PDF_EXTRACT_TIMEOUT_SECONDS, PDF_MAX_BYTES, PDF_MAX_PAGES)
+from pdf_worker import worker_entry
 
 try:
     import fitz  # PyMuPDF
@@ -40,7 +44,7 @@ except ImportError:
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 # 저장소 루트 VERSION 파일과 항상 같은 값으로 맞춰서 커밋할 것(버전 두 곳 중복 관리).
-__version__ = '1.5.0'
+__version__ = '1.7.0'
 
 REQUEST_TIMEOUT = (8, 30)
 
@@ -154,13 +158,25 @@ def _cache_get(file_seq):
         conn = _cache_connect()
         try:
             row = conn.execute(
-                'SELECT text, page_offsets, pages FROM doc_text_cache WHERE file_seq = ?', (file_seq,)
+                'SELECT text, page_offsets, pages, fetched_at FROM doc_text_cache WHERE file_seq = ?', (file_seq,)
             ).fetchone()
         finally:
             conn.close()
     if not row:
         return None
-    text, page_offsets_json, pages = row
+    text, page_offsets_json, pages, fetched_at = row
+    try:
+        if (datetime.utcnow() - datetime.fromisoformat(fetched_at)).total_seconds() > DOC_CACHE_TTL_SECONDS:
+            with _CACHE_LOCK:
+                conn = _cache_connect()
+                try:
+                    conn.execute('DELETE FROM doc_text_cache WHERE file_seq=?', (file_seq,))
+                    conn.commit()
+                finally:
+                    conn.close()
+            return None
+    except (TypeError, ValueError):
+        return None
     return {'text': text, 'page_offsets': json.loads(page_offsets_json), 'pages': pages}
 
 
@@ -173,6 +189,12 @@ def _cache_put(file_seq, text, page_offsets, pages):
                 '(file_seq, text, page_offsets, pages, char_count, fetched_at) VALUES (?, ?, ?, ?, ?, ?)',
                 (file_seq, text, json.dumps(page_offsets), pages, len(text), datetime.utcnow().isoformat()),
             )
+            conn.execute('''DELETE FROM doc_text_cache WHERE file_seq IN (
+                SELECT file_seq FROM doc_text_cache ORDER BY fetched_at ASC
+                LIMIT MAX(0, (SELECT COUNT(*) FROM doc_text_cache) - 5000)
+            )''')
+            while conn.execute('SELECT COALESCE(SUM(char_count), 0) FROM doc_text_cache').fetchone()[0] > DOC_CACHE_MAX_CHARS:
+                conn.execute('DELETE FROM doc_text_cache WHERE file_seq=(SELECT file_seq FROM doc_text_cache ORDER BY fetched_at ASC LIMIT 1)')
             conn.commit()
         finally:
             conn.close()
@@ -309,7 +331,7 @@ def _unquote_dotenv_value(value):
     return value.strip()
 
 
-def read_dotenv_values(path):
+def _read_dotenv_values_legacy(path):
     values = {}
     if not path or not os.path.exists(path):
         return values
@@ -327,6 +349,36 @@ def read_dotenv_values(path):
     except OSError:
         pass
     return values
+
+
+def read_dotenv_values(path):
+    """UTF-8 우선, 한국어 Windows의 CP949 .env도 안전하게 읽는다."""
+    if not path or not os.path.exists(path):
+        return {}
+    try:
+        with open(path, 'rb') as f:
+            raw = f.read()
+    except OSError:
+        return {}
+
+    last_decode_error = None
+    for encoding in ('utf-8-sig', 'cp949'):
+        try:
+            text = raw.decode(encoding)
+        except UnicodeDecodeError as exc:
+            last_decode_error = exc
+            continue
+        values = {}
+        for line in text.splitlines():
+            match = re.match(r'\s*([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*)\s*$', line)
+            if not match:
+                continue
+            key, value = match.group(1), match.group(2)
+            if '#' in value and not value.lstrip().startswith(('"', "'")):
+                value = value.split('#', 1)[0]
+            values[key] = _unquote_dotenv_value(value)
+        return values
+    raise EiassError(f'.env 인코딩을 읽을 수 없습니다: {path} ({last_decode_error})')
 
 
 def get_vworld_api_key():
@@ -352,6 +404,31 @@ def get_vworld_domain():
 
 class EiassError(RuntimeError):
     pass
+
+
+class ScanCancelled(EiassError):
+    """백그라운드 작업이 안전한 중단 지점에서 취소됐음을 알린다."""
+    pass
+
+
+def _first_nonblank(*values):
+    """EIASS 표의 결측 표기('-', 빈 문자열, None)를 건너뛴 첫 값을 반환한다."""
+    for value in values:
+        if value is not None and str(value).strip() not in ('', '-'):
+            return value
+    return ''
+
+
+def _check_cancelled(should_cancel):
+    if should_cancel and should_cancel():
+        raise ScanCancelled('사용자 요청으로 스캔을 취소했습니다.')
+
+
+def _validate_paging(offset, max_candidates):
+    if not isinstance(offset, int) or offset < 0:
+        raise EiassError('offset은 0 이상의 정수여야 합니다.')
+    if not isinstance(max_candidates, int) or max_candidates <= 0:
+        raise EiassError('max_candidates는 1 이상의 정수여야 합니다.')
 
 
 def _session():
@@ -546,15 +623,19 @@ def _completion_date_or_dash(value):
     return date_value.strftime('%Y.%m.%d') if date_value else '-'
 
 
-def _passes_extra_filters(item, consult_date_from=None, consult_date_to=None, progress_status=None):
+def _passes_extra_filters(item, consult_date_from=None, consult_date_to=None, progress_status=None,
+                          date_filter_exclusions=None):
     """원본 _passes_extra_filters 이식. 서버측 년도 필터는 성기므로 클라이언트에서 정확히 재검증한다."""
     if progress_status and item.get('progress_status') != progress_status:
         return False
     start, end = consult_date_from, consult_date_to
     if start or end:
         if item.get('type') == '사후환경영향조사':
-            year_match = re.search(r'\d{4}', item.get('date', '') or item.get('comp_date', '') or '')
+            year_match = re.search(r'\d{4}', _first_nonblank(item.get('date'), item.get('comp_date')))
             if not year_match:
+                if date_filter_exclusions is not None:
+                    date_filter_exclusions.append({'name': item.get('name'), 'eia_cd': item.get('eia_cd'),
+                                                   'reason': '사후환경영향조사 연도를 확인할 수 없습니다.'})
                 return False
             survey_year = int(year_match.group(0))
             if start and survey_year < start.year:
@@ -564,7 +645,10 @@ def _passes_extra_filters(item, consult_date_from=None, consult_date_to=None, pr
             return True
         date_value = _date_from_text(item.get('comp_date', '')) or _date_from_text(item.get('date', ''))
         if not date_value:
-            return True
+            if date_filter_exclusions is not None:
+                date_filter_exclusions.append({'name': item.get('name'), 'eia_cd': item.get('eia_cd'),
+                                               'reason': '협의완료일을 확인할 수 없습니다.'})
+            return False
         if start and date_value < start:
             return False
         if end and date_value > end:
@@ -574,7 +658,7 @@ def _passes_extra_filters(item, consult_date_from=None, consult_date_to=None, pr
 
 def search_projects(keyword='', type_codes=None, agency_code='', max_pages=0, session=None,
                      consult_date_from=None, consult_date_to=None, progress_status='', climate_filter='',
-                     progress_stage_keys=None, biz_gubun=''):
+                     progress_stage_keys=None, biz_gubun='', date_filter_exclusions=None):
     """EIASS 사업 검색. 원본 앱(run_search)의 협의완료일 범위/진행상태/기후변화영향평가/
     진행구분/사업유형(biz_gubun) 필터를 그대로 지원한다.
 
@@ -602,6 +686,14 @@ def search_projects(keyword='', type_codes=None, agency_code='', max_pages=0, se
     biz_gubun = (biz_gubun or '').strip()
     consult_start = _parse_iso_date(consult_date_from)
     consult_end = _parse_iso_date(consult_date_to)
+    if consult_date_from and not consult_start:
+        raise EiassError('consult_date_from은 YYYY-MM-DD 형식이어야 합니다.')
+    if consult_date_to and not consult_end:
+        raise EiassError('consult_date_to는 YYYY-MM-DD 형식이어야 합니다.')
+    if consult_start and consult_end and consult_start > consult_end:
+        raise EiassError('consult_date_from은 consult_date_to보다 늦을 수 없습니다.')
+    if not isinstance(max_pages, int) or max_pages < 0:
+        raise EiassError('max_pages는 0 이상의 정수여야 합니다.')
     has_consult_date_filter = bool(consult_start or consult_end)
     if (not keyword and not agency_code and not has_consult_date_filter
             and not progress_status and not climate_filter and not biz_gubun):
@@ -689,6 +781,7 @@ def search_projects(keyword='', type_codes=None, agency_code='', max_pages=0, se
         payload['urlString'] = '&' + urllib.parse.urlencode(url_dict)
 
         page_no = 0
+        seen_page_signatures = set()
         while True:
             page_no += 1
             if max_pages and max_pages > 0 and page_no > max_pages:
@@ -702,6 +795,22 @@ def search_projects(keyword='', type_codes=None, agency_code='', max_pages=0, se
             if not rows:
                 break
 
+            page_keys = []
+            for tr in rows:
+                title_td = tr.find('td', class_='title')
+                link = title_td.find('a') if title_td else None
+                if not link:
+                    continue
+                match = re.search(r"view\('([^']+)',\s*'([^']+)',\s*'([^']+)'", link.get('href', ''))
+                if match:
+                    page_keys.append((match.group(1), match.group(2), match.group(3), t))
+            page_signature = tuple(page_keys)
+            if len(rows) >= 100 and (not page_signature or page_signature in seen_page_signatures):
+                raise EiassError(
+                    f'EIASS 검색 페이지가 반복되어 진행할 수 없습니다 (평가종류={t}, 페이지={page_no}).')
+            seen_page_signatures.add(page_signature)
+            new_on_page = 0
+
             for tr in rows:
                 title_td = tr.find('td', class_='title')
                 if not title_td or not title_td.find('a'):
@@ -714,6 +823,7 @@ def search_projects(keyword='', type_codes=None, agency_code='', max_pages=0, se
                 if result_key in seen_keys:
                     continue
                 seen_keys.add(result_key)
+                new_on_page += 1
 
                 progress_td = tr.find('td', class_='td_prog') or _find_result_cell(tr, '진행현황')
                 _parsed_agency, _progress_value, progress_status_val = _parse_result_progress_cell(progress_td)
@@ -746,9 +856,13 @@ def search_projects(keyword='', type_codes=None, agency_code='', max_pages=0, se
                     'eia_cd': m.group(2),
                     'revirpt_seq': m.group(3),
                 }
-                if not _passes_extra_filters(item_data, consult_start, consult_end, progress_status):
+                if not _passes_extra_filters(item_data, consult_start, consult_end, progress_status,
+                                             date_filter_exclusions):
                     continue
                 results.append(item_data)
+            if len(rows) >= 100 and new_on_page == 0:
+                raise EiassError(
+                    f'EIASS 검색 페이지에서 새 후보가 없어 진행을 중단했습니다 (평가종류={t}, 페이지={page_no}).')
             if len(rows) < 100:
                 break
     return results
@@ -1272,22 +1386,31 @@ def _get_full_document_text(file_seq, session=None):
                 timeout=(8, 60), verify=False)
     if res.status_code != 200 or not res.content:
         raise EiassError(f'문서 다운로드 실패: HTTP {res.status_code}')
-    doc = fitz.open(stream=res.content, filetype='pdf')
+    if len(res.content) > PDF_MAX_BYTES:
+        raise EiassError(f'문서 크기가 제한({PDF_MAX_BYTES // (1024 * 1024)}MB)을 초과했습니다.')
+    # PyMuPDF는 손상 PDF에서 장시간 멈출 수 있어 별도 프로세스에서 제한 시간 안에 추출한다.
+    ctx = multiprocessing.get_context('spawn')
+    result_queue = ctx.Queue(maxsize=1)
+    process = ctx.Process(target=worker_entry, args=(res.content, PDF_MAX_PAGES, result_queue), daemon=True)
+    process.start()
+    process.join(PDF_EXTRACT_TIMEOUT_SECONDS)
+    if process.is_alive():
+        process.terminate()
+        process.join(5)
+        raise EiassError(f'PDF 텍스트 추출 시간이 제한({PDF_EXTRACT_TIMEOUT_SECONDS}초)을 초과했습니다.')
+    if result_queue.empty():
+        raise EiassError(f'PDF 텍스트 추출 프로세스가 결과 없이 종료했습니다 (exit={process.exitcode}).')
+    status, payload = result_queue.get()
+    if status != 'ok':
+        raise EiassError(f'PDF 텍스트 추출 실패: {payload}')
+    full_text = payload['text']
+    page_offsets = payload['page_offsets']
+    pages = payload['pages']
     try:
-        parts = [page.get_text() for page in doc]
-    finally:
-        doc.close()
-    full_text = '\n'.join(parts)
-    page_offsets = []
-    cursor = 0
-    for part in parts:
-        cursor += len(part) + 1
-        page_offsets.append(cursor)
-    try:
-        _cache_put(file_seq, full_text, page_offsets, len(parts))
+        _cache_put(file_seq, full_text, page_offsets, pages)
     except Exception:
         pass  # 캐시 저장 실패는 무시(검색 자체는 계속 진행)
-    return {'text': full_text, 'page_offsets': page_offsets, 'pages': len(parts), 'from_cache': False}
+    return {'text': full_text, 'page_offsets': page_offsets, 'pages': pages, 'from_cache': False}
 
 
 def _filter_files_by_title(files, title_terms):
@@ -1517,6 +1640,8 @@ def search_projects_by_document_keyword(
     snippet_chars=250,
     audit_sample_size=0,
     record_pattern=True,
+    candidates=None,
+    should_cancel=None,
 ):
     """검색 필터(협의완료일 범위/진행상태/진행구분 등)로 후보 사업을 뽑은 뒤, 지정한 단계(기본값
     '초안,본안,보완,협의의견' — 협의의견만 우선 확인하면 놓치는 경우가 있어 여러 단계를
@@ -1580,14 +1705,18 @@ def search_projects_by_document_keyword(
         raise EiassError('text_queries에 검색어를 하나 이상 지정해야 합니다.')
     if match_mode not in ('any', 'all'):
         raise EiassError("match_mode는 'any' 또는 'all'이어야 합니다.")
+    _validate_paging(offset, max_candidates)
     doc_title_contains = [t for t in (doc_title_contains or []) if t]
 
     session = session or _session()
-    candidates = search_projects(
-        keyword, type_codes=type_codes, agency_code=agency_code, max_pages=max_pages, session=session,
-        consult_date_from=consult_date_from, consult_date_to=consult_date_to, progress_status=progress_status,
-        biz_gubun=biz_gubun, progress_stage_keys=progress_stage_keys,
-    )
+    if candidates is None:
+        candidates = search_projects(
+            keyword, type_codes=type_codes, agency_code=agency_code, max_pages=max_pages, session=session,
+            consult_date_from=consult_date_from, consult_date_to=consult_date_to, progress_status=progress_status,
+            biz_gubun=biz_gubun, progress_stage_keys=progress_stage_keys,
+        )
+    else:
+        candidates = list(candidates)
     total = len(candidates)
     batch = candidates[offset:offset + max_candidates]
 
@@ -1599,6 +1728,7 @@ def search_projects_by_document_keyword(
     reference_like_snippets = 0
 
     for item in batch:
+        _check_cancelled(should_cancel)
         try:
             detail = get_project_detail(item['view_type'], item['eia_cd'], item['revirpt_seq'],
                                          session=session, use_cache=True)
@@ -1611,7 +1741,9 @@ def search_projects_by_document_keyword(
         any_stage_has_filtered_files = False
         matched_snippets = []
         matched_keywords = set()
+        document_errors = []
         for stage in stages:
+            _check_cancelled(should_cancel)
             raw_files = [f for cat_files in (stage_docs.get(stage) or {}).values()
                          for f in cat_files if f.get('is_pdf')]
             if not raw_files:
@@ -1624,11 +1756,11 @@ def search_projects_by_document_keyword(
             stage_stats[stage]['checked'] += 1
             stage_had_match = False
             for f in files:
+                _check_cancelled(should_cancel)
                 try:
                     doc = _get_full_document_text(f['seq'], session=session)
                 except Exception as exc:
-                    skipped.append({'name': item['name'], 'eia_cd': item['eia_cd'],
-                                     'reason': f"{f['name']} 다운로드/추출 실패: {exc}"})
+                    document_errors.append(f"{f['name']} 다운로드/추출 실패: {exc}")
                     continue
                 text = doc['text']
                 for q in text_queries:
@@ -1667,11 +1799,16 @@ def search_projects_by_document_keyword(
             matches.append({
                 **item, 'fields': detail['fields'],
                 'matched_keywords': sorted(matched_keywords), 'matched_snippets': matched_snippets,
+                'document_errors': document_errors,
             })
         else:
-            # 문서를 실제로 열어봤지만 키워드가 없었던 사업 — CSV/보고 시 "스캔한 전체 리스트"에
-            # 이 사업들도 빠짐없이 포함해야 하므로(매칭된 것만 담지 않도록) 별도로 남겨둔다.
-            checked_no_match.append({'name': item['name'], 'eia_cd': item['eia_cd']})
+            # 후보 하나는 matches/checked_no_match/skipped 중 정확히 한 곳에만 넣는다.
+            # 부분 문서 실패를 skipped와 no_match 양쪽에 중복 기록하지 않는다.
+            if document_errors:
+                skipped.append({'name': item['name'], 'eia_cd': item['eia_cd'],
+                                'reason': '; '.join(document_errors)})
+            else:
+                checked_no_match.append({'name': item['name'], 'eia_cd': item['eia_cd']})
 
     checked = len(batch)
     next_offset = offset + checked if (offset + checked) < total else None
@@ -2100,18 +2237,49 @@ def _point_to_ring_min_distance_m(lon, lat, ring):
     return best if best is not None else float('inf')
 
 
+def _point_in_ring(lon, lat, ring):
+    """경계 포함 ray-casting 판정. KDPA GeoJSON의 lon/lat 링을 직접 처리한다."""
+    if not ring or len(ring) < 3:
+        return False
+    if _point_to_ring_min_distance_m(lon, lat, ring) <= 0.01:
+        return True
+    inside = False
+    j = len(ring) - 1
+    for i, point in enumerate(ring):
+        xi, yi = point[0], point[1]
+        xj, yj = ring[j][0], ring[j][1]
+        intersects = ((yi > lat) != (yj > lat)) and (
+            lon < (xj - xi) * (lat - yi) / ((yj - yi) or 1e-300) + xi)
+        if intersects:
+            inside = not inside
+        j = i
+    return inside
+
+
+def _polygon_min_distance_m(lon, lat, rings):
+    if not rings:
+        return None
+    outer, holes = rings[0], rings[1:]
+    if _point_in_ring(lon, lat, outer) and not any(_point_in_ring(lon, lat, hole) for hole in holes):
+        return 0.0
+    distances = [_point_to_ring_min_distance_m(lon, lat, ring) for ring in rings if ring]
+    return min(distances) if distances else None
+
+
 def _feature_min_distance_m(lon, lat, geometry):
     geom_type = geometry.get('type')
     coords = geometry.get('coordinates')
     if geom_type == 'Polygon':
-        rings = coords
+        polygons = [coords]
     elif geom_type == 'MultiPolygon':
-        rings = [ring for poly in coords for ring in poly]
+        polygons = coords
     else:
         return None
     best = None
-    for ring in rings:
-        d = _point_to_ring_min_distance_m(lon, lat, ring)
+    for polygon in polygons:
+        d = _polygon_min_distance_m(lon, lat, polygon)
+        if d == 0:
+            return 0.0
         if best is None or d < best:
             best = d
     return best
@@ -2125,27 +2293,46 @@ def _kdpa_headers(json_request=False):
 
 
 _KDPA_VERSION_CACHE = {'version': None, 'fetched_at': 0.0}
+_KDPA_VERSION_LOCK = threading.Lock()
 _KDPA_VERSION_TTL_SECONDS = 300  # 사업지 여러 건을 연달아 조회할 때 매번 /getNewVer를 부르지 않도록 짧게 캐시
 
 
-def _kdpa_latest_version(session):
+def _kdpa_latest_version(session, return_diagnostics=False):
     now = time.time()
-    if _KDPA_VERSION_CACHE['version'] and (now - _KDPA_VERSION_CACHE['fetched_at']) < _KDPA_VERSION_TTL_SECONDS:
-        return _KDPA_VERSION_CACHE['version']
-    res = session.post(
-        KDPA_BASE_URL + '/getNewVer',
-        data=json.dumps({'version_nm': ''}, ensure_ascii=False).encode('utf-8'),
-        headers=_kdpa_headers(json_request=True), timeout=15,
-    )
-    version = KDPA_DEFAULT_VERSION
-    if res.status_code == 200:
-        version = str(res.json().get('body') or KDPA_DEFAULT_VERSION)
-    _KDPA_VERSION_CACHE['version'] = version
-    _KDPA_VERSION_CACHE['fetched_at'] = now
-    return version
+    with _KDPA_VERSION_LOCK:
+        cached = _KDPA_VERSION_CACHE['version']
+        cached_at = _KDPA_VERSION_CACHE['fetched_at']
+    if cached and (now - cached_at) < _KDPA_VERSION_TTL_SECONDS:
+        result = (cached, {'source': 'cache', 'errors': []})
+        return result if return_diagnostics else result[0]
+
+    errors = []
+    try:
+        res = session.post(
+            KDPA_BASE_URL + '/getNewVer',
+            data=json.dumps({'version_nm': ''}, ensure_ascii=False).encode('utf-8'),
+            headers=_kdpa_headers(json_request=True), timeout=15,
+        )
+        if res.status_code != 200:
+            raise EiassError(f'KDPA 버전 조회 HTTP {res.status_code}')
+        version = str((res.json() or {}).get('body') or '').strip()
+        if not version:
+            raise EiassError('KDPA 버전 응답에 body가 없습니다.')
+        with _KDPA_VERSION_LOCK:
+            _KDPA_VERSION_CACHE['version'] = version
+            _KDPA_VERSION_CACHE['fetched_at'] = now
+        result = (version, {'source': 'live', 'errors': []})
+        return result if return_diagnostics else result[0]
+    except Exception as exc:
+        errors.append(f'KDPA 버전 조회 실패: {exc}')
+        version = cached or KDPA_DEFAULT_VERSION
+        source = 'stale_cache' if cached else 'default'
+        result = (version, {'source': source, 'errors': errors})
+        return result if return_diagnostics else result[0]
 
 
-def find_nearby_protected_areas(lon, lat, radius_m=1000, session=None, version=None, designations=None):
+def find_nearby_protected_areas(lon, lat, radius_m=1000, session=None, version=None, designations=None,
+                                return_diagnostics=False, should_cancel=None):
     """지점 기준 radius_m(미터) 이내 KDPA 보호지역을 조회한다.
 
     KDPA GeoServer는 WFS 1.1.0 + EPSG:4326에서 위경도 축순서(lat,lon)를 강제하므로,
@@ -2172,14 +2359,23 @@ def find_nearby_protected_areas(lon, lat, radius_m=1000, session=None, version=N
             )
         layers = [layer for layer in KDPA_DEFAULT_LAYER_DEFS if layer['name'] in designations]
     else:
-        layers = KDPA_DEFAULT_LAYER_DEFS
+        # 전체 레이어는 최신 보호지역 전체 + OECM이면 충분하다. 같은 버전 레이어를
+        # "전체 + 지정종"으로 여러 번 조회하던 중복 왕복을 피한다.
+        layers = [KDPA_DEFAULT_LAYER_DEFS[0], KDPA_DEFAULT_LAYER_DEFS[-1]]
 
     s = session or _session()
-    version = version or _kdpa_latest_version(s)
+    if version:
+        version_info = {'source': 'caller', 'errors': []}
+    else:
+        version, version_info = _kdpa_latest_version(s, return_diagnostics=True)
 
     results = []
     seen = set()
+    errors = list(version_info['errors'])
+    queried_layers = []
+    truncated_layers = []
     for layer in layers:
+        _check_cancelled(should_cancel)
         layer_url = (layer.get('layer_url') or '').strip().lower()
         type_name = f'oecm_{version}' if layer_url == 'oecm' else version
         desig = (layer.get('desig') or '').strip()
@@ -2191,17 +2387,24 @@ def find_nearby_protected_areas(lon, lat, radius_m=1000, session=None, version=N
             'typeName': 'korea:' + type_name, 'outputFormat': 'application/json',
             'CQL_FILTER': cql, 'maxFeatures': '200',
         }
+        queried_layers.append(layer['name'])
         try:
             res = s.get(KDPA_WFS_URL, params=params, headers=_kdpa_headers(), timeout=20, verify=True)
-        except Exception:
+        except Exception as exc:
+            errors.append(f"{layer['name']} 조회 실패: {exc}")
             continue
         if res.status_code != 200:
+            errors.append(f"{layer['name']} 조회 HTTP {res.status_code}")
             continue
         try:
             data = res.json()
-        except ValueError:
+        except ValueError as exc:
+            errors.append(f"{layer['name']} 응답 JSON 파싱 실패: {exc}")
             continue
-        for feature in data.get('features') or []:
+        features = data.get('features') or []
+        if len(features) >= 200:
+            truncated_layers.append(layer['name'])
+        for feature in features:
             props = feature.get('properties') or {}
             wdpaid = props.get('WDPAID')
             key = (type_name, wdpaid, props.get('ORIG_NAME') or props.get('NAME'))
@@ -2220,7 +2423,16 @@ def find_nearby_protected_areas(lon, lat, radius_m=1000, session=None, version=N
                 'distance_m': round(distance_m, 1) if distance_m is not None else None,
             })
     results.sort(key=lambda r: (r['distance_m'] is None, r['distance_m'] if r['distance_m'] is not None else 0))
-    return results
+    diagnostic = {
+        'areas': results,
+        'complete': not errors and not truncated_layers,
+        'errors': errors,
+        'version': version,
+        'version_source': version_info['source'],
+        'queried_layers': queried_layers,
+        'truncated_layers': truncated_layers,
+    }
+    return diagnostic if return_diagnostics else results
 
 
 # ── 검색 필터 + 공간조회(보호구역 인접) 결합 ──
@@ -2318,6 +2530,7 @@ def scan_projects_protected_area_adjacency(
     progress_status='완료', biz_gubun='', progress_stage_keys=None, max_pages=0,
     radius_m=1000, designations=None, allow_admin_fallback=True,
     offset=0, max_candidates=15, session=None,
+    candidates=None, should_cancel=None,
 ):
     """검색 필터로 후보를 뽑은 뒤, offset부터 max_candidates개를 순서대로 지오코딩+공간조회한다.
 
@@ -2331,19 +2544,25 @@ def scan_projects_protected_area_adjacency(
         'match_count', 'matches': [scanned 중 nearby_protected_areas가 1개 이상인 것],
         'geocode_failures': [{'name','eia_cd','reason'}, ...]}
     """
+    _validate_paging(offset, max_candidates)
     session = session or _session()
-    candidates = search_projects(
-        keyword, type_codes=type_codes, agency_code=agency_code, max_pages=max_pages, session=session,
-        consult_date_from=consult_date_from, consult_date_to=consult_date_to, progress_status=progress_status,
-        biz_gubun=biz_gubun, progress_stage_keys=progress_stage_keys,
-    )
+    if candidates is None:
+        candidates = search_projects(
+            keyword, type_codes=type_codes, agency_code=agency_code, max_pages=max_pages, session=session,
+            consult_date_from=consult_date_from, consult_date_to=consult_date_to, progress_status=progress_status,
+            biz_gubun=biz_gubun, progress_stage_keys=progress_stage_keys,
+        )
+    else:
+        candidates = list(candidates)
     total = len(candidates)
     batch = candidates[offset:offset + max_candidates]
 
     scanned = []
     matches = []
     geocode_failures = []
+    spatial_failures = []
     for item in batch:
+        _check_cancelled(should_cancel)
         try:
             detail = get_project_detail(item['view_type'], item['eia_cd'], item['revirpt_seq'],
                                          session=session, use_cache=True)
@@ -2368,8 +2587,10 @@ def scan_projects_protected_area_adjacency(
             })
             continue
 
-        areas = find_nearby_protected_areas(
-            geocoded['lon'], geocoded['lat'], radius_m=radius_m, designations=designations, session=session)
+        spatial = find_nearby_protected_areas(
+            geocoded['lon'], geocoded['lat'], radius_m=radius_m, designations=designations,
+            session=session, return_diagnostics=True, should_cancel=should_cancel)
+        areas = spatial['areas']
         row = {
             **item,
             'location': location,
@@ -2378,8 +2599,13 @@ def scan_projects_protected_area_adjacency(
             'location_precision': geocoded['location_precision'],
             'fallback_used': geocoded['fallback_used'],
             'nearby_protected_areas': areas,
+            'spatial_complete': spatial['complete'],
+            'spatial_errors': spatial['errors'],
         }
         scanned.append(row)
+        if not spatial['complete']:
+            spatial_failures.append({'name': item['name'], 'eia_cd': item['eia_cd'],
+                                     'errors': spatial['errors']})
         if areas:
             matches.append(row)
 
@@ -2390,7 +2616,7 @@ def scan_projects_protected_area_adjacency(
         'next_offset': next_offset, 'has_more': next_offset is not None,
         'radius_m': radius_m, 'designations': list(designations) if designations else 'ALL',
         'scanned': scanned, 'match_count': len(matches), 'matches': matches,
-        'geocode_failures': geocode_failures,
+        'geocode_failures': geocode_failures, 'spatial_failures': spatial_failures,
     }
 
 

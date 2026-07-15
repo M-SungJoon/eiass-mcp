@@ -6,3 +6,5 @@ dist/
 .env
 .venv/
 venv/
+# AI 작업용 빌드 가상환경·렌더링·검증 산출물
+\#AI working/

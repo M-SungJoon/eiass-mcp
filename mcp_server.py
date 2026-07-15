@@ -15,13 +15,22 @@ Claude Code에 연결하려면 프로젝트 `.mcp.json`에 다음과 같이 등�
     }
 """
 import threading
+import time
 import uuid
+import multiprocessing
 
 from mcp.server.fastmcp import FastMCP
 
 import eiass_core as core
+from job_store import JobStore
+from scan_engine import ScanRunner, document_status, spatial_status
 
 mcp = FastMCP('eiass')
+
+# 작업 상태·후보·결과는 SQLite에 저장한다. 이전 프로세스가 남긴 running 작업은 ScanRunner가
+# queued로 복구해 같은 후보 스냅샷의 미처리분만 다시 실행한다.
+_job_store = JobStore()
+_job_runner = ScanRunner(_job_store)
 
 # ── 백그라운드 스캔 job 레지스트리 ──
 # 대량 후보(수백 건)를 협의의견/본안 등에서 키워드로 훑을 때, 한 번의 MCP tool 호출 안에서
@@ -29,6 +38,33 @@ mcp = FastMCP('eiass')
 # 실제 스캔은 백그라운드 스레드가 offset을 이어가며 계속 진행한다.
 _jobs_lock = threading.Lock()
 _jobs = {}
+_JOB_RETENTION_SECONDS = 24 * 60 * 60
+_MAX_RETAINED_JOBS = 100
+
+
+def _cleanup_jobs_locked(jobs):
+    """완료 job 결과가 서버 수명 내내 메모리에 누적되지 않게 제한한다."""
+    now = time.time()
+    terminal = {'done', 'cancelled', 'error'}
+    expired = [job_id for job_id, job in jobs.items()
+               if job.get('status') in terminal and now - job.get('updated_at', now) > _JOB_RETENTION_SECONDS]
+    for job_id in expired:
+        jobs.pop(job_id, None)
+    retained = [(job.get('updated_at', 0), job_id) for job_id, job in jobs.items()
+                if job.get('status') in terminal]
+    retained.sort()
+    for _, job_id in retained[:-_MAX_RETAINED_JOBS]:
+        jobs.pop(job_id, None)
+
+
+def _snapshot_candidates(kwargs, session):
+    return core.search_projects(
+        kwargs.get('keyword', ''), type_codes=kwargs.get('type_codes'), agency_code=kwargs.get('agency_code', ''),
+        max_pages=kwargs.get('max_pages', 0), session=session,
+        consult_date_from=kwargs.get('consult_date_from'), consult_date_to=kwargs.get('consult_date_to'),
+        progress_status=kwargs.get('progress_status', ''), biz_gubun=kwargs.get('biz_gubun', ''),
+        progress_stage_keys=kwargs.get('progress_stage_keys'),
+    )
 
 
 def _run_scan_job(job_id, kwargs):
@@ -36,12 +72,25 @@ def _run_scan_job(job_id, kwargs):
     session = core._session()
     offset = 0
     try:
+        with _jobs_lock:
+            job['status'] = 'discovering'
+            job['current_phase'] = 'candidate_snapshot'
+            job['updated_at'] = time.time()
+        candidates = _snapshot_candidates(kwargs, session)
+        with _jobs_lock:
+            job['candidates_total'] = len(candidates)
+            job['status'] = 'running'
+            job['current_phase'] = 'document_scan'
+            job['updated_at'] = time.time()
         while True:
             with _jobs_lock:
                 if job['cancel']:
                     job['status'] = 'cancelled'
+                    job['updated_at'] = time.time()
                     return
-            result = core.search_projects_by_document_keyword(session=session, offset=offset, **kwargs)
+            result = core.search_projects_by_document_keyword(
+                session=session, offset=offset, candidates=candidates,
+                should_cancel=lambda: job['cancel'], **kwargs)
             with _jobs_lock:
                 job['checked'] += result['checked']
                 job['candidates_total'] = result['candidates_total']
@@ -56,15 +105,25 @@ def _run_scan_job(job_id, kwargs):
                     acc = job['stage_stats'].setdefault(stage, {'checked': 0, 'matched': 0})
                     acc['checked'] += stats['checked']
                     acc['matched'] += stats['matched']
+                job['updated_at'] = time.time()
             if not result['has_more']:
                 break
             offset = result['next_offset']
         with _jobs_lock:
             job['status'] = 'done'
+            job['current_phase'] = 'completed'
+            job['updated_at'] = time.time()
+    except core.ScanCancelled:
+        with _jobs_lock:
+            job['status'] = 'cancelled'
+            job['updated_at'] = time.time()
     except Exception as exc:
         with _jobs_lock:
             job['status'] = 'error'
             job['error'] = str(exc)
+            job['updated_at'] = time.time()
+    finally:
+        session.close()
 
 
 # ── 백그라운드 공간조회(검색+보호구역 인접) job 레지스트리 ──
@@ -79,27 +138,51 @@ def _run_spatial_scan_job(job_id, kwargs):
     session = core._session()
     offset = 0
     try:
+        with _spatial_jobs_lock:
+            job['status'] = 'discovering'
+            job['current_phase'] = 'candidate_snapshot'
+            job['updated_at'] = time.time()
+        candidates = _snapshot_candidates(kwargs, session)
+        with _spatial_jobs_lock:
+            job['candidates_total'] = len(candidates)
+            job['status'] = 'running'
+            job['current_phase'] = 'spatial_scan'
+            job['updated_at'] = time.time()
         while True:
             with _spatial_jobs_lock:
                 if job['cancel']:
                     job['status'] = 'cancelled'
+                    job['updated_at'] = time.time()
                     return
-            result = core.scan_projects_protected_area_adjacency(session=session, offset=offset, **kwargs)
+            result = core.scan_projects_protected_area_adjacency(
+                session=session, offset=offset, candidates=candidates,
+                should_cancel=lambda: job['cancel'], **kwargs)
             with _spatial_jobs_lock:
                 job['checked'] += result['checked']
                 job['candidates_total'] = result['candidates_total']
                 job['scanned'].extend(result['scanned'])
                 job['matches'].extend(result['matches'])
                 job['geocode_failures'].extend(result['geocode_failures'])
+                job['spatial_failures'].extend(result['spatial_failures'])
+                job['updated_at'] = time.time()
             if not result['has_more']:
                 break
             offset = result['next_offset']
         with _spatial_jobs_lock:
             job['status'] = 'done'
+            job['current_phase'] = 'completed'
+            job['updated_at'] = time.time()
+    except core.ScanCancelled:
+        with _spatial_jobs_lock:
+            job['status'] = 'cancelled'
+            job['updated_at'] = time.time()
     except Exception as exc:
         with _spatial_jobs_lock:
             job['status'] = 'error'
             job['error'] = str(exc)
+            job['updated_at'] = time.time()
+    finally:
+        session.close()
 
 
 @mcp.tool()
@@ -139,18 +222,19 @@ def eiass_search_projects(keyword: str = '', types: str = '', agency_code: str =
     """
     type_codes = [c.strip().upper() for c in types.split(',') if c.strip()] or None
     stage_labels = [s.strip() for s in progress_stage.split(',') if s.strip()]
+    date_filter_exclusions = []
     try:
         stage_keys = core.progress_stage_keys_from_labels(stage_labels)
         results = core.search_projects(
             keyword, type_codes=type_codes, agency_code=agency_code,
-            max_pages=max(0, max_pages),
+            max_pages=max_pages,
             consult_date_from=consult_date_from or None, consult_date_to=consult_date_to or None,
             progress_status=progress_status, climate_filter=climate_filter, biz_gubun=biz_gubun,
-            progress_stage_keys=stage_keys,
+            progress_stage_keys=stage_keys, date_filter_exclusions=date_filter_exclusions,
         )
     except core.EiassError as exc:
         return {'error': str(exc)}
-    return {'count': len(results), 'projects': results}
+    return {'count': len(results), 'projects': results, 'date_filter_exclusions': date_filter_exclusions}
 
 
 @mcp.tool()
@@ -201,7 +285,7 @@ def eiass_preview_search(
             consult_date_from=consult_date_from or None, consult_date_to=consult_date_to or None,
             progress_status=progress_status, biz_gubun=biz_gubun, progress_stage_keys=stage_keys,
             stages=stage_list, doc_title_contains=title_terms,
-            max_pages=max(0, max_pages), inference_notes=inference_notes,
+            max_pages=max_pages, inference_notes=inference_notes,
         )
     except core.EiassError as exc:
         return {'error': str(exc)}
@@ -299,7 +383,7 @@ def eiass_find_projects_by_document_keyword(
             consult_date_from=consult_date_from or None, consult_date_to=consult_date_to or None,
             progress_status=progress_status, biz_gubun=biz_gubun, progress_stage_keys=stage_keys,
             stages=stage_list, doc_title_contains=title_terms,
-            max_pages=max(0, max_pages),
+            max_pages=max_pages,
         )
         if not confirmed:
             return core.preview_document_keyword_search(
@@ -358,7 +442,7 @@ def eiass_start_document_keyword_scan(
         consult_date_from=consult_date_from or None, consult_date_to=consult_date_to or None,
         progress_status=progress_status, biz_gubun=biz_gubun, progress_stage_keys=stage_keys,
         stages=stage_list, doc_title_contains=title_terms,
-        max_pages=max(0, max_pages),
+        max_pages=max_pages,
     )
     if not confirmed:
         try:
@@ -366,23 +450,22 @@ def eiass_start_document_keyword_scan(
         except core.EiassError as exc:
             return {'error': str(exc)}
 
+    if batch_size <= 0:
+        return {'error': 'batch_size는 1 이상의 정수여야 합니다.'}
     job_id = uuid.uuid4().hex[:12]
-    job = {
-        'status': 'running', 'checked': 0, 'candidates_total': None,
-        'matches': [], 'skipped': [], 'checked_no_match': [], 'error': None, 'cancel': False,
-        'stage_stats': {}, 'needs_refinement': False, 'refinement_hints': [], 'audit_samples': [],
-    }
-    with _jobs_lock:
-        _jobs[job_id] = job
-
-    kwargs = dict(text_queries=query_list, max_candidates=max(1, batch_size),
-                   audit_sample_size=audit_sample_size, **common_kwargs)
-    threading.Thread(target=_run_scan_job, args=(job_id, kwargs), daemon=True).start()
-    return {'job_id': job_id, 'status': 'running'}
+    kwargs = dict(text_queries=query_list, batch_size=batch_size,
+                  audit_sample_size=audit_sample_size, **common_kwargs)
+    _job_store.cleanup()
+    _job_store.create(job_id, 'document', kwargs)
+    if not _job_runner.submit(job_id):
+        _job_store.update(job_id, status='error', phase='queue_full', error='스캔 대기열이 가득 찼습니다. 잠시 후 다시 시도하세요.')
+        return {'error': '스캔 대기열이 가득 찼습니다. 잠시 후 다시 시도하세요.'}
+    return {'job_id': job_id, 'status': 'queued'}
 
 
 @mcp.tool()
-def eiass_get_scan_status(job_id: str, include_matches: bool = True) -> dict:
+def eiass_get_scan_status(job_id: str, include_matches: bool = False,
+                          result_offset: int = 0, result_limit: int = 100) -> dict:
     """eiass_start_document_keyword_scan이 반환한 job_id로 진행 상황과 지금까지의 매칭
     결과를 조회한다(스캔이 running이어도 즉시 응답한다). status는
     'running' | 'done' | 'cancelled' | 'error'.
@@ -395,38 +478,15 @@ def eiass_get_scan_status(job_id: str, include_matches: bool = True) -> dict:
     "스캔한 전체"(matches + checked_no_match + skipped)를 대상으로 한다. 매칭 없는 사업은
     `원문 파일명`/`유사내용 페이지번호`/`변경 내용 요약`을 `매칭 없음`으로 채운다.
     """
-    with _jobs_lock:
-        job = _jobs.get(job_id)
-        if not job:
-            return {'error': f'알 수 없는 job_id: {job_id}'}
-        result = {
-            'status': job['status'],
-            'checked': job['checked'],
-            'candidates_total': job['candidates_total'],
-            'match_count': len(job['matches']),
-            'checked_no_match_count': len(job['checked_no_match']),
-            'skipped_count': len(job['skipped']),
-            'stage_stats': dict(job['stage_stats']),
-            'needs_refinement': job['needs_refinement'],
-            'refinement_hints': list(dict.fromkeys(job['refinement_hints'])),
-            'audit_samples': list(job['audit_samples']),
-            'error': job['error'],
-        }
-        if include_matches:
-            result['matches'] = list(job['matches'])
-            result['skipped'] = list(job['skipped'])
-            result['checked_no_match'] = list(job['checked_no_match'])
-    return result
+    return document_status(_job_store, job_id, include_matches, result_offset, min(result_limit, 500))
 
 
 @mcp.tool()
 def eiass_cancel_scan(job_id: str) -> dict:
     """진행 중인 백그라운드 스캔(eiass_start_document_keyword_scan)을 취소한다."""
-    with _jobs_lock:
-        job = _jobs.get(job_id)
-        if not job:
-            return {'error': f'알 수 없는 job_id: {job_id}'}
-        job['cancel'] = True
+    if not _job_store.get(job_id) or _job_store.get(job_id)['kind'] != 'document':
+        return {'error': f'알 수 없는 job_id: {job_id}'}
+    _job_store.request_cancel(job_id)
     return {'job_id': job_id, 'status': 'cancelling'}
 
 
@@ -529,15 +589,18 @@ def eiass_check_protected_area_adjacency(address: str, radius_m: int = 1000, des
         return {'error': f'주소를 좌표로 변환하지 못했습니다: {address}'}
     lon, lat, source = coord
     try:
-        areas = core.find_nearby_protected_areas(lon, lat, radius_m=radius_m, designations=designations or None)
+        spatial = core.find_nearby_protected_areas(
+            lon, lat, radius_m=radius_m, designations=designations or None, return_diagnostics=True)
     except core.EiassError as exc:
         return {'error': str(exc)}
     return {
         'address': address,
         'lon': lon, 'lat': lat, 'geocode_source': source,
         'radius_m': radius_m,
-        'nearby_count': len(areas),
-        'nearby_protected_areas': areas,
+        'nearby_count': len(spatial['areas']),
+        'nearby_protected_areas': spatial['areas'],
+        'spatial_complete': spatial['complete'],
+        'spatial_errors': spatial['errors'],
     }
 
 
@@ -624,8 +687,9 @@ def eiass_check_project_protected_area_adjacency(
         }
 
     try:
-        areas = core.find_nearby_protected_areas(
-            geocoded['lon'], geocoded['lat'], radius_m=radius_m, designations=designations or None)
+        spatial = core.find_nearby_protected_areas(
+            geocoded['lon'], geocoded['lat'], radius_m=radius_m,
+            designations=designations or None, return_diagnostics=True)
     except core.EiassError as exc:
         return {'error': str(exc)}
 
@@ -637,8 +701,10 @@ def eiass_check_project_protected_area_adjacency(
         'location_precision': geocoded['location_precision'],
         'fallback_used': geocoded['fallback_used'],
         'radius_m': radius_m,
-        'nearby_count': len(areas),
-        'nearby_protected_areas': areas,
+        'nearby_count': len(spatial['areas']),
+        'nearby_protected_areas': spatial['areas'],
+        'spatial_complete': spatial['complete'],
+        'spatial_errors': spatial['errors'],
     }
 
 
@@ -695,7 +761,7 @@ def eiass_find_projects_protected_area_adjacency(
             keyword=keyword, type_codes=type_codes, agency_code=agency_code,
             consult_date_from=consult_date_from or None, consult_date_to=consult_date_to or None,
             progress_status=progress_status, biz_gubun=biz_gubun, progress_stage_keys=stage_keys,
-            max_pages=max(0, max_pages),
+            max_pages=max_pages,
         )
         if not confirmed:
             return core.preview_spatial_scan(
@@ -743,7 +809,7 @@ def eiass_start_spatial_scan(
         keyword=keyword, type_codes=type_codes, agency_code=agency_code,
         consult_date_from=consult_date_from or None, consult_date_to=consult_date_to or None,
         progress_status=progress_status, biz_gubun=biz_gubun, progress_stage_keys=stage_keys,
-        max_pages=max(0, max_pages),
+        max_pages=max_pages,
     )
     if not confirmed:
         try:
@@ -753,56 +819,37 @@ def eiass_start_spatial_scan(
         except core.EiassError as exc:
             return {'error': str(exc)}
 
+    if batch_size <= 0:
+        return {'error': 'batch_size는 1 이상의 정수여야 합니다.'}
     job_id = uuid.uuid4().hex[:12]
-    job = {
-        'status': 'running', 'checked': 0, 'candidates_total': None,
-        'scanned': [], 'matches': [], 'geocode_failures': [], 'error': None, 'cancel': False,
-    }
-    with _spatial_jobs_lock:
-        _spatial_jobs[job_id] = job
-
     kwargs = dict(radius_m=radius_m, designations=designation_list, allow_admin_fallback=allow_admin_fallback,
-                  max_candidates=max(1, batch_size), **common_kwargs)
-    threading.Thread(target=_run_spatial_scan_job, args=(job_id, kwargs), daemon=True).start()
-    return {'job_id': job_id, 'status': 'running'}
+                  batch_size=batch_size, **common_kwargs)
+    _job_store.cleanup()
+    _job_store.create(job_id, 'spatial', kwargs)
+    if not _job_runner.submit(job_id):
+        _job_store.update(job_id, status='error', phase='queue_full', error='스캔 대기열이 가득 찼습니다. 잠시 후 다시 시도하세요.')
+        return {'error': '스캔 대기열이 가득 찼습니다. 잠시 후 다시 시도하세요.'}
+    return {'job_id': job_id, 'status': 'queued'}
 
 
 @mcp.tool()
-def eiass_get_spatial_scan_status(job_id: str, include_results: bool = True) -> dict:
+def eiass_get_spatial_scan_status(job_id: str, include_results: bool = False,
+                                  result_offset: int = 0, result_limit: int = 100) -> dict:
     """eiass_start_spatial_scan이 반환한 job_id로 진행 상황과 지금까지의 결과를 조회한다
     (스캔이 running이어도 즉시 응답한다). status는 'running' | 'done' | 'cancelled' | 'error'.
 
     **최종 보고 형식(필수)**: done이 되면 scanned(스캔한 전체) 기준으로 보고하라 — matches만
     추리지 말 것. 자세한 지침은 eiass_start_spatial_scan 참고.
     """
-    with _spatial_jobs_lock:
-        job = _spatial_jobs.get(job_id)
-        if not job:
-            return {'error': f'알 수 없는 job_id: {job_id}'}
-        result = {
-            'status': job['status'],
-            'checked': job['checked'],
-            'candidates_total': job['candidates_total'],
-            'scanned_count': len(job['scanned']),
-            'match_count': len(job['matches']),
-            'geocode_failure_count': len(job['geocode_failures']),
-            'error': job['error'],
-        }
-        if include_results:
-            result['scanned'] = list(job['scanned'])
-            result['matches'] = list(job['matches'])
-            result['geocode_failures'] = list(job['geocode_failures'])
-    return result
+    return spatial_status(_job_store, job_id, include_results, result_offset, min(result_limit, 500))
 
 
 @mcp.tool()
 def eiass_cancel_spatial_scan(job_id: str) -> dict:
     """진행 중인 백그라운드 공간조회(eiass_start_spatial_scan)를 취소한다."""
-    with _spatial_jobs_lock:
-        job = _spatial_jobs.get(job_id)
-        if not job:
-            return {'error': f'알 수 없는 job_id: {job_id}'}
-        job['cancel'] = True
+    if not _job_store.get(job_id) or _job_store.get(job_id)['kind'] != 'spatial':
+        return {'error': f'알 수 없는 job_id: {job_id}'}
+    _job_store.request_cancel(job_id)
     return {'job_id': job_id, 'status': 'cancelling'}
 
 
@@ -879,4 +926,5 @@ def eiass_geocode(address: str) -> dict:
 
 
 if __name__ == '__main__':
+    multiprocessing.freeze_support()
     mcp.run(transport='stdio')
