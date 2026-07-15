@@ -23,7 +23,7 @@ import sys
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 SRC = os.path.join(BASE_DIR, 'mcp_server.py')
 DIST_DIR = BASE_DIR
-WORK_DIR = os.path.join(BASE_DIR, 'build', 'mcp_pyinstaller')
+WORK_DIR = os.path.join(BASE_DIR, '#AI working', 'mcp_pyinstaller')
 SPEC_DIR = WORK_DIR
 
 
