@@ -32,8 +32,11 @@ import multiprocessing
 import requests
 import urllib3
 from bs4 import BeautifulSoup
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 from config import (DETAIL_CACHE_MAX_ITEMS, DETAIL_CACHE_TTL_SECONDS, DOC_CACHE_MAX_CHARS,
-                    DOC_CACHE_TTL_SECONDS, PDF_EXTRACT_TIMEOUT_SECONDS, PDF_MAX_BYTES, PDF_MAX_PAGES)
+                    DOC_CACHE_TTL_SECONDS, HEALTH_CACHE_TTL_SECONDS, PDF_EXTRACT_TIMEOUT_SECONDS,
+                    PDF_MAX_BYTES, PDF_MAX_PAGES)
 from pdf_worker import worker_entry
 
 try:
@@ -45,7 +48,7 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 # 저장소 루트 VERSION 파일과 항상 같은 값으로 맞춰서 커밋할 것(버전 두 곳 중복 관리).
 # 어긋난 채로 커밋되지 않도록 build_mcp.py가 빌드 시작 전에 두 값을 대조한다.
-__version__ = '1.10.0'
+__version__ = '1.11.0'
 
 REQUEST_TIMEOUT = (8, 30)
 
@@ -414,6 +417,29 @@ class EiassError(RuntimeError):
     pass
 
 
+class EiassNetworkError(EiassError):
+    """외부 서비스가 접속되지 않거나 5xx를 돌려줘서 실패했음을 나타낸다.
+
+    입력값 오류(날짜 형식 등)와 구분하려고 따로 둔다. 입력 오류에까지 서버 상태를 찔러보면
+    사용자 오타 한 번에 헬스체크 4번이 날아가고, "서버는 정상입니다"라는 엉뚱한 꼬리말이 붙는다.
+    """
+
+
+def is_network_error(exc):
+    """이 예외가 외부 서비스 문제로 생긴 것인지 판별한다(원인 체인까지 따라간다).
+
+    requests 예외는 대부분 감싸지 않고 그대로 올라오므로 그것까지 같이 본다.
+    """
+    seen = set()
+    current = exc
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        if isinstance(current, (requests.exceptions.RequestException, EiassNetworkError)):
+            return True
+        current = current.__cause__ or current.__context__
+    return False
+
+
 class ScanCancelled(EiassError):
     """백그라운드 작업이 안전한 중단 지점에서 취소됐음을 알린다."""
     pass
@@ -439,8 +465,30 @@ def _validate_paging(offset, max_candidates):
         raise EiassError('max_candidates는 1 이상의 정수여야 합니다.')
 
 
-def _session():
+def _session(retry=True):
+    """조회용 세션. 기본적으로 일시적 실패를 재시도한다.
+
+    EIASS는 장애가 아니어도 느려질 때가 있는데, 재시도가 없으면 타임아웃 한 번에 그 항목이
+    곧바로 실패로 확정된다(스캔은 계속 돌지만 멀쩡히 될 일이 실패로 쌓인다). 여기서 다루는
+    요청은 전부 조회(읽기 전용)라 POST(검색 API)까지 재시도해도 부작용이 없다.
+
+    retry=False는 헬스체크 전용이다 — 진단은 "지금 이 순간" 상태를 재시도 없이 봐야 한다.
+    """
     s = requests.Session()
+    if retry:
+        retries = Retry(
+            total=3,
+            connect=3,
+            read=3,                       # 읽기 타임아웃(= 느린 응답)도 재시도 대상
+            status=3,
+            status_forcelist=(500, 502, 503, 504),
+            allowed_methods=frozenset(['GET', 'POST']),
+            backoff_factor=0.5,           # 0.5s → 1s → 2s
+            raise_on_status=False,
+        )
+        adapter = HTTPAdapter(max_retries=retries)
+        s.mount('https://', adapter)
+        s.mount('http://', adapter)
     return s
 
 
@@ -1417,7 +1465,7 @@ def _get_full_document_text(file_seq, session=None):
     res = s.get(url, headers={'User-Agent': 'Mozilla/5.0', 'Referer': EIASS_BASE + '/'},
                 timeout=(8, 60), verify=False)
     if res.status_code != 200 or not res.content:
-        raise EiassError(f'문서 다운로드 실패: HTTP {res.status_code}')
+        raise EiassNetworkError(f'문서 다운로드 실패: HTTP {res.status_code}')
     if len(res.content) > PDF_MAX_BYTES:
         raise EiassError(f'문서 크기가 제한({PDF_MAX_BYTES // (1024 * 1024)}MB)을 초과했습니다.')
     # PyMuPDF는 손상 PDF에서 장시간 멈출 수 있어 별도 프로세스에서 제한 시간 안에 추출한다.
@@ -2351,7 +2399,7 @@ def _kdpa_latest_version(session, return_diagnostics=False):
             headers=_kdpa_headers(json_request=True), timeout=15,
         )
         if res.status_code != 200:
-            raise EiassError(f'KDPA 버전 조회 HTTP {res.status_code}')
+            raise EiassNetworkError(f'KDPA 버전 조회 HTTP {res.status_code}')
         version = str((res.json() or {}).get('body') or '').strip()
         if not version:
             raise EiassError('KDPA 버전 응답에 body가 없습니다.')
@@ -2659,14 +2707,26 @@ def scan_projects_protected_area_adjacency(
 def _http_probe(method, url, session, **kwargs):
     """단순 HTTP 헬스체크 한 번을 수행해 상태코드/응답시간(ms)/에러를 기록한다.
     5xx나 예외는 실패로 보되, 4xx는 "서비스는 응답했다"는 의미로 성공 취급한다
-    (상태확인 목적상 인증/파라미터 문제까지 서버 장애로 오인하지 않기 위함)."""
+    (상태확인 목적상 인증/파라미터 문제까지 서버 장애로 오인하지 않기 위함).
+
+    kind로 실패의 성격을 구분한다. 이 구분이 중요한 이유는, 느릴 뿐 살아있는 서버를 죽었다고
+    오진하면 "조회할 수 없습니다"라고 잘못 안내하게 되기 때문이다:
+      'ok'   — 정상 응답(4xx 포함)
+      'slow' — 타임아웃. 서버가 살아있지만 느린 것일 수 있어 장애로 단정하지 않는다.
+      'down' — 5xx / 연결 거부 / DNS 실패 등 명백한 장애.
+    """
     started = time.monotonic()
     try:
         res = session.request(method, url, timeout=REQUEST_TIMEOUT, **kwargs)
+    except requests.exceptions.Timeout as exc:
+        return {'ok': False, 'kind': 'slow', 'status_code': None,
+                'latency_ms': round((time.monotonic() - started) * 1000), 'error': str(exc)}
     except Exception as exc:
-        return {'ok': False, 'status_code': None, 'latency_ms': None, 'error': str(exc)}
+        return {'ok': False, 'kind': 'down', 'status_code': None, 'latency_ms': None, 'error': str(exc)}
     latency_ms = round((time.monotonic() - started) * 1000)
-    return {'ok': res.status_code < 500, 'status_code': res.status_code, 'latency_ms': latency_ms, 'error': None}
+    ok = res.status_code < 500
+    return {'ok': ok, 'kind': 'ok' if ok else 'down', 'status_code': res.status_code,
+            'latency_ms': latency_ms, 'error': None}
 
 
 def check_server_status(session=None):
@@ -2679,15 +2739,21 @@ def check_server_status(session=None):
     반환: {'eiass_site','eiass_search_api','vworld','kdpa': {'ok','status_code',
         'latency_ms','error'}, 'all_ok': bool, 'checked_at': ISO8601 UTC 문자열}
     """
-    s = session or _session()
-    result = {}
+    result = dict(probe_services(SERVICE_ORDER, session=session, use_cache=False))
+    result['checked_at'] = datetime.utcnow().isoformat() + 'Z'
+    result['all_ok'] = all(v['ok'] for v in result.values() if isinstance(v, dict) and 'ok' in v)
+    return result
 
-    result['eiass_site'] = _http_probe(
+
+def _probe_eiass_site(s):
+    return _http_probe(
         'GET', EIASS_BASE + '/', s,
         headers={'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'}, verify=False,
     )
 
-    result['eiass_search_api'] = _http_probe(
+
+def _probe_eiass_search_api(s):
+    return _http_probe(
         'POST', SEARCH_API_URL, s,
         data={
             'query': '', 'collection': 'business', 'currentPage': '1', 'sort': 'DATE/DESC',
@@ -2701,25 +2767,118 @@ def check_server_status(session=None):
         verify=False,
     )
 
+
+def _probe_vworld(s):
     api_key = get_vworld_api_key()
     if not api_key:
-        result['vworld'] = {'ok': False, 'status_code': None, 'latency_ms': None,
-                             'error': 'VWORLD_API_KEY가 설정되어 있지 않습니다 (.env) — 확인을 건너뛰었습니다.'}
-    else:
-        result['vworld'] = _http_probe(
-            'GET', 'https://api.vworld.kr/req/search', s,
-            params={'service': 'search', 'request': 'search', 'version': '2.0', 'crs': 'EPSG:4326',
-                    'size': '1', 'page': '1', 'query': '서울특별시', 'type': 'address',
-                    'category': 'road', 'format': 'json', 'errorformat': 'json', 'key': api_key},
-            verify=True,
-        )
+        return {'ok': False, 'kind': 'unconfigured', 'status_code': None, 'latency_ms': None,
+                'error': 'VWORLD_API_KEY가 설정되어 있지 않습니다 (.env) — 확인을 건너뛰었습니다.'}
+    return _http_probe(
+        'GET', 'https://api.vworld.kr/req/search', s,
+        params={'service': 'search', 'request': 'search', 'version': '2.0', 'crs': 'EPSG:4326',
+                'size': '1', 'page': '1', 'query': '서울특별시', 'type': 'address',
+                'category': 'road', 'format': 'json', 'errorformat': 'json', 'key': api_key},
+        verify=True,
+    )
 
-    result['kdpa'] = _http_probe(
+
+def _probe_kdpa(s):
+    return _http_probe(
         'POST', KDPA_BASE_URL + '/getNewVer', s,
         data=json.dumps({'version_nm': ''}, ensure_ascii=False).encode('utf-8'),
         headers=_kdpa_headers(json_request=True),
     )
 
-    result['checked_at'] = datetime.utcnow().isoformat() + 'Z'
-    result['all_ok'] = all(v['ok'] for v in result.values() if isinstance(v, dict) and 'ok' in v)
-    return result
+
+_PROBES = {
+    'eiass_site': _probe_eiass_site,
+    'eiass_search_api': _probe_eiass_search_api,
+    'vworld': _probe_vworld,
+    'kdpa': _probe_kdpa,
+}
+SERVICE_ORDER = ('eiass_site', 'eiass_search_api', 'vworld', 'kdpa')
+SERVICE_LABELS = {
+    'eiass_site': 'EIASS 본사이트',
+    'eiass_search_api': 'EIASS 검색 API',
+    'vworld': 'VWorld 지오코딩 API',
+    'kdpa': 'KDPA 보호지역 WFS',
+}
+
+_HEALTH_CACHE = {}
+_HEALTH_CACHE_LOCK = threading.Lock()
+
+
+def probe_services(names, session=None, use_cache=True):
+    """지정한 서비스만 점검한다. 헬스체크는 재시도 없는 세션으로 "지금" 상태를 본다.
+
+    use_cache=True면 HEALTH_CACHE_TTL_SECONDS 동안 결과를 재사용한다. 장애 중에는 스캔의
+    모든 항목이 실패하는데, 항목마다 4개 서비스를 다시 찔러보면 진단이 본 작업보다 비싸진다.
+    캐시는 "설명"에만 쓰고 호출을 막는 데는 쓰지 않으므로, 캐시가 틀려도 작업을 버리지 않는다.
+    """
+    now = time.monotonic()
+    result = {}
+    missing = []
+    for name in names:
+        if use_cache:
+            with _HEALTH_CACHE_LOCK:
+                cached = _HEALTH_CACHE.get(name)
+            if cached and now - cached[1] < HEALTH_CACHE_TTL_SECONDS:
+                result[name] = cached[0]
+                continue
+        missing.append(name)
+    if missing:
+        s = session or _session(retry=False)
+        for name in missing:
+            probe = _PROBES[name](s)
+            result[name] = probe
+            with _HEALTH_CACHE_LOCK:
+                _HEALTH_CACHE[name] = (probe, time.monotonic())
+    return {name: result[name] for name in names if name in result}
+
+
+def explain_failure(exc, service_names, session=None):
+    """실패한 조회의 원인을 외부 서비스 상태로 설명해 사용자에게 돌려줄 dict를 만든다.
+
+    진단일 뿐 중단을 결정하지 않는다 — 이미 실패한 호출에 라벨을 붙일 뿐이라, 이 함수 때문에
+    작업이 버려지는 일은 없다. 느린 서버를 장애로 단정하지 않으려고 'slow'와 'down'을 구분해
+    안내 문구를 다르게 쓴다.
+    """
+    # requests가 던지는 원문에는 커넥션 풀·재시도 내역이 통째로 들어 있어 그대로 붙이면 정작
+    # 중요한 "어느 서버가 문제인가"가 파묻힌다. 원인 추적용으로 앞부분만 남긴다.
+    detail = ' '.join(str(exc).split())
+    if len(detail) > 160:
+        detail = detail[:160] + '…'
+    try:
+        probes = probe_services(service_names, session=session)
+    except Exception:
+        return {'error': detail}  # 진단이 실패해도 원래 오류는 그대로 전달한다
+
+    down = [n for n in service_names if probes.get(n, {}).get('kind') == 'down']
+    slow = [n for n in service_names if probes.get(n, {}).get('kind') == 'slow']
+    unconfigured = [n for n in service_names if probes.get(n, {}).get('kind') == 'unconfigured']
+
+    def _describe(name):
+        probe = probes.get(name, {})
+        label = SERVICE_LABELS.get(name, name)
+        if probe.get('status_code'):
+            return f"{label}(HTTP {probe['status_code']})"
+        return label
+
+    if down:
+        message = (f"{', '.join(_describe(n) for n in down)} 장애로 조회할 수 없습니다. "
+                   f"서비스가 복구된 뒤 다시 시도하세요. (원래 오류: {detail})")
+    elif slow:
+        message = (f"{', '.join(_describe(n) for n in slow)}이(가) 응답 지연 중입니다"
+                   f"(장애는 아님). 잠시 후 다시 시도하면 성공할 수 있습니다. (원래 오류: {detail})")
+    elif unconfigured:
+        message = f"{', '.join(_describe(n) for n in unconfigured)} 설정이 없어 조회할 수 없습니다. (원래 오류: {detail})"
+    else:
+        message = f"{detail} (참고: 관련 외부 서비스는 정상 응답 중이라 서버 장애는 아닙니다.)"
+
+    return {
+        'error': message,
+        'outage': bool(down),
+        'degraded': bool(slow),
+        'affected_services': down + slow + unconfigured,
+        'server_status': probes,
+    }

@@ -24,6 +24,7 @@ import shutil
 import sys
 import tempfile
 
+import requests
 from mcp.server.fastmcp import FastMCP
 
 import eiass_core as core
@@ -52,6 +53,30 @@ def _jobs_backend():
             _job_store = JobStore()
             _job_runner = ScanRunner(_job_store)
         return _job_store, _job_runner
+
+
+# ── 실패 원인 안내 ──
+# 도구마다 의존하는 외부 서비스가 다르다. 지오코딩이 실패했는데 "EIASS 사이트 장애"라고
+# 알리면 오진이므로, 그 도구가 실제로 쓰는 서비스만 점검해 범인을 지목한다.
+SVC_SEARCH = ('eiass_site', 'eiass_search_api')      # 사업 검색
+SVC_DOCS = ('eiass_site',)                            # 상세/첨부문서 다운로드
+SVC_GEO = ('vworld',)                                 # 주소 → 좌표
+SVC_SPATIAL = ('vworld', 'kdpa')                      # 좌표 → 보호지역
+SVC_SEARCH_DOCS = SVC_SEARCH                          # 검색 후 문서까지 여는 도구
+SVC_PROJECT_SPATIAL = ('eiass_site', 'vworld', 'kdpa')  # 사업 상세 → 주소 → 보호지역
+SVC_SEARCH_SPATIAL = ('eiass_site', 'eiass_search_api', 'vworld', 'kdpa')
+
+
+def _fail(exc, services):
+    """도구 실패를 사용자에게 돌려줄 dict로 만든다.
+
+    외부 서비스 때문에 생긴 실패일 때만 상태를 점검해 어느 서버가 문제인지 붙인다. 입력값
+    오류까지 점검하면 오타 한 번에 헬스체크가 날아간다. 점검은 설명을 붙일 뿐 재시도나 중단을
+    결정하지 않으므로, 이 경로 때문에 작업이 버려지지는 않는다.
+    """
+    if core.is_network_error(exc):
+        return core.explain_failure(exc, services)
+    return {'error': str(exc)}
 
 
 def _confirmation_only(result):
@@ -266,8 +291,8 @@ def eiass_search_projects(keyword: str = '', types: str = '', agency_code: str =
             progress_status=progress_status, climate_filter=climate_filter, biz_gubun=biz_gubun,
             progress_stage_keys=stage_keys, date_filter_exclusions=date_filter_exclusions,
         )
-    except core.EiassError as exc:
-        return {'error': str(exc)}
+    except (core.EiassError, requests.exceptions.RequestException) as exc:
+        return _fail(exc, SVC_SEARCH)
     return {'count': len(results), 'projects': results, 'date_filter_exclusions': date_filter_exclusions}
 
 
@@ -325,8 +350,8 @@ def eiass_preview_search(
             max_pages=max_pages, inference_notes=inference_notes,
             audit_sample_size=audit_sample_size,
         ))
-    except core.EiassError as exc:
-        return {'error': str(exc)}
+    except (core.EiassError, requests.exceptions.RequestException) as exc:
+        return _fail(exc, SVC_SEARCH)
 
 
 @mcp.tool()
@@ -435,8 +460,8 @@ def eiass_find_projects_by_document_keyword(
             query_list, offset=offset, max_candidates=max_candidates,
             audit_sample_size=audit_sample_size, **common_kwargs,
         )
-    except core.EiassError as exc:
-        return {'error': str(exc)}
+    except (core.EiassError, requests.exceptions.RequestException) as exc:
+        return _fail(exc, SVC_SEARCH_DOCS)
 
 
 @mcp.tool()
@@ -480,8 +505,8 @@ def eiass_start_document_keyword_scan(
     progress_stage_labels = [s.strip() for s in progress_stage.split(',') if s.strip()]
     try:
         stage_keys = core.progress_stage_keys_from_labels(progress_stage_labels)
-    except core.EiassError as exc:
-        return {'error': str(exc)}
+    except (core.EiassError, requests.exceptions.RequestException) as exc:
+        return _fail(exc, SVC_SEARCH)
     common_kwargs = dict(
         match_mode=match_mode, keyword=keyword, type_codes=type_codes, agency_code=agency_code,
         consult_date_from=consult_date_from or None, consult_date_to=consult_date_to or None,
@@ -495,8 +520,8 @@ def eiass_start_document_keyword_scan(
             return _confirmation_only(core.preview_document_keyword_search(
                 query_list, inference_notes=inference_notes,
                 audit_sample_size=audit_sample_size, **common_kwargs))
-        except core.EiassError as exc:
-            return {'error': str(exc)}
+        except (core.EiassError, requests.exceptions.RequestException) as exc:
+            return _fail(exc, SVC_SEARCH)
 
     if batch_size <= 0:
         return {'error': 'batch_size는 1 이상의 정수여야 합니다.'}
@@ -571,8 +596,8 @@ def eiass_read_document(file_seq: str, max_chars: int = 20000) -> dict:
     """
     try:
         return core.download_document_text(file_seq, max_chars=max_chars)
-    except core.EiassError as exc:
-        return {'error': str(exc)}
+    except (core.EiassError, requests.exceptions.RequestException) as exc:
+        return _fail(exc, SVC_DOCS)
 
 
 @mcp.tool()
@@ -637,16 +662,16 @@ def eiass_check_protected_area_adjacency(address: str, radius_m: int = 1000, des
     """
     try:
         coord = core.geocode_address(address)
-    except core.EiassError as exc:
-        return {'error': str(exc)}
+    except (core.EiassError, requests.exceptions.RequestException) as exc:
+        return _fail(exc, SVC_SPATIAL)
     if not coord:
         return {'error': f'주소를 좌표로 변환하지 못했습니다: {address}'}
     lon, lat, source = coord
     try:
         spatial = core.find_nearby_protected_areas(
             lon, lat, radius_m=radius_m, designations=designations or None, return_diagnostics=True)
-    except core.EiassError as exc:
-        return {'error': str(exc)}
+    except (core.EiassError, requests.exceptions.RequestException) as exc:
+        return _fail(exc, SVC_SPATIAL)
     return {
         'address': address,
         'lon': lon, 'lat': lat, 'geocode_source': source,
@@ -716,8 +741,8 @@ def eiass_check_project_protected_area_adjacency(
 
     try:
         geocoded = core.geocode_project_location(project_location)
-    except core.EiassError as exc:
-        return {'error': str(exc)}
+    except (core.EiassError, requests.exceptions.RequestException) as exc:
+        return _fail(exc, SVC_PROJECT_SPATIAL)
     if not geocoded:
         return {'error': f'사업지 주소가 비어 있습니다: {project_location!r}'}
     if geocoded['lon'] is None:
@@ -737,8 +762,8 @@ def eiass_check_project_protected_area_adjacency(
         spatial = core.find_nearby_protected_areas(
             geocoded['lon'], geocoded['lat'], radius_m=radius_m,
             designations=designations or None, return_diagnostics=True)
-    except core.EiassError as exc:
-        return {'error': str(exc)}
+    except (core.EiassError, requests.exceptions.RequestException) as exc:
+        return _fail(exc, SVC_PROJECT_SPATIAL)
 
     return {
         'project_location': project_location,
@@ -820,8 +845,8 @@ def eiass_find_projects_protected_area_adjacency(
         return core.scan_projects_protected_area_adjacency(
             radius_m=radius_m, designations=designation_list, allow_admin_fallback=allow_admin_fallback,
             offset=offset, max_candidates=max_candidates, **common_kwargs)
-    except core.EiassError as exc:
-        return {'error': str(exc)}
+    except (core.EiassError, requests.exceptions.RequestException) as exc:
+        return _fail(exc, SVC_SEARCH_SPATIAL)
 
 
 @mcp.tool()
@@ -856,8 +881,8 @@ def eiass_start_spatial_scan(
     designation_list = [d.strip() for d in designations.split(',') if d.strip()] or None
     try:
         stage_keys = core.progress_stage_keys_from_labels(stage_labels)
-    except core.EiassError as exc:
-        return {'error': str(exc)}
+    except (core.EiassError, requests.exceptions.RequestException) as exc:
+        return _fail(exc, SVC_SEARCH_SPATIAL)
     common_kwargs = dict(
         keyword=keyword, type_codes=type_codes, agency_code=agency_code,
         consult_date_from=consult_date_from or None, consult_date_to=consult_date_to or None,
@@ -871,8 +896,8 @@ def eiass_start_spatial_scan(
                 radius_m=radius_m, designations=designation_list,
                 allow_admin_fallback=allow_admin_fallback, inference_notes=inference_notes,
                 **common_kwargs))
-        except core.EiassError as exc:
-            return {'error': str(exc)}
+        except (core.EiassError, requests.exceptions.RequestException) as exc:
+            return _fail(exc, SVC_SEARCH_SPATIAL)
 
     if batch_size <= 0:
         return {'error': 'batch_size는 1 이상의 정수여야 합니다.'}
@@ -978,8 +1003,8 @@ def eiass_geocode(address: str) -> dict:
     """주소를 VWorld API로 경위도 좌표로 변환한다."""
     try:
         coord = core.geocode_address(address)
-    except core.EiassError as exc:
-        return {'error': str(exc)}
+    except (core.EiassError, requests.exceptions.RequestException) as exc:
+        return _fail(exc, SVC_GEO)
     if not coord:
         return {'error': f'주소를 좌표로 변환하지 못했습니다: {address}'}
     lon, lat, source = coord

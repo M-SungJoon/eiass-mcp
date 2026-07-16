@@ -18,6 +18,10 @@ DOC_CACHE_TTL_SECONDS = 30 * 24 * 60 * 60
 DOC_CACHE_MAX_CHARS = 100 * 1024 * 1024
 DETAIL_CACHE_TTL_SECONDS = 60 * 60
 DETAIL_CACHE_MAX_ITEMS = 512
+# 실패 원인을 설명하려고 찍어본 서비스 상태를 재사용하는 시간. 장애 중에는 스캔의 모든 항목이
+# 실패하는데 항목마다 서비스를 다시 찔러보면 진단이 본 작업보다 비싸진다. 설명에만 쓰고
+# 호출을 막는 데는 쓰지 않는다.
+HEALTH_CACHE_TTL_SECONDS = 60
 
 
 def app_data_dir():

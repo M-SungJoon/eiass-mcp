@@ -120,9 +120,25 @@ class ScanRunner:
         except core.ScanCancelled:
             self.store.update(job_id, status='cancelled', phase='cancelled', clear_owner=True)
         except Exception as exc:
-            self.store.update(job_id, status='error', phase='failed', error=str(exc), clear_owner=True)
+            # 개별 문서/사업 실패는 안쪽 루프가 이미 잡아서 스캔을 계속 진행시킨다. 여기까지 온 건
+            # 후보 검색 같은 스캔 전체를 세우는 오류이므로, 외부 서비스 탓이면 어느 서버인지 남긴다.
+            self.store.update(job_id, status='error', phase='failed',
+                              error=_describe_job_failure(exc, kind), clear_owner=True)
         finally:
             session.close()
+
+
+def _describe_job_failure(exc, kind):
+    """스캔 job이 실패한 이유를 사용자가 읽을 문장으로 만든다.
+
+    장시간 도는 작업이라 "왜 멈췄는지"가 특히 중요하다. 외부 서비스 문제가 아니면 원래 메시지를
+    그대로 둔다(입력 오류에까지 헬스체크를 돌리지 않는다).
+    """
+    if not core.is_network_error(exc):
+        return str(exc)
+    services = (('eiass_site', 'eiass_search_api') if kind == 'document'
+                else ('eiass_site', 'eiass_search_api', 'vworld', 'kdpa'))
+    return core.explain_failure(exc, services).get('error', str(exc))
 
 
 def _merge_stage_stats(total, batch):

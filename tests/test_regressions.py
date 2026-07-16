@@ -1,6 +1,11 @@
 # -*- coding: utf-8 -*-
+import threading
+import time
 import unittest
 from datetime import date
+from http.server import BaseHTTPRequestHandler, HTTPServer
+
+import requests
 
 import eiass_core as core
 import mcp_server
@@ -172,6 +177,133 @@ class RegressionTests(unittest.TestCase):
         self.assertEqual(len(search_calls), 1)
         self.assertEqual(batches, [(0, ['1', '2', '3']), (2, ['1', '2', '3'])])
         self.assertEqual(mcp_server._jobs['job']['status'], 'done')
+
+
+class OutageDiagnosisTests(unittest.TestCase):
+    """실패 원인을 어느 서버 탓으로 돌리는지 검증한다.
+
+    핵심은 "느릴 뿐 살아있는 서버"를 장애로 단정하지 않는 것이다. 장애로 단정하면 사용자에게
+    조회 불가라고 잘못 안내하게 된다.
+    """
+
+    OK = {'ok': True, 'kind': 'ok', 'status_code': 200, 'latency_ms': 100, 'error': None}
+    DOWN = {'ok': False, 'kind': 'down', 'status_code': 503, 'latency_ms': 80, 'error': None}
+    SLOW = {'ok': False, 'kind': 'slow', 'status_code': None, 'latency_ms': 30000,
+            'error': 'Read timed out.'}
+
+    def setUp(self):
+        self.original_probe = core.probe_services
+
+    def tearDown(self):
+        core.probe_services = self.original_probe
+
+    def _stub_probes(self, mapping):
+        def _fake(names, session=None, use_cache=True):
+            return {n: mapping[n] for n in names if n in mapping}
+        core.probe_services = _fake
+
+    def test_down_service_is_named_as_outage(self):
+        self._stub_probes({'eiass_site': self.OK, 'eiass_search_api': self.DOWN})
+        result = mcp_server._fail(requests.exceptions.ConnectionError('refused'), mcp_server.SVC_SEARCH)
+        self.assertTrue(result['outage'])
+        self.assertEqual(result['affected_services'], ['eiass_search_api'])
+        self.assertIn('EIASS 검색 API', result['error'])
+
+    def test_slow_service_is_not_reported_as_outage(self):
+        self._stub_probes({'eiass_site': self.OK, 'eiass_search_api': self.SLOW})
+        result = mcp_server._fail(requests.exceptions.ReadTimeout('timed out'), mcp_server.SVC_SEARCH)
+        self.assertFalse(result['outage'])
+        self.assertTrue(result['degraded'])
+        self.assertIn('지연', result['error'])
+
+    def test_validation_error_does_not_probe_services(self):
+        calls = []
+
+        def _fake(names, session=None, use_cache=True):
+            calls.append(names)
+            return {}
+        core.probe_services = _fake
+        result = mcp_server._fail(core.EiassError('consult_date_from은 YYYY-MM-DD 형식이어야 합니다.'),
+                                  mcp_server.SVC_SEARCH)
+        self.assertEqual(calls, [])
+        self.assertEqual(result, {'error': 'consult_date_from은 YYYY-MM-DD 형식이어야 합니다.'})
+
+    def test_only_services_the_tool_uses_are_blamed(self):
+        # EIASS도 같이 죽어 있어도 지오코딩 실패의 범인으로 지목하면 오진이다.
+        self._stub_probes({'vworld': self.DOWN, 'eiass_site': self.DOWN})
+        result = mcp_server._fail(requests.exceptions.ConnectionError('x'), mcp_server.SVC_GEO)
+        self.assertEqual(result['affected_services'], ['vworld'])
+
+    def test_healthy_services_are_not_blamed(self):
+        self._stub_probes({'eiass_site': self.OK, 'eiass_search_api': self.OK})
+        result = mcp_server._fail(requests.exceptions.ConnectionError('원인 불명'), mcp_server.SVC_SEARCH)
+        self.assertFalse(result['outage'])
+        self.assertFalse(result['degraded'])
+        self.assertIn('서버 장애는 아닙니다', result['error'])
+
+    def test_http_status_failures_count_as_network_errors(self):
+        self.assertTrue(core.is_network_error(core.EiassNetworkError('문서 다운로드 실패: HTTP 503')))
+        self.assertFalse(core.is_network_error(core.EiassError('max_candidates는 1 이상이어야 합니다.')))
+
+    def test_wrapped_requests_error_is_detected_through_cause_chain(self):
+        try:
+            try:
+                raise requests.exceptions.ReadTimeout('timed out')
+            except requests.exceptions.ReadTimeout as exc:
+                raise core.EiassError('조회 실패') from exc
+        except core.EiassError as exc:
+            self.assertTrue(core.is_network_error(exc))
+
+
+class RetrySessionTests(unittest.TestCase):
+    """느린 서버 때문에 멀쩡한 요청이 실패로 확정되지 않는지 검증한다."""
+
+    def _serve(self, failures, delay=0.0):
+        state = {'hits': 0}
+
+        class Handler(BaseHTTPRequestHandler):
+            def log_message(self, *args):
+                pass
+
+            def do_GET(self):
+                state['hits'] += 1
+                if state['hits'] <= failures:
+                    if delay:
+                        time.sleep(delay)
+                    else:
+                        self.send_response(503)
+                        self.end_headers()
+                        return
+                self.send_response(200)
+                self.end_headers()
+                self.wfile.write(b'OK')
+
+        class QuietServer(HTTPServer):
+            def handle_error(self, request, client_address):
+                pass  # 클라이언트 타임아웃으로 끊기는 건 이 테스트에선 정상이다
+
+        server = QuietServer(('127.0.0.1', 0), Handler)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        self.addCleanup(server.shutdown)
+        return f'http://127.0.0.1:{server.server_port}/', state
+
+    def test_transient_5xx_is_retried_until_success(self):
+        url, state = self._serve(failures=2)
+        response = core._session().get(url, timeout=(5, 5))
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(state['hits'], 3)
+
+    def test_read_timeout_from_slow_server_is_retried(self):
+        url, state = self._serve(failures=2, delay=2.0)
+        response = core._session().get(url, timeout=(5, 0.5))
+        self.assertEqual(response.status_code, 200)
+
+    def test_health_check_session_does_not_retry(self):
+        # 진단은 "지금" 상태를 봐야 하므로 재시도하면 안 된다.
+        url, state = self._serve(failures=2)
+        response = core._session(retry=False).get(url, timeout=(5, 5))
+        self.assertEqual(response.status_code, 503)
+        self.assertEqual(state['hits'], 1)
 
 
 if __name__ == '__main__':
