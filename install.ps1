@@ -86,6 +86,11 @@ try {
     # 옛 onefile 버전이 남긴 %TEMP%/_MEI 폴더 정리 — 업데이트 여부와 무관하게 매번 한다.
     Clear-OrphanMeiDirs
 
+    # 이전 업데이트에서 물러난 구버전 폴더. 그때는 서버가 실행 중이라 못 지웠을 수 있으니
+    # 매번 다시 시도한다(아직 쓰는 중이면 조용히 실패하고 다음 기회에 지운다).
+    Get-ChildItem -LiteralPath $ExeDir -Directory -Filter "mcp_server.old*" -ErrorAction SilentlyContinue |
+        ForEach-Object { Remove-Item $_.FullName -Recurse -Force -ErrorAction SilentlyContinue }
+
     # 0) 버전 확인 + 자동 업데이트 — git 없이 GitHub API/raw 파일 URL만 사용한다.
     # 업데이트가 필요한지 여부는 mcp_server_dist.zip의 최신 커밋 SHA로 판단하고(정확함),
     # 사람이 보는 버전 번호는 저장소 루트의 VERSION 파일(예: "1.1.0")에서 가져온다.
@@ -139,7 +144,9 @@ try {
                 $tmpZip = Join-Path $ExeDir "mcp_server_dist.download.zip"
                 $tmpManifestPath = "$tmpZip.sha256"
                 $stageDir = Join-Path $ExeDir "mcp_server.new"
-                $retireDir = Join-Path $ExeDir "mcp_server.old"
+                # 물러날 폴더는 매번 새 이름을 쓴다. 이전 구버전이 아직 실행 중이라 삭제되지 않고
+                # 남아 있으면, 고정 이름이면 rename 대상이 이미 존재해 교체가 통째로 막힌다.
+                $retireDir = Join-Path $ExeDir ("mcp_server.old-" + [guid]::NewGuid().ToString('N').Substring(0, 8))
                 try {
                     Invoke-WebRequest -Uri $downloadUrl -OutFile $tmpZip -Headers $ghHeaders -TimeoutSec 300
                     Invoke-WebRequest -Uri $manifestUrl -OutFile $tmpManifestPath -Headers $ghHeaders -TimeoutSec 30
@@ -152,24 +159,44 @@ try {
                     # 새 배포본을 먼저 옆에 풀어두고, 검증이 끝난 뒤에만 기존 폴더와 바꿔치기한다.
                     # 압축 해제 도중 실패해도 돌아가던 버전은 그대로 남는다.
                     if (Test-Path $stageDir) { Remove-Item $stageDir -Recurse -Force }
-                    if (Test-Path $retireDir) { Remove-Item $retireDir -Recurse -Force -ErrorAction SilentlyContinue }
                     Expand-Archive -Path $tmpZip -DestinationPath $stageDir -Force
                     $extracted = Join-Path $stageDir "mcp_server"
                     if (-not (Test-Path (Join-Path $extracted "mcp_server.exe"))) {
                         throw "배포 zip 구조가 예상과 다릅니다 (mcp_server/mcp_server.exe 없음)."
                     }
-                    # 실행 중이면 Move-Item이 실패한다 — 그 경우 기존 폴더를 건드리지 않고 빠져나간다.
-                    if (Test-Path $AppDir) { Move-Item -Path $AppDir -Destination $retireDir -Force }
-                    Move-Item -Path $extracted -Destination $AppDir -Force
+
+                    # 교체는 반드시 [System.IO.Directory]::Move로 한다. Move-Item은 폴더를 통째로
+                    # rename하지 못하면 "파일 하나씩 옮기기"로 알아서 대체 실행되는데, 서버가 실행 중이라
+                    # 일부 파일이 잠겨 있으면 옮길 수 있는 것만 옮기고 멈춰 설치본을 반쯤 부순다
+                    # (실제로 exe만 빠져나가고 _internal만 남아 MCP가 통째로 죽었다).
+                    # Directory.Move는 진짜 rename이라 막히면 아무것도 건드리지 않고 예외를 던진다.
+                    $retired = $false
+                    if (Test-Path $AppDir) {
+                        try {
+                            [System.IO.Directory]::Move($AppDir, $retireDir)
+                            $retired = $true
+                        } catch {
+                            throw ("기존 배포본이 사용 중이라 교체할 수 없습니다. Claude Code/Codex를 " +
+                                   "완전히 종료한 뒤 다시 실행하세요. (기존 버전은 그대로 유지됩니다)")
+                        }
+                    }
+                    try {
+                        [System.IO.Directory]::Move($extracted, $AppDir)
+                    } catch {
+                        # 새 배포본을 못 넣었으면 치워둔 구버전을 반드시 제자리로 되돌린다.
+                        if ($retired) { [System.IO.Directory]::Move($retireDir, $AppDir) }
+                        throw
+                    }
 
                     Set-Content -Path $versionFile -Value @($latestSha, $latestVersion) -Encoding utf8
                     Write-Host "✅ 배포본을 최신 버전($latestVersion)으로 업데이트했습니다.`n"
                 } catch {
                     Write-Host "⚠ 업데이트 다운로드/교체 실패: $($_.Exception.Message)"
                     Write-Host "   (Claude Code/Codex가 실행 중이면 파일이 잠겨 있을 수 있습니다 — 완전히 종료한 뒤 다시 실행해보세요.)"
-                    # 교체 도중 실패해 기존 폴더만 치워진 상태면 되돌린다.
-                    if ((-not (Test-Path $AppDir)) -and (Test-Path $retireDir)) {
-                        Move-Item -Path $retireDir -Destination $AppDir -Force -ErrorAction SilentlyContinue
+                    # 실행 파일이 제자리에 없으면 아직 복구가 안 된 것이다. 폴더 존재 여부로 판단하면
+                    # 안 된다 — 껍데기만 남은 폴더를 "복구 완료"로 오인해 그냥 지나친다(실제로 겪음).
+                    if ((-not (Test-Path $ExePath)) -and (Test-Path $retireDir)) {
+                        try { [System.IO.Directory]::Move($retireDir, $AppDir) } catch {}
                     }
                     if (-not (Test-Path $ExePath)) {
                         throw "배포본을 받지 못해 설치를 진행할 수 없습니다."
