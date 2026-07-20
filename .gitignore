@@ -9,9 +9,13 @@ venv/
 .mcpbuild_venv/
 # AI 작업용 빌드 가상환경·렌더링·검증 산출물
 \#AI working/
-# install.ps1이 mcp_server_dist.zip을 풀어 만드는 로컬 설치본 (저장소에는 zip만 커밋한다)
+# 예전에 저장소 폴더에 풀려 있던 로컬 설치본 (이제 설치 위치는 %LOCALAPPDATA%로 고정)
 /mcp_server/
 /mcp_server.new/
 /mcp_server.old/
 # install.ps1이 설치 폴더에 남기는 로컬 상태 파일
 .eiass_mcp_version
+# 배포본은 저장소에 커밋하지 않고 GitHub 릴리스 자산으로만 올린다
+# (41MB 바이너리를 커밋하면 git 히스토리에 영구히 쌓인다 — 실측 22회에 .git 907MB)
+/mcp_server_dist.zip
+/mcp_server_dist.zip.sha256

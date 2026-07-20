@@ -39,10 +39,11 @@ jobs:
           $zip = Join-Path '#AI working/release' "mcp_server_dist_$versionTag.zip"
           python tools/verify_release.py $zip "$zip.sha256"
 
-          # 2) 저장소에 커밋된 배포본(사용자가 install.ps1로 실제 받아가는 그 파일)도 검증한다.
-          # 소스만 고치고 zip 재빌드를 잊으면 여기서 걸린다 — 실제로 VERSION만 올리고 exe를
-          # 안 맞춰서 1.10.0이 1.9.0을 보고한 적이 있다.
-          python tools/verify_release.py mcp_server_dist.zip mcp_server_dist.zip.sha256
+          # 2) 릴리스에 올라갈 이름 그대로의 자산도 검증한다. install.ps1이 이 이름 두 개를
+          # 그대로 찾으므로, 이름이 어긋나면 모든 사용자의 업데이트가 조용히 실패한다.
+          # (배포본은 저장소에 커밋하지 않고 GitHub 릴리스 자산으로만 올린다.)
+          $asset = Join-Path $env:EIASS_MCP_BUILD_ROOT 'release\mcp_server_dist.zip'
+          python tools/verify_release.py $asset "$asset.sha256"
           $shipped = Join-Path $env:RUNNER_TEMP 'shipped'
-          Expand-Archive -Path mcp_server_dist.zip -DestinationPath $shipped -Force
+          Expand-Archive -Path $asset -DestinationPath $shipped -Force
           python tools/parity_smoke.py --exe (Join-Path $shipped 'mcp_server\mcp_server.exe')

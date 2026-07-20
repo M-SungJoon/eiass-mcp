@@ -143,7 +143,7 @@ def assert_version_in_sync():
         sys.exit(2)
 
 
-def build(publish_root=False):
+def build():
     assert_build_python()
     assert_version_in_sync()
     os.makedirs(DIST_DIR, exist_ok=True)
@@ -186,23 +186,55 @@ def build(publish_root=False):
         os.remove(versioned_zip)
     shutil.make_archive(versioned_zip[:-4], 'zip', root_dir=DIST_DIR, base_dir=OUTPUT_NAME)
     write_manifest(versioned_zip)
+    # 릴리스 자산은 이름이 고정돼야 한다 — install.ps1이 mcp_server_dist.zip / .sha256 두 개를
+    # 이름으로 찾는다. 업로드용 사본은 반드시 저장소 밖(DIST_DIR)에 둔다: 저장소 폴더 이름이
+    # '#AI working'인데 gh는 자산 경로의 '#'을 "파일#라벨" 구분자로 해석해서 경로가 쪼개진다
+    # (실제로 파일명이 'eiass-mcp'로 잘못 잡혀 업로드가 실패했다).
+    asset_zip = os.path.join(DIST_DIR, PAYLOAD_ZIP_NAME)
+    shutil.copyfile(versioned_zip, asset_zip)
+    write_manifest(asset_zip)
+    # 사람이 어느 빌드인지 확인할 수 있게 버전 붙은 사본도 저장소 작업 폴더에 남긴다.
     os.makedirs(ARTIFACT_DIR, exist_ok=True)
-    artifact_zip = os.path.join(ARTIFACT_DIR, os.path.basename(versioned_zip))
-    shutil.copyfile(versioned_zip, artifact_zip)
-    write_manifest(artifact_zip)
-    if publish_root:
-        stable_path = os.path.join(BASE_DIR, PAYLOAD_ZIP_NAME)
-        shutil.copyfile(versioned_zip, stable_path)
-        write_manifest(stable_path)
-        print(f'✅ 저장소 배포본 갱신: {stable_path}')
+    shutil.copyfile(versioned_zip, os.path.join(ARTIFACT_DIR, os.path.basename(versioned_zip)))
+    write_manifest(os.path.join(ARTIFACT_DIR, os.path.basename(versioned_zip)))
+
     size_mb = os.path.getsize(versioned_zip) / (1024 * 1024)
     print(f'\n✅ 빌드 완료: {app_dir}')
-    print(f'   배포 zip: {artifact_zip} ({size_mb:.1f} MB)')
+    print(f'   릴리스 자산: {asset_zip} ({size_mb:.1f} MB)')
+    return asset_zip
+
+
+def publish_release(asset_zip):
+    """빌드 산출물을 GitHub 릴리스로 올린다.
+
+    저장소에 41MB zip을 커밋하면 git 히스토리에 영구히 쌓인다(실측: 22회 커밋에 .git 907MB).
+    릴리스 자산은 히스토리 밖에 있어서 저장소가 커지지 않는다.
+    """
+    tag = 'v' + VERSION
+    exists = subprocess.run(['gh', 'release', 'view', tag], cwd=BASE_DIR,
+                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode == 0
+    assets = [asset_zip, asset_zip + '.sha256']
+    if exists:
+        print(f'릴리스 {tag}가 이미 있어 자산만 갱신합니다.')
+        cmd = ['gh', 'release', 'upload', tag] + assets + ['--clobber']
+    else:
+        cmd = ['gh', 'release', 'create', tag] + assets + [
+            '--title', f'EIASS MCP {VERSION}',
+            '--notes', f'EIASS MCP {VERSION}\n\n설치/업데이트: `install.bat`을 더블클릭하세요.',
+        ]
+    result = subprocess.run(cmd, cwd=BASE_DIR)
+    if result.returncode != 0:
+        print(f'\n❌ 릴리스 발행 실패 (exit code {result.returncode})')
+        sys.exit(7)
+    print(f'\n✅ 릴리스 발행 완료: {tag}')
 
 
 if __name__ == '__main__':
     configure_stdio()
     parser = argparse.ArgumentParser()
-    parser.add_argument('--publish-root', action='store_true',
-                        help='검증용 버전 실행 파일을 저장소의 mcp_server.exe에도 반영')
-    build(parser.parse_args().publish_root)
+    parser.add_argument('--publish-release', action='store_true',
+                        help='빌드 후 GitHub 릴리스(v<VERSION>)에 배포본을 올린다')
+    args = parser.parse_args()
+    built_asset = build()
+    if args.publish_release:
+        publish_release(built_asset)

@@ -1,23 +1,29 @@
-﻿# EIASS MCP 자동 등록 스크립트
-# 사용법: install.bat을 더블클릭하거나, 이 폴더에서
-#   powershell -ExecutionPolicy Bypass -File install.ps1
+﻿# EIASS MCP 자동 설치 스크립트
+# 사용법: 'EIASS MCP 설치.bat'을 더블클릭한다(사용자는 이것만 하면 된다).
+#   터미널에서 직접 돌리려면: irm https://raw.githubusercontent.com/M-SungJoon/eiass-mcp/main/install.ps1 | iex
 # Claude Code / Claude Desktop / Codex CLI 중 이 PC에 설치된 것을 찾아 자동으로 eiass MCP 서버를 등록한다.
 # 성공하든 실패하든 마지막에 Enter를 눌러야 창이 닫힌다(더블클릭 실행 시 결과를 볼 수 있도록).
 #
-# 설치 폴더 구조 (v1.10.0부터):
+# 설치 폴더는 %LOCALAPPDATA%\Programs\EIASS MCP로 고정한다(v1.12.0부터):
 #   <설치 폴더>/
-#     install.ps1, install.bat
 #     .env                  ← VWorld 키. 업데이트해도 유지된다.
 #     .eiass_mcp_version
 #     mcp_server/           ← 배포본. 업데이트 때 이 폴더만 통째로 교체된다.
 #       mcp_server.exe
 #       _internal/...
+# 경로를 고정하는 이유:
+#   (1) 'irm | iex'로 실행하면 스크립트가 디스크에 없어서 $PSScriptRoot가 비어버린다.
+#       예전처럼 스크립트 위치를 설치 위치로 삼으면 이 방식 자체가 동작하지 않는다.
+#   (2) 등록 경로가 영구히 고정돼 업데이트해도 재등록이 필요 없다. 특히 Claude Desktop은
+#       설정 JSON에 경로를 직접 넣어야 해서, 경로가 바뀌면 사용자가 매번 손을 봐야 한다.
+#   (3) 사용자가 설치 폴더를 고르지 않아도 된다.
+#
 # v1.9.0까지는 <설치 폴더>/mcp_server.exe 단일 파일이었다(onefile). onefile은 실행할 때마다
 # exe 전체를 %TEMP%/_MEIxxxxxx에 풀고 정상 종료 시에만 지워서, 강제 종료가 잦은 MCP 서버
 # 특성상 임시 폴더가 무한정 쌓였다(실측 280개 20.7GB). 이 스크립트는 그 잔재도 청소한다.
 
 param(
-    [string]$InstallRoot = $PSScriptRoot,
+    [string]$InstallRoot,
     [switch]$SkipUpdateCheck
 )
 
@@ -74,14 +80,71 @@ function Clear-OrphanMeiDirs {
     }
 }
 
+# 이미 등록된 eiass MCP의 실행 경로에서 예전 설치 폴더를 역추적한다.
+# v1.9.0 이하: <설치폴더>\mcp_server.exe      → 설치폴더 = 부모
+# v1.10~1.11 : <설치폴더>\mcp_server\mcp_server.exe → 설치폴더 = 조부모
+function Get-RegisteredEiassCommand {
+    $configPath = Join-Path $env:USERPROFILE ".claude.json"
+    if (-not (Test-Path $configPath)) { return $null }
+    $raw = Get-Content $configPath -Raw
+    # ConvertFrom-Json을 쓰면 안 된다. Windows PowerShell 5.1의 파서는 실제 .claude.json
+    # 크기/구조를 감당하지 못하고 "':' 또는 '}'가 필요합니다"로 실패한다(실측). 그러면 예전
+    # 설치를 못 찾아 VWorld 키 이주가 조용히 건너뛰어진다. 그래서 텍스트에서 직접 뽑는다.
+    try {
+        $config = $raw | ConvertFrom-Json
+        if ($config.mcpServers.eiass.command) { return $config.mcpServers.eiass.command }
+    } catch {
+        # 아래 텍스트 추출로 넘어간다.
+    }
+    $idx = $raw.IndexOf('"eiass"')
+    if ($idx -lt 0) { return $null }
+    $match = [regex]::Match($raw.Substring($idx), '"command"\s*:\s*"([^"]*)"')
+    if (-not $match.Success) { return $null }
+    return ($match.Groups[1].Value -replace '\\\\', '\')
+}
+
+function Get-LegacyInstallRoot {
+    param([string]$CurrentRoot)
+    $command = Get-RegisteredEiassCommand
+    if (-not $command) { return $null }
+    $parent = Split-Path $command -Parent
+    if (-not $parent) { return $null }
+    if ((Split-Path $parent -Leaf) -eq "mcp_server") { $parent = Split-Path $parent -Parent }
+    if (-not $parent) { return $null }
+    # 이미 새 위치에 설치돼 있으면 이주할 것이 없다.
+    if ($parent.TrimEnd('\') -ieq $CurrentRoot.TrimEnd('\')) { return $null }
+    if (-not (Test-Path $parent)) { return $null }
+    return $parent
+}
+
 try {
-    # 배포본이 아직 없는 상태에서 이 스크립트만 받아 실행하는 경우도 지원해야 하므로,
-    # 폴더가 없으면 만들고 절대경로로 정규화한 뒤 진행한다.
-    if (-not $InstallRoot) { $InstallRoot = $PSScriptRoot }
+    # 설치 폴더는 고정한다. -InstallRoot로 덮어쓸 수는 있게 두되(테스트/특수 상황용),
+    # 평소에는 사용자가 위치를 고민할 일이 없어야 한다.
+    if (-not $InstallRoot) { $InstallRoot = Join-Path $env:LOCALAPPDATA "Programs\EIASS MCP" }
     if (-not (Test-Path $InstallRoot)) { New-Item -ItemType Directory -Path $InstallRoot -Force | Out-Null }
     $ExeDir = (Resolve-Path $InstallRoot).Path
     $AppDir = Join-Path $ExeDir "mcp_server"
     $ExePath = Join-Path $AppDir "mcp_server.exe"
+    Write-Host "설치 위치: $ExeDir`n"
+
+    # 예전 위치에 설치돼 있으면 VWorld 키를 먼저 가져온다. 사용자가 키를 다시 발급/입력하는
+    # 일이 없어야 한다. 예전 설치본 정리는 새 배포본이 자리를 잡은 뒤에 한다.
+    $legacyRoot = Get-LegacyInstallRoot -CurrentRoot $ExeDir
+    if ($legacyRoot) {
+        Write-Host "기존 설치를 발견했습니다: $legacyRoot"
+        $legacyEnv = Join-Path $legacyRoot ".env"
+        $newEnv = Join-Path $ExeDir ".env"
+        if ((Test-Path $legacyEnv) -and -not (Test-Path $newEnv)) {
+            Copy-Item $legacyEnv $newEnv -Force
+            Write-Host "  VWorld API 키(.env)를 새 위치로 옮겼습니다."
+        }
+        $legacyVersionFile = Join-Path $legacyRoot ".eiass_mcp_version"
+        $newVersionFile = Join-Path $ExeDir ".eiass_mcp_version"
+        if ((Test-Path $legacyVersionFile) -and -not (Test-Path $newVersionFile)) {
+            Copy-Item $legacyVersionFile $newVersionFile -Force
+        }
+        Write-Host ""
+    }
 
     # 옛 onefile 버전이 남긴 %TEMP%/_MEI 폴더 정리 — 업데이트 여부와 무관하게 매번 한다.
     Clear-OrphanMeiDirs
@@ -91,54 +154,51 @@ try {
     Get-ChildItem -LiteralPath $ExeDir -Directory -Filter "mcp_server.old*" -ErrorAction SilentlyContinue |
         ForEach-Object { Remove-Item $_.FullName -Recurse -Force -ErrorAction SilentlyContinue }
 
-    # 0) 버전 확인 + 자동 업데이트 — git 없이 GitHub API/raw 파일 URL만 사용한다.
-    # 업데이트가 필요한지 여부는 mcp_server_dist.zip의 최신 커밋 SHA로 판단하고(정확함),
-    # 사람이 보는 버전 번호는 저장소 루트의 VERSION 파일(예: "1.1.0")에서 가져온다.
-    # 두 값을 로컬 .eiass_mcp_version 파일에 "SHA<개행>버전" 두 줄로 저장해뒀다가
-    # 다음 실행 때 "현재 설치된 버전"으로 보여준다. 설치된 버전/Git 최신 버전은
-    # SkipUpdateCheck 여부와 무관하게 항상 화면에 표시한다.
+    # 0) 버전 확인 + 자동 업데이트 — git 없이 GitHub Releases API만 사용한다.
+    # 배포본(mcp_server_dist.zip)은 저장소에 커밋하지 않고 릴리스 자산으로 올린다. 41MB 바이너리를
+    # 커밋하면 git 히스토리에 영구히 쌓여(실측 22회 커밋에 .git 907MB) clone이 갈수록 무거워진다.
+    # 설치된 버전은 .eiass_mcp_version에 "태그<개행>버전"으로 남긴다. v1.11.0 이하가 남긴 파일에는
+    # 1행에 커밋 SHA가 들어 있는데, 어떤 태그와도 일치하지 않으므로 자연히 업데이트가 걸린다.
     $RepoOwner = "M-SungJoon"
     $RepoName = "eiass-mcp"
     $versionFile = Join-Path $ExeDir ".eiass_mcp_version"
     $ghHeaders = @{ "User-Agent" = "eiass-mcp-install-script" }
 
-    $localSha = $null
-    $localVersion = "알 수 없음(최초 설치 또는 이전 버전의 설치 스크립트로 설치됨)"
+    $localTag = $null
+    $localVersion = "알 수 없음(최초 설치)"
     if (Test-Path $versionFile) {
         $versionLines = @(Get-Content $versionFile)
-        if ($versionLines.Count -ge 1 -and $versionLines[0]) { $localSha = $versionLines[0].Trim() }
+        if ($versionLines.Count -ge 1 -and $versionLines[0]) { $localTag = $versionLines[0].Trim() }
         if ($versionLines.Count -ge 2 -and $versionLines[1]) { $localVersion = $versionLines[1].Trim() }
     }
-    $localShaShort = if ($localSha) { $localSha.Substring(0, [Math]::Min(7, $localSha.Length)) } else { "알 수 없음" }
-    Write-Host "현재 설치된 버전: $localVersion (commit $localShaShort)"
+    Write-Host "현재 설치된 버전: $localVersion"
 
     if (-not $SkipUpdateCheck) {
-        $latestSha = $null
+        $latestTag = $null
+        $latestVersion = "알 수 없음"
+        $downloadUrl = $null
+        $manifestUrl = $null
         try {
-            $apiUrl = "https://api.github.com/repos/$RepoOwner/$RepoName/commits?path=mcp_server_dist.zip&per_page=1"
-            $commits = Invoke-RestMethod -Uri $apiUrl -Headers $ghHeaders -TimeoutSec 10
-            $latestSha = $commits[0].sha
+            $apiUrl = "https://api.github.com/repos/$RepoOwner/$RepoName/releases/latest"
+            $release = Invoke-RestMethod -Uri $apiUrl -Headers $ghHeaders -TimeoutSec 15
+            $latestTag = $release.tag_name
+            $latestVersion = $latestTag -replace '^v', ''
+            foreach ($asset in $release.assets) {
+                if ($asset.name -eq "mcp_server_dist.zip") { $downloadUrl = $asset.browser_download_url }
+                if ($asset.name -eq "mcp_server_dist.zip.sha256") { $manifestUrl = $asset.browser_download_url }
+            }
+            Write-Host "배포된 최신 버전: $latestVersion"
+            if (-not $downloadUrl -or -not $manifestUrl) {
+                Write-Host "⚠ 최신 릴리스에 배포본 자산이 없습니다 — 기존 배포본으로 계속 진행합니다.`n"
+                $latestTag = $null
+            }
         } catch {
             Write-Host "⚠ 최신 버전 확인 실패(네트워크 문제일 수 있음) — 기존 배포본으로 계속 진행합니다.`n"
         }
 
-        $latestVersion = "알 수 없음"
-        if ($latestSha) {
-            try {
-                $versionUrl = "https://raw.githubusercontent.com/$RepoOwner/$RepoName/$latestSha/VERSION"
-                $latestVersion = (Invoke-RestMethod -Uri $versionUrl -Headers $ghHeaders -TimeoutSec 10).Trim()
-            } catch {
-                # VERSION 파일이 없던 옛 커밋일 수도 있음 — 버전 번호 표시만 못 할 뿐 업데이트 자체는 진행한다.
-            }
-            $latestShaShort = $latestSha.Substring(0, [Math]::Min(7, $latestSha.Length))
-            Write-Host "Git에 푸시된 최신 버전: $latestVersion (commit $latestShaShort)"
-        }
-
-        if ($latestSha) {
-            if (($latestSha -ne $localSha) -or (-not (Test-Path $ExePath))) {
-                Write-Host "새 버전 발견 — 배포본 다운로드 중... ($latestVersion / $latestSha)"
-                $downloadUrl = "https://raw.githubusercontent.com/$RepoOwner/$RepoName/$latestSha/mcp_server_dist.zip"
-                $manifestUrl = "https://raw.githubusercontent.com/$RepoOwner/$RepoName/$latestSha/mcp_server_dist.zip.sha256"
+        if ($latestTag) {
+            if (($latestTag -ne $localTag) -or (-not (Test-Path $ExePath))) {
+                Write-Host "새 버전 발견 — 배포본 다운로드 중... ($latestVersion)"
                 # 확장자가 반드시 .zip이어야 한다 — Expand-Archive는 그 외 확장자를 아예 거부한다
                 # (".zip.new"로 뒀다가 모든 업데이트가 실패했다).
                 $tmpZip = Join-Path $ExeDir "mcp_server_dist.download.zip"
@@ -188,8 +248,8 @@ try {
                         throw
                     }
 
-                    Set-Content -Path $versionFile -Value @($latestSha, $latestVersion) -Encoding utf8
-                    Write-Host "✅ 배포본을 최신 버전($latestVersion)으로 업데이트했습니다.`n"
+                    Set-Content -Path $versionFile -Value @($latestTag, $latestVersion) -Encoding utf8
+                    Write-Host "✅ 배포본을 최신 버전($latestVersion)으로 설치했습니다.`n"
                 } catch {
                     Write-Host "⚠ 업데이트 다운로드/교체 실패: $($_.Exception.Message)"
                     Write-Host "   (Claude Code/Codex가 실행 중이면 파일이 잠겨 있을 수 있습니다 — 완전히 종료한 뒤 다시 실행해보세요.)"
@@ -219,7 +279,7 @@ try {
     }
 
     if (-not (Test-Path $ExePath)) {
-        throw "mcp_server.exe를 찾을 수 없습니다: $ExePath (자동 업데이트도 실패했습니다. -SkipUpdateCheck 없이 다시 실행하거나 저장소에서 직접 받아주세요.)"
+        throw "배포본을 받지 못해 설치를 완료하지 못했습니다. 인터넷 연결을 확인한 뒤 다시 실행해 주세요."
     }
     $ExePath = (Resolve-Path $ExePath).Path
     Write-Host "대상 실행 파일: $ExePath`n"
@@ -235,6 +295,30 @@ try {
         } catch {
             Write-Host "⚠ 이전 버전 exe를 지우지 못했습니다(실행 중일 수 있음): $legacyExe`n"
         }
+    }
+
+    # 예전 위치의 배포본을 정리한다. 우리가 설치한 것(mcp_server 폴더 / 단일 exe)만 지우고
+    # 나머지(.env, 사용자가 넣어둔 파일 등)는 건드리지 않는다 — 사용자 폴더를 통째로 지우면
+    # 우리가 만들지 않은 파일까지 날아간다.
+    if ($legacyRoot) {
+        $removed = @()
+        $kept = $false
+        foreach ($item in @((Join-Path $legacyRoot "mcp_server"), (Join-Path $legacyRoot "mcp_server.exe"))) {
+            if (Test-Path $item) {
+                try {
+                    Remove-Item $item -Recurse -Force -ErrorAction Stop
+                    $removed += (Split-Path $item -Leaf)
+                } catch { $kept = $true }
+            }
+        }
+        if ($removed.Count -gt 0) {
+            Write-Host "🧹 예전 위치의 배포본을 정리했습니다: $legacyRoot ($($removed -join ', '))"
+        }
+        if ($kept) {
+            Write-Host "⚠ 예전 배포본 일부가 사용 중이라 남았습니다: $legacyRoot"
+            Write-Host "   Claude를 완전히 종료한 뒤 이 설치를 한 번 더 실행하면 정리됩니다."
+        }
+        Write-Host "   (예전 폴더의 .env 등 나머지 파일은 그대로 두었습니다.)`n"
     }
 
     # 1) VWorld API 키 (.env) — 대화형 콘솔에서만 물어보고, 아니면 건너뛴다.
@@ -293,7 +377,28 @@ try {
         Write-Host "ℹ Claude Desktop이 설치되어 있지 않은 것으로 보여 건너뜁니다.`n"
     }
 
+    # 5) 다음 업데이트용 실행 파일을 설치 폴더에 남긴다. 사용자가 처음 받은 .bat을 어디에 뒀는지
+    # 잊어버려도, 설치 폴더의 이 파일을 더블클릭하면 최신 버전으로 갱신된다. 내용은 웹에서 최신
+    # 스크립트를 받아 실행하는 것이라, 설치 로직이 고쳐지면 그것도 자동으로 반영된다.
+    $updaterPath = Join-Path $ExeDir "EIASS MCP 업데이트.bat"
+    $updaterBody = @(
+        '@echo off',
+        'chcp 65001 >nul',
+        'echo EIASS MCP 업데이트를 확인하는 중입니다...',
+        'echo.',
+        ('powershell -NoProfile -ExecutionPolicy Bypass -Command "irm https://raw.githubusercontent.com/' +
+         $RepoOwner + '/' + $RepoName + '/main/install.ps1 | iex"')
+    )
+    try {
+        Set-Content -Path $updaterPath -Value $updaterBody -Encoding oem
+    } catch {
+        # 부가 기능이라 실패해도 설치 자체는 성공으로 둔다.
+    }
+
     Write-Host "완료! Claude Code / Codex를 재시작하면 eiass 도구를 쓸 수 있습니다."
+    Write-Host ""
+    Write-Host "다음에 업데이트할 때는 아래 파일을 더블클릭하세요:"
+    Write-Host "  $updaterPath"
 } catch {
     Write-Host ""
     Write-Host "❌ 오류가 발생해 설치를 완료하지 못했습니다: $($_.Exception.Message)" -ForegroundColor Red
