@@ -96,11 +96,11 @@ function Write-Utf8NoBomText {
     [System.IO.File]::WriteAllText($Path, $Text, (New-Object System.Text.UTF8Encoding($false)))
 }
 
-function Get-RegisteredEiassCommand {
-    $configPath = Join-Path $env:USERPROFILE ".claude.json"
-    if (-not (Test-Path $configPath)) { return $null }
-    $raw = Read-Utf8Text -Path $configPath
-    # ConvertFrom-Json을 쓰면 안 된다. Windows PowerShell 5.1의 파서는 실제 .claude.json
+function Get-EiassCommandFromConfig {
+    param([string]$ConfigPath)
+    if (-not (Test-Path $ConfigPath)) { return $null }
+    $raw = Read-Utf8Text -Path $ConfigPath
+    # ConvertFrom-Json을 쓰면 안 된다. Windows PowerShell 5.1의 파서는 실제 설정 파일의
     # 크기/구조를 감당하지 못하고 "':' 또는 '}'가 필요합니다"로 실패한다(실측). 그러면 예전
     # 설치를 못 찾아 VWorld 키 이주가 조용히 건너뛰어진다. 그래서 텍스트에서 직접 뽑는다.
     try {
@@ -114,6 +114,27 @@ function Get-RegisteredEiassCommand {
     $match = [regex]::Match($raw.Substring($idx), '"command"\s*:\s*"([^"]*)"')
     if (-not $match.Success) { return $null }
     return ($match.Groups[1].Value -replace '\\\\', '\')
+}
+
+function Get-RegisteredEiassCommand {
+    # 예전 설치는 Claude Code(.claude.json)와 Claude Desktop(claude_desktop_config.json) 중
+    # 어디에 등록돼 있을지 모른다. 특히 터미널을 안 쓰는 사용자는 Desktop만 쓸 가능성이 높은데,
+    # .claude.json만 보면 그들의 예전 설치를 못 찾아 VWorld 키 이주가 통째로 건너뛰어진다.
+    # 우리가 설치했던 흔적(mcp_server\mcp_server.exe 또는 단일 mcp_server.exe)을 가리키는 값을
+    # 우선한다 — npx 같은 외부 명령이 아니라 실제 이주 대상 경로여야 하기 때문이다.
+    $configs = @(
+        (Join-Path $env:USERPROFILE ".claude.json"),
+        (Join-Path $env:APPDATA "Claude\claude_desktop_config.json")
+    )
+    $fallback = $null
+    foreach ($configPath in $configs) {
+        $command = Get-EiassCommandFromConfig -ConfigPath $configPath
+        if (-not $command) { continue }
+        $leaf = Split-Path $command -Leaf
+        if ($leaf -ieq "mcp_server.exe") { return $command }  # 우리가 설치한 배포본
+        if (-not $fallback) { $fallback = $command }
+    }
+    return $fallback
 }
 
 # Claude Desktop 설정에 eiass를 직접 등록한다.
