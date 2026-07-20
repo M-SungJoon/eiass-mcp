@@ -182,7 +182,13 @@ VWORLD_API_KEY=발급받은_키
 powershell -ExecutionPolicy Bypass -File install.ps1
 ```
 
-실행 후 Claude Code/Codex를 재시작하면 `eiass_*` 도구를 바로 쓸 수 있다. Claude Desktop은 CLI가 없어 자동 등록은 지원하지 않고, 실행 후 안내되는 JSON 스니펫을 `claude_desktop_config.json`에 직접 추가하면 된다.
+실행 후 Claude Code/Codex를 재시작하면 `eiass_*` 도구를 바로 쓸 수 있다. **Claude Desktop도 자동으로 등록된다** — `claude_desktop_config.json`을 직접 수정할 필요가 없다.
+
+Desktop 설정 파일에는 `mcpServers` 말고 앱이 관리하는 상태(`preferences` 등)도 들어 있어서, 다음 순서로 안전하게 처리한다: 백업 → `eiass` 항목만 추가/교체 → 다시 읽어서 **최상위 키와 기존 MCP 서버가 모두 살아있는지 검증** → 하나라도 어긋나면 백업으로 되돌리고 수동 안내로 전환. 파일이 손상돼 파싱조차 안 되면 아예 건드리지 않는다.
+
+이 과정에는 Windows PowerShell 5.1의 함정이 두 개 있어서 그렇게 짜여 있다. (1) `Get-Content -Raw`는 UTF-8 파일을 시스템 ANSI 코드페이지로 디코딩해 한글을 깨뜨리고, 그 깨진 문자열은 JSON 파싱에 실패한다(실측: 6,326바이트 파일이 5,954자로 읽혀 실패, 올바르게 읽으면 5,846자). 그래서 `[System.IO.File]::ReadAllText(..., UTF8)`로 읽는다. (2) `ConvertTo-Json`의 기본 깊이는 **2**라서, 깊이 6인 이 파일을 그냥 저장하면 하위 구조가 `System.Object[]` 문자열로 뭉개진다. 그래서 `-Depth 100`을 명시하고, 직렬화 결과에 손상 흔적이 있으면 저장하지 않는다.
+
+Claude Desktop이 실행 중이면 종료할 때 앱이 설정을 다시 쓰면서 방금 넣은 등록을 덮어쓸 수 있다. 그래서 실행 중이면 안내를 띄우고, 그런 일이 생겨도 설치를 한 번 더 실행하면 복구된다.
 
 **git 없이도 최신 버전으로 갱신된다.** 설치 폴더에 생긴 **`EIASS MCP 업데이트.bat`을 더블클릭**하면 된다(처음 받은 `install.bat`을 다시 실행해도 똑같다). GitHub Releases API로 최신 릴리스를 확인해 `.eiass_mcp_version`에 기록된 태그와 비교하고, 다르면 릴리스 자산을 받아 SHA-256을 검증한 뒤 `mcp_server` 폴더를 통째로 교체한다 — git clone이나 pull이 전혀 필요 없다. 저장소를 push해도 각 사용자 PC에 자동 반영되지는 않으므로 **업데이트를 받으려면 이 파일을 다시 실행해야 한다**(완전 자동 업데이트는 아님).
 

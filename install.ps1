@@ -83,10 +83,23 @@ function Clear-OrphanMeiDirs {
 # 이미 등록된 eiass MCP의 실행 경로에서 예전 설치 폴더를 역추적한다.
 # v1.9.0 이하: <설치폴더>\mcp_server.exe      → 설치폴더 = 부모
 # v1.10~1.11 : <설치폴더>\mcp_server\mcp_server.exe → 설치폴더 = 조부모
+# JSON 설정 파일은 반드시 이걸로 읽는다. Get-Content -Raw는 UTF-8 파일을 시스템 ANSI
+# 코드페이지로 디코딩해서 한글을 깨뜨리고, 그 깨진 문자열은 ConvertFrom-Json에서 파싱 실패한다
+# (실측: claude_desktop_config.json 6326바이트가 5954자로 읽혀 파싱 실패, 올바르게 읽으면 5846자).
+function Read-Utf8Text {
+    param([string]$Path)
+    return [System.IO.File]::ReadAllText($Path, [System.Text.Encoding]::UTF8)
+}
+
+function Write-Utf8NoBomText {
+    param([string]$Path, [string]$Text)
+    [System.IO.File]::WriteAllText($Path, $Text, (New-Object System.Text.UTF8Encoding($false)))
+}
+
 function Get-RegisteredEiassCommand {
     $configPath = Join-Path $env:USERPROFILE ".claude.json"
     if (-not (Test-Path $configPath)) { return $null }
-    $raw = Get-Content $configPath -Raw
+    $raw = Read-Utf8Text -Path $configPath
     # ConvertFrom-Json을 쓰면 안 된다. Windows PowerShell 5.1의 파서는 실제 .claude.json
     # 크기/구조를 감당하지 못하고 "':' 또는 '}'가 필요합니다"로 실패한다(실측). 그러면 예전
     # 설치를 못 찾아 VWorld 키 이주가 조용히 건너뛰어진다. 그래서 텍스트에서 직접 뽑는다.
@@ -101,6 +114,63 @@ function Get-RegisteredEiassCommand {
     $match = [regex]::Match($raw.Substring($idx), '"command"\s*:\s*"([^"]*)"')
     if (-not $match.Success) { return $null }
     return ($match.Groups[1].Value -replace '\\\\', '\')
+}
+
+# Claude Desktop 설정에 eiass를 직접 등록한다.
+# 이 파일에는 mcpServers 말고 앱이 관리하는 상태(preferences 등)도 들어 있어서, 잘못 쓰면 앱
+# 설정을 통째로 날린다. 그래서 (1) 백업하고 (2) eiass 항목만 손대고 (3) 쓴 결과를 다시 읽어
+# 최상위 키와 기존 서버가 모두 살아있는지 확인한 뒤 (4) 하나라도 어긋나면 백업으로 되돌린다.
+# 파싱조차 안 되면 아예 건드리지 않고 수동 안내로 넘어간다.
+function Register-ClaudeDesktop {
+    param([string]$ConfigPath, [string]$ExePath)
+
+    if (-not (Test-Path $ConfigPath)) {
+        # 설정 파일이 없으면 새로 만든다(앱 상태가 없으므로 위험하지 않다).
+        Write-Utf8NoBomText -Path $ConfigPath -Text (@{ mcpServers = @{ eiass = @{ command = $ExePath } } } |
+            ConvertTo-Json -Depth 100)
+        return 'created'
+    }
+
+    try {
+        $config = Read-Utf8Text -Path $ConfigPath | ConvertFrom-Json
+    } catch {
+        return 'unparsable'
+    }
+
+    $keysBefore = @($config.PSObject.Properties.Name)
+    $serversBefore = if ($config.mcpServers) { @($config.mcpServers.PSObject.Properties.Name) } else { @() }
+
+    $backup = "$ConfigPath.bak"
+    Copy-Item $ConfigPath $backup -Force
+
+    try {
+        if (-not $config.mcpServers) {
+            $config | Add-Member -NotePropertyName 'mcpServers' -NotePropertyValue (New-Object PSObject) -Force
+        }
+        $config.mcpServers | Add-Member -NotePropertyName 'eiass' `
+            -NotePropertyValue ([PSCustomObject]@{ command = $ExePath }) -Force
+
+        # -Depth 100이 없으면 안 된다. Windows PowerShell 5.1의 ConvertTo-Json은 기본 깊이가 2라
+        # 그 아래 구조가 "System.Object[]" 문자열로 뭉개진다(이 설정 파일의 실제 깊이는 6).
+        $json = $config | ConvertTo-Json -Depth 100
+        if ($json -match 'System\.(Object|Management)') { throw "직렬화 중 구조가 손상되었습니다." }
+        Write-Utf8NoBomText -Path $ConfigPath -Text $json
+
+        $verify = Read-Utf8Text -Path $ConfigPath | ConvertFrom-Json
+        $keysAfter = @($verify.PSObject.Properties.Name)
+        $serversAfter = @($verify.mcpServers.PSObject.Properties.Name)
+        foreach ($key in $keysBefore) {
+            if ($keysAfter -notcontains $key) { throw "최상위 항목이 사라졌습니다: $key" }
+        }
+        foreach ($server in $serversBefore) {
+            if ($serversAfter -notcontains $server) { throw "MCP 서버 등록이 사라졌습니다: $server" }
+        }
+        if ($verify.mcpServers.eiass.command -ne $ExePath) { throw "eiass 경로가 기록되지 않았습니다." }
+    } catch {
+        Copy-Item $backup $ConfigPath -Force   # 원복
+        return "failed:$($_.Exception.Message)"
+    }
+    return 'updated'
 }
 
 function Get-LegacyInstallRoot {
@@ -371,14 +441,32 @@ try {
         Write-Host "⚠ codex CLI를 찾지 못해 Codex 등록을 건너뜁니다.`n"
     }
 
-    # 4) Claude Desktop — claude_desktop_config.json은 앱마다 실제 구조가 달라(단순 mcpServers만
-    # 있는 경우도, 앱 내부 상태까지 같이 들어있는 경우도 있음) 자동으로 덮어쓰면 앱 상태를 깨뜨릴 위험이
-    # 있다. 그래서 자동 수정 대신 직접 추가할 스니펫만 안내한다.
+    # 4) Claude Desktop — 설정 JSON에 직접 등록한다. 터미널도 어려워하는 사용자에게 JSON을
+    # 손으로 고치게 할 수는 없다. 실패하면 기존 파일을 되돌리고 수동 안내로 넘어간다.
     $desktopConfigDir = Join-Path $env:APPDATA "Claude"
     $desktopConfigPath = Join-Path $desktopConfigDir "claude_desktop_config.json"
     if (Test-Path $desktopConfigDir) {
-        Write-Host "ℹ Claude Desktop을 쓴다면 아래 항목을 $desktopConfigPath 의 `"mcpServers`" 안에 직접 추가하고 앱을 재시작하세요:"
-        Write-Host "    `"eiass`": { `"command`": `"$($ExePath -replace '\\','\\')`" }`n"
+        $desktopResult = Register-ClaudeDesktop -ConfigPath $desktopConfigPath -ExePath $ExePath
+        switch -Wildcard ($desktopResult) {
+            'updated' { Write-Host "✅ Claude Desktop에 등록 완료`n" }
+            'created' { Write-Host "✅ Claude Desktop 설정을 새로 만들어 등록했습니다`n" }
+            default {
+                if ($desktopResult -eq 'unparsable') {
+                    Write-Host "⚠ Claude Desktop 설정 파일을 읽지 못해 자동 등록을 건너뜁니다(파일은 그대로 두었습니다)."
+                } else {
+                    Write-Host "⚠ Claude Desktop 자동 등록 실패 — 원래 설정으로 되돌렸습니다."
+                    Write-Host "   ($($desktopResult -replace '^failed:', ''))"
+                }
+                Write-Host "   아래 항목을 $desktopConfigPath 의 `"mcpServers`" 안에 직접 추가하세요:"
+                Write-Host "     `"eiass`": { `"command`": `"$($ExePath -replace '\\','\\')`" }`n"
+            }
+        }
+        if (Get-Process 'Claude' -ErrorAction SilentlyContinue) {
+            # 실행 중인 앱이 종료할 때 자기 상태를 이 파일에 다시 쓰면서 방금 넣은 등록을
+            # 덮어쓸 수 있다. 그때는 앱을 끄고 한 번 더 실행하면 된다.
+            Write-Host "⚠ Claude Desktop이 실행 중입니다. 완전히 종료했다가 다시 켜세요."
+            Write-Host "   (종료 시 앱이 설정을 덮어써서 등록이 사라지면, 이 설치를 한 번 더 실행하면 됩니다.)`n"
+        }
     } else {
         Write-Host "ℹ Claude Desktop이 설치되어 있지 않은 것으로 보여 건너뜁니다.`n"
     }
