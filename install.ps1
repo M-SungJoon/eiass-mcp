@@ -118,6 +118,12 @@ function Get-LegacyInstallRoot {
 }
 
 try {
+    Write-Host ""
+    Write-Host "=========================================="
+    Write-Host "  EIASS MCP 설치"
+    Write-Host "=========================================="
+    Write-Host ""
+
     # 설치 폴더는 고정한다. -InstallRoot로 덮어쓸 수는 있게 두되(테스트/특수 상황용),
     # 평소에는 사용자가 위치를 고민할 일이 없어야 한다.
     if (-not $InstallRoot) { $InstallRoot = Join-Path $env:LOCALAPPDATA "Programs\EIASS MCP" }
@@ -380,12 +386,15 @@ try {
     # 5) 다음 업데이트용 실행 파일을 설치 폴더에 남긴다. 사용자가 처음 받은 .bat을 어디에 뒀는지
     # 잊어버려도, 설치 폴더의 이 파일을 더블클릭하면 최신 버전으로 갱신된다. 내용은 웹에서 최신
     # 스크립트를 받아 실행하는 것이라, 설치 로직이 고쳐지면 그것도 자동으로 반영된다.
+    # 배치 파일 본문은 반드시 ASCII로만 쓴다. chcp 65001이 켜진 상태에서 비ASCII 문자가 있으면
+    # cmd가 파일을 바이트 오프셋으로 되읽는 과정에서 위치가 어긋나 주석 조각을 명령으로 실행한다
+    # (실제로 한글 주석 때문에 "'...'은(는) 내부 또는 외부 명령이 아닙니다" 오류가 났다).
+    # 한글 안내는 전부 install.ps1이 출력한다. 파일 이름은 cmd가 파싱하지 않으므로 한글이어도 된다.
     $updaterPath = Join-Path $ExeDir "EIASS MCP 업데이트.bat"
     $updaterBody = @(
         '@echo off',
         'chcp 65001 >nul',
-        'echo EIASS MCP 업데이트를 확인하는 중입니다...',
-        'echo.',
+        'title EIASS MCP',
         ('powershell -NoProfile -ExecutionPolicy Bypass -Command "irm https://raw.githubusercontent.com/' +
          $RepoOwner + '/' + $RepoName + '/main/install.ps1 | iex"')
     )
