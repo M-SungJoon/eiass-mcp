@@ -21,7 +21,11 @@ REM  logic reach everyone -- previously each user kept a stale local copy that
 REM  never updated itself.
 REM ---------------------------------------------------------------------------
 
-powershell -NoProfile -ExecutionPolicy Bypass -Command "irm https://raw.githubusercontent.com/M-SungJoon/eiass-mcp/main/install.ps1 | iex"
+REM  TrimStart is required, not cosmetic: install.ps1 is UTF-8 *with a BOM* (PowerShell
+REM  5.1 needs that to read its Korean correctly), and irm hands the BOM through as the
+REM  first character of the string. Piping that straight to iex makes the opening "#"
+REM  comment parse as "<BOM>#", which PowerShell reports as an unknown command.
+powershell -NoProfile -ExecutionPolicy Bypass -Command "iex ((irm https://raw.githubusercontent.com/M-SungJoon/eiass-mcp/main/install.ps1).TrimStart([char]0xFEFF))"
 
 if errorlevel 1 (
     echo.

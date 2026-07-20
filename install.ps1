@@ -395,8 +395,11 @@ try {
         '@echo off',
         'chcp 65001 >nul',
         'title EIASS MCP',
-        ('powershell -NoProfile -ExecutionPolicy Bypass -Command "irm https://raw.githubusercontent.com/' +
-         $RepoOwner + '/' + $RepoName + '/main/install.ps1 | iex"')
+        # TrimStart로 BOM을 떼야 한다. 이 스크립트는 UTF-8 BOM 파일이고(PS 5.1이 한글을 제대로
+        # 읽으려면 필요), irm은 BOM을 문자열 첫 글자로 그대로 넘겨준다. 그대로 iex에 넘기면
+        # 첫 줄 주석이 "<BOM>#"으로 파싱돼 알 수 없는 명령 오류가 난다.
+        ('powershell -NoProfile -ExecutionPolicy Bypass -Command "iex ((irm https://raw.githubusercontent.com/' +
+         $RepoOwner + '/' + $RepoName + '/main/install.ps1).TrimStart([char]0xFEFF))"')
     )
     try {
         Set-Content -Path $updaterPath -Value $updaterBody -Encoding oem
