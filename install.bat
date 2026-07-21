@@ -21,6 +21,18 @@ REM  logic reach everyone -- previously each user kept a stale local copy that
 REM  never updated itself.
 REM ---------------------------------------------------------------------------
 
+REM  ==== Optional: bundle your VWorld API key ====================================
+REM  Fill in your key on the line below (remove "REM " and the spaces) BEFORE you
+REM  hand this file out. Then users are set up with the key automatically and never
+REM  have to enter it. install.ps1 reads EIASS_VWORLD_API_KEY and writes the .env.
+REM
+REM  Keep the key ONLY in this hand-distributed copy. Do NOT commit it or upload it
+REM  anywhere public -- this repo is public, and a leaked VWorld key can be abused
+REM  or revoked. One shared key also means one shared quota across all your users.
+REM
+REM  set EIASS_VWORLD_API_KEY=PUT-YOUR-KEY-HERE
+REM  ==============================================================================
+
 REM  TrimStart is required, not cosmetic: install.ps1 is UTF-8 *with a BOM* (PowerShell
 REM  5.1 needs that to read its Korean correctly), and irm hands the BOM through as the
 REM  first character of the string. Piping that straight to iex makes the opening "#"

@@ -442,13 +442,21 @@ try {
         Write-Host "   (예전 폴더의 .env 등 나머지 파일은 그대로 두었습니다.)`n"
     }
 
-    # 1) VWorld API 키 (.env) — 대화형 콘솔에서만 물어보고, 아니면 건너뛴다.
-    # exe 폴더가 아니라 설치 폴더에 둔다. 업데이트가 mcp_server 폴더를 통째로 갈아끼우므로
-    # 그 안에 두면 키가 매번 날아간다(서버는 두 위치를 모두 찾는다).
+    # 1) VWorld API 키 (.env) — exe 폴더가 아니라 설치 폴더에 둔다. 업데이트가 mcp_server
+    # 폴더를 통째로 갈아끼우므로 그 안에 두면 키가 매번 날아간다(서버는 두 위치를 모두 찾는다).
+    # 키를 얻는 순서: (1) 환경변수 EIASS_VWORLD_API_KEY → (2) 대화형 입력.
+    # 배포자가 나눠주는 install.bat에 자기 키를 넣어두면, 그 키가 환경변수로 넘어와 사용자는
+    # 아무것도 입력하지 않아도 된다. install.ps1은 공개 raw URL로 받아가므로 여기에 키를 절대
+    # 넣지 않는다 — 키는 배포자가 직접 나눠주는 install.bat에만 담긴다.
     $envPath = Join-Path $ExeDir ".env"
     if (-not (Test-Path $envPath)) {
         $key = $null
-        if ([Environment]::UserInteractive -and -not ([Console]::IsInputRedirected)) {
+        $bundledKey = $env:EIASS_VWORLD_API_KEY
+        if ($bundledKey) { $bundledKey = $bundledKey.Trim() }
+        if ($bundledKey) {
+            $key = $bundledKey
+            Write-Host "설치 파일에 포함된 VWorld API 키를 사용합니다."
+        } elseif ([Environment]::UserInteractive -and -not ([Console]::IsInputRedirected)) {
             Write-Host "지오코딩/보호구역 조회에 VWorld API 키가 필요합니다 (https://www.vworld.kr/dev/v4api.do 에서 무료 발급)."
             try { $key = Read-Host "VWorld API 키 입력 (나중에 하려면 Enter)" } catch { $key = $null }
         }
