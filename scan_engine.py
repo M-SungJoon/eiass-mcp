@@ -79,6 +79,15 @@ class ScanRunner:
         try:
             if not job['snapshot_complete']:
                 self.store.update(job_id, status='discovering', phase='candidate_snapshot')
+                # 후보 수집은 수천 건이면 수십 개의 순차 요청이라 오래 걸린다. 페이지마다 heartbeat를
+                # 갱신해 "살아있음 + 지금까지 N건 수집"을 상태에 남기고(안 그러면 checked:0으로 멈춘
+                # 것처럼 보인다), 취소 요청도 페이지 사이에 반영되게 한다.
+                disco_meta = dict(job['meta'])
+
+                def _on_discovery_progress(found):
+                    disco_meta['discovery_count'] = found
+                    self.store.update(job_id, phase='candidate_snapshot', meta=disco_meta)
+
                 date_filter_exclusions = []
                 candidates = core.search_projects(
                     payload.get('keyword', ''), type_codes=payload.get('type_codes'),
@@ -87,10 +96,11 @@ class ScanRunner:
                     progress_status=payload.get('progress_status', ''),
                     climate_filter=payload.get('climate_filter', ''), biz_gubun=payload.get('biz_gubun', ''),
                     progress_stage_keys=payload.get('progress_stage_keys'),
-                    date_filter_exclusions=date_filter_exclusions)
-                meta = job['meta']
-                meta['date_filter_exclusions'] = date_filter_exclusions
-                self.store.save_candidates(job_id, candidates, meta=meta)
+                    date_filter_exclusions=date_filter_exclusions,
+                    should_cancel=lambda: self.store.cancel_requested(job_id),
+                    on_progress=_on_discovery_progress)
+                disco_meta['date_filter_exclusions'] = date_filter_exclusions
+                self.store.save_candidates(job_id, candidates, meta=disco_meta)
             self.store.update(job_id, status='running', phase='document_scan' if kind == 'document' else 'spatial_scan')
             pending = self.store.candidates(job_id, only_pending=True)
             batch_size = int(payload['batch_size'])
@@ -161,6 +171,7 @@ def document_status(store, job_id, include_results=False, offset=0, limit=100):
               'refinement_hints': list(dict.fromkeys(filter(None, job['meta'].get('refinement_hints', [])))),
               'audit_samples': job['meta'].get('audit_samples', []),
               'date_filter_exclusions': job['meta'].get('date_filter_exclusions', []),
+              'discovery_count': job['meta'].get('discovery_count'),
               'error': job['error'], 'current_phase': job['current_phase'],
               'updated_at': job['updated_at'], 'heartbeat_at': job['heartbeat_at'], 'resume_count': job['resume_count']}
     if include_results:
@@ -183,6 +194,7 @@ def spatial_status(store, job_id, include_results=False, offset=0, limit=100):
               'match_count': counts.get('match', 0), 'geocode_failure_count': counts.get('geocode_failure', 0),
               'spatial_failure_count': counts.get('spatial_failure', 0), 'error': job['error'],
               'date_filter_exclusions': job['meta'].get('date_filter_exclusions', []),
+              'discovery_count': job['meta'].get('discovery_count'),
               'current_phase': job['current_phase'], 'updated_at': job['updated_at'],
               'heartbeat_at': job['heartbeat_at'], 'resume_count': job['resume_count']}
     if include_results:

@@ -48,7 +48,7 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 # 저장소 루트 VERSION 파일과 항상 같은 값으로 맞춰서 커밋할 것(버전 두 곳 중복 관리).
 # 어긋난 채로 커밋되지 않도록 build_mcp.py가 빌드 시작 전에 두 값을 대조한다.
-__version__ = '1.11.0'
+__version__ = '1.12.0'
 
 REQUEST_TIMEOUT = (8, 30)
 
@@ -714,7 +714,8 @@ def _passes_extra_filters(item, consult_date_from=None, consult_date_to=None, pr
 
 def search_projects(keyword='', type_codes=None, agency_code='', max_pages=0, session=None,
                      consult_date_from=None, consult_date_to=None, progress_status='', climate_filter='',
-                     progress_stage_keys=None, biz_gubun='', date_filter_exclusions=None):
+                     progress_stage_keys=None, biz_gubun='', date_filter_exclusions=None,
+                     should_cancel=None, on_progress=None):
     """EIASS 사업 검색. 원본 앱(run_search)의 협의완료일 범위/진행상태/기후변화영향평가/
     진행구분/사업유형(biz_gubun) 필터를 그대로 지원한다.
 
@@ -842,6 +843,10 @@ def search_projects(keyword='', type_codes=None, agency_code='', max_pages=0, se
             page_no += 1
             if max_pages and max_pages > 0 and page_no > max_pages:
                 break
+            # 후보가 수천 건이면 이 루프가 평가종류 5개 × 수십 페이지의 순차 HTTP 요청이 된다.
+            # 취소 확인과 진행 보고를 페이지마다 하지 않으면, 이 단계 전체가 하나의 긴 블로킹
+            # 호출이 되어 job heartbeat가 얼어붙고(=멈춘 것처럼 보임) 취소도 먹지 않는다.
+            _check_cancelled(should_cancel)
             payload['currentPage'] = str(page_no)
             res = s.post(SEARCH_API_URL, data=payload, headers=headers, timeout=REQUEST_TIMEOUT, verify=False)
             if res.status_code != 200:
@@ -919,6 +924,8 @@ def search_projects(keyword='', type_codes=None, agency_code='', max_pages=0, se
             if len(rows) >= 100 and new_on_page == 0:
                 raise EiassError(
                     f'EIASS 검색 페이지에서 새 후보가 없어 진행을 중단했습니다 (평가종류={t}, 페이지={page_no}).')
+            if on_progress:
+                on_progress(len(results))  # 지금까지 모은 후보 수 — heartbeat 갱신 + 진행 표시용
             if len(rows) < 100:
                 break
     return results

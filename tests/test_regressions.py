@@ -306,5 +306,50 @@ class RetrySessionTests(unittest.TestCase):
         self.assertEqual(state['hits'], 1)
 
 
+class DiscoveryProgressTests(unittest.TestCase):
+    """후보 수집(discovery) 단계가 페이지마다 진행을 보고하고 취소를 반영하는지 검증한다.
+
+    이게 없으면 후보가 수천 건일 때 이 단계가 하나의 긴 블로킹 호출이 되어 job heartbeat가
+    얼어붙고(checked:0으로 멈춘 것처럼 보임) 취소도 먹지 않는다(실제 사용자가 겪은 증상).
+    """
+
+    def _page(self, n_rows, type_code, start_id):
+        trs = ''.join(
+            f'<tr><td class="title"><a href="view(\'v{type_code}\',\'E{start_id + i}\',\'r{start_id + i}\')">사업{start_id + i}</a></td>'
+            f'<td class="td_prog">(완료)</td></tr>'
+            for i in range(n_rows))
+        return _Response(f'<table class="disTm"><tbody>{trs}</tbody></table>')
+
+    def _session(self, cancel_flag=None):
+        outer = self
+
+        class FakeSession:
+            def get(self, *a, **k):
+                return _Response('<html></html>')
+
+            def post(self, url, **k):
+                page = int(k['data']['currentPage'])
+                if cancel_flag is not None and page >= 2:
+                    cancel_flag['flag'] = True   # 2페이지부터 취소 요청 — full 페이지라 안 멈추면 무한 루프
+                    return outer._page(100, 'S', page * 1000)
+                # 3 full pages then a short page -> 310 candidates, 4 pages
+                return outer._page(100 if page <= 3 else 10, 'S', page * 1000)
+
+        return FakeSession()
+
+    def test_on_progress_is_called_per_page_with_running_total(self):
+        seen = []
+        results = core.search_projects('테스트', type_codes=['S'], session=self._session(),
+                                       on_progress=lambda found: seen.append(found))
+        self.assertEqual(len(results), 310)
+        self.assertEqual(seen, [100, 200, 300, 310])   # 페이지마다 누적 후보 수
+
+    def test_should_cancel_interrupts_discovery(self):
+        flag = {'flag': False}
+        with self.assertRaises(core.ScanCancelled):
+            core.search_projects('테스트', type_codes=['S'], session=self._session(cancel_flag=flag),
+                                 should_cancel=lambda: flag['flag'])
+
+
 if __name__ == '__main__':
     unittest.main()
