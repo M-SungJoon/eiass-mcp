@@ -26,6 +26,7 @@ import threading
 import time
 import urllib.parse
 from collections import OrderedDict
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import date, datetime
 import multiprocessing
 
@@ -35,7 +36,8 @@ from bs4 import BeautifulSoup
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 from config import (DETAIL_CACHE_MAX_ITEMS, DETAIL_CACHE_TTL_SECONDS, DOC_CACHE_MAX_CHARS,
-                    DOC_CACHE_TTL_SECONDS, HEALTH_CACHE_TTL_SECONDS, PDF_EXTRACT_TIMEOUT_SECONDS,
+                    DOC_CACHE_TTL_SECONDS, DOC_DOWNLOAD_CONCURRENCY, DOC_DOWNLOAD_RETRY_TOTAL,
+                    HEALTH_CACHE_TTL_SECONDS, PDF_EXTRACT_TIMEOUT_SECONDS,
                     PDF_MAX_BYTES, PDF_MAX_PAGES)
 from pdf_worker import worker_entry
 
@@ -48,7 +50,7 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 # 저장소 루트 VERSION 파일과 항상 같은 값으로 맞춰서 커밋할 것(버전 두 곳 중복 관리).
 # 어긋난 채로 커밋되지 않도록 build_mcp.py가 빌드 시작 전에 두 값을 대조한다.
-__version__ = '1.13.0'
+__version__ = '1.14.0'
 
 REQUEST_TIMEOUT = (8, 30)
 
@@ -465,7 +467,7 @@ def _validate_paging(offset, max_candidates):
         raise EiassError('max_candidates는 1 이상의 정수여야 합니다.')
 
 
-def _session(retry=True):
+def _session(retry=True, retry_total=3, pool_maxsize=10):
     """조회용 세션. 기본적으로 일시적 실패를 재시도한다.
 
     EIASS는 장애가 아니어도 느려질 때가 있는데, 재시도가 없으면 타임아웃 한 번에 그 항목이
@@ -473,23 +475,101 @@ def _session(retry=True):
     요청은 전부 조회(읽기 전용)라 POST(검색 API)까지 재시도해도 부작용이 없다.
 
     retry=False는 헬스체크 전용이다 — 진단은 "지금 이 순간" 상태를 재시도 없이 봐야 한다.
+    retry_total은 재시도 횟수(대량 문서 다운로드는 1로 낮춰 빨리 실패·건너뛰기).
+    pool_maxsize는 커넥션 풀 크기(동시 다운로드 K개면 최소 K여야 요청이 직렬화되지 않는다).
     """
     s = requests.Session()
-    if retry:
-        retries = Retry(
-            total=3,
-            connect=3,
-            read=3,                       # 읽기 타임아웃(= 느린 응답)도 재시도 대상
-            status=3,
-            status_forcelist=(500, 502, 503, 504),
-            allowed_methods=frozenset(['GET', 'POST']),
-            backoff_factor=0.5,           # 0.5s → 1s → 2s
-            raise_on_status=False,
-        )
-        adapter = HTTPAdapter(max_retries=retries)
-        s.mount('https://', adapter)
-        s.mount('http://', adapter)
+    retries = Retry(
+        total=retry_total,
+        connect=retry_total,
+        read=retry_total,                 # 읽기 타임아웃(= 느린 응답)도 재시도 대상
+        status=retry_total,
+        status_forcelist=(500, 502, 503, 504),
+        allowed_methods=frozenset(['GET', 'POST']),
+        backoff_factor=0.5,               # 0.5s → 1s → 2s
+        raise_on_status=False,
+    ) if retry else Retry(total=0, read=0, connect=0, status=0, raise_on_status=False)
+    adapter = HTTPAdapter(max_retries=retries, pool_maxsize=pool_maxsize, pool_connections=pool_maxsize)
+    s.mount('https://', adapter)
+    s.mount('http://', adapter)
     return s
+
+
+def _map_concurrent(items, fn, max_workers, should_cancel=None):
+    """items를 스레드 풀에서 동시 처리한다. 반환값은 입력 순서를 보존한다.
+
+    다운로드는 네트워크 대기(I/O)라 스레드로 병렬화하면 대기 시간이 겹쳐 처리량이 크게 는다.
+    취소는 best-effort다 — 이미 실행 중인 스레드는 각자의 타임아웃으로 끝나고, 남은 작업은
+    제출을 취소한다. 여기서 warm하는 캐시는 뒤따르는 순차 매칭 루프가 읽으므로, 개별 실패는
+    삼키고 그 루프가 다시 시도/기록하게 둔다.
+    """
+    items = list(items)
+    results = [None] * len(items)
+    if not items:
+        return results
+    workers = max(1, min(max_workers, len(items)))
+    with ThreadPoolExecutor(max_workers=workers, thread_name_prefix='eiass-dl') as pool:
+        future_to_index = {pool.submit(fn, item): i for i, item in enumerate(items)}
+        for future in as_completed(future_to_index):
+            if should_cancel and should_cancel():
+                for pending in future_to_index:
+                    pending.cancel()
+                break
+            try:
+                results[future_to_index[future]] = future.result()
+            except Exception:
+                results[future_to_index[future]] = None
+    return results
+
+
+def _prefetch_batch_documents(batch, stages, doc_title_contains, session,
+                              should_cancel=None, max_workers=None):
+    """한 배치가 열어볼 모든 PDF를 동시에 내려받아 텍스트 캐시를 미리 데운다.
+
+    이걸 먼저 돌려두면 뒤따르는 순차 매칭 루프의 _get_full_document_text 호출이 전부 캐시에
+    적중해, 매칭 로직은 그대로 두고 다운로드/추출만 병렬화하는 효과를 낸다.
+    """
+    if max_workers is None:
+        max_workers = DOC_DOWNLOAD_CONCURRENCY
+    if max_workers <= 1:
+        return  # 병렬화 꺼짐 — 기존 순차 경로 그대로
+
+    # 1) 후보 상세를 동시에 받아 파일 목록을 파악한다(상세 캐시도 함께 데운다).
+    def _load_detail(item):
+        try:
+            return get_project_detail(item['view_type'], item['eia_cd'], item['revirpt_seq'],
+                                       session=session, use_cache=True)
+        except Exception:
+            return None
+    details = _map_concurrent(batch, _load_detail, max_workers, should_cancel)
+    if should_cancel and should_cancel():
+        return
+
+    # 2) 열어볼 PDF의 file_seq를 중복 없이 모은다.
+    file_seqs = []
+    seen = set()
+    for detail in details:
+        if not detail:
+            continue
+        for stage in stages:
+            raw_files = [f for cat_files in (detail['stage_docs'].get(stage) or {}).values()
+                         for f in cat_files if f.get('is_pdf')]
+            for f in _filter_files_by_title(raw_files, doc_title_contains):
+                seq = f.get('seq')
+                if seq and seq not in seen:
+                    seen.add(seq)
+                    file_seqs.append(seq)
+    if not file_seqs:
+        return
+
+    # 3) 동시에 다운로드+추출해 캐시를 데운다. 대량 다운로드용 fast-fail 세션 + K 크기 커넥션 풀.
+    dl_session = _session(retry_total=DOC_DOWNLOAD_RETRY_TOTAL, pool_maxsize=max_workers)
+    try:
+        _map_concurrent(file_seqs,
+                        lambda seq: _get_full_document_text(seq, session=dl_session),
+                        max_workers, should_cancel)
+    finally:
+        dl_session.close()
 
 
 # ── 검색 ──
@@ -1817,6 +1897,10 @@ def search_projects_by_document_keyword(
     checked_no_match = []
     total_snippets = 0
     reference_like_snippets = 0
+
+    # 이 배치가 열어볼 PDF를 동시에 미리 받아 캐시를 데운다. 아래 순차 루프의 문서 조회는
+    # 그 캐시에 적중하므로, 매칭 로직은 그대로 두고 다운로드/추출만 병렬화된다.
+    _prefetch_batch_documents(batch, stages, doc_title_contains, session, should_cancel=should_cancel)
 
     for item in batch:
         _check_cancelled(should_cancel)

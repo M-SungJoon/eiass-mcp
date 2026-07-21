@@ -429,5 +429,72 @@ class JobHeartbeatPumpTests(unittest.TestCase):
             scan_engine.run_document_batch = original_batch
 
 
+class ParallelDocumentScanTests(unittest.TestCase):
+    """문서 스캔이 배치의 PDF를 동시에 내려받아(캐시 warm) 처리량을 높이면서도, 결과는
+    순차 처리와 완전히 동일해야 한다."""
+
+    def setUp(self):
+        self.orig_detail = core.get_project_detail
+        self.orig_doc = core._get_full_document_text
+        self.orig_conc = core.DOC_DOWNLOAD_CONCURRENCY
+
+        def fake_detail(view_type, eia_cd, revirpt_seq, session=None, use_cache=True):
+            return {'fields': {'location': eia_cd},
+                    'stage_docs': {'본안': {'cat': [
+                        {'is_pdf': True, 'seq': f'{eia_cd}-f1', 'name': f'{eia_cd}-1.pdf'},
+                        {'is_pdf': True, 'seq': f'{eia_cd}-f2', 'name': f'{eia_cd}-2.pdf'}]}}}
+        core.get_project_detail = fake_detail
+
+        self._cache = {}
+        self._lock = threading.Lock()
+        self.max_concurrency = 0
+        self._now = 0
+
+        def fake_doc(file_seq, session=None):
+            with self._lock:
+                if file_seq in self._cache:
+                    return self._cache[file_seq]
+                self._now += 1
+                self.max_concurrency = max(self.max_concurrency, self._now)
+            time.sleep(0.15)
+            # keyword only in even candidates' first file
+            n = int(file_seq[1:].split('-')[0])
+            text = 'CALPUFF' if (file_seq.endswith('-f1') and n % 2 == 0) else 'other'
+            doc = {'text': text, 'page_offsets': [len(text)], 'pages': 1, 'from_cache': False}
+            with self._lock:
+                self._cache[file_seq] = doc
+                self._now -= 1
+            return doc
+        core._get_full_document_text = fake_doc
+
+    def tearDown(self):
+        core.get_project_detail = self.orig_detail
+        core._get_full_document_text = self.orig_doc
+        core.DOC_DOWNLOAD_CONCURRENCY = self.orig_conc
+
+    def _run(self):
+        candidates = [{'name': f's{i}', 'eia_cd': f'E{i}', 'view_type': 'v',
+                       'revirpt_seq': f'r{i}', 'type': '환경영향평가'} for i in range(8)]
+        res = core.search_projects_by_document_keyword(
+            text_queries=['CALPUFF'], candidates=candidates, offset=0, max_candidates=8,
+            stages=['본안'], record_pattern=False)
+        return sorted(m['name'] for m in res['matches'])
+
+    def test_parallel_and_sequential_give_identical_results(self):
+        core.DOC_DOWNLOAD_CONCURRENCY = 10
+        self._cache.clear(); self.max_concurrency = 0; self._now = 0
+        parallel = self._run()
+        parallel_max = self.max_concurrency
+
+        core.DOC_DOWNLOAD_CONCURRENCY = 1
+        self._cache.clear(); self.max_concurrency = 0; self._now = 0
+        sequential = self._run()
+
+        self.assertEqual(parallel, sequential)                       # correctness preserved
+        self.assertEqual(parallel, ['s0', 's2', 's4', 's6'])         # right matches
+        self.assertGreaterEqual(parallel_max, 4)                     # actually ran in parallel
+        self.assertEqual(self.max_concurrency, 1)                    # K=1 stays sequential
+
+
 if __name__ == '__main__':
     unittest.main()
