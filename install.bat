@@ -30,7 +30,7 @@ REM  Keep the key ONLY in this hand-distributed copy. Do NOT commit it or upload
 REM  anywhere public -- this repo is public, and a leaked VWorld key can be abused
 REM  or revoked. One shared key also means one shared quota across all your users.
 REM
-  set EIASS_VWORLD_API_KEY=3450EBB1-8296-3F1F-A23C-7816C6A8ED9F
+REM  set EIASS_VWORLD_API_KEY=PUT-YOUR-KEY-HERE
 REM  ==============================================================================
 
 REM  TrimStart is required, not cosmetic: install.ps1 is UTF-8 *with a BOM* (PowerShell
