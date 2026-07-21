@@ -116,16 +116,40 @@ function Get-EiassCommandFromConfig {
     return ($match.Groups[1].Value -replace '\\\\', '\')
 }
 
+# Claude Desktop 설정 파일 후보 경로를 모두 반환한다.
+#   - 일반 설치: %APPDATA%\Claude\claude_desktop_config.json
+#   - Microsoft Store(MSIX) 설치: Store 앱은 %APPDATA%(Roaming) 쓰기를 패키지 내부로
+#     리다이렉트해서, 실제 파일은 %LOCALAPPDATA%\Packages\<패키지>\LocalCache\Roaming\Claude\에 있다.
+#     일반 프로세스가 $env:APPDATA를 읽으면 진짜 Roaming 경로가 나오지 실제 패키지 경로가
+#     아니므로, Store 위치는 따로 뒤져야 한다(실제 사용자가 이 경우에 걸려 등록이 건너뛰어졌다).
+function Get-DesktopConfigPaths {
+    $paths = @(Join-Path $env:APPDATA "Claude\claude_desktop_config.json")
+    $pkgRoot = Join-Path $env:LOCALAPPDATA "Packages"
+    if (Test-Path $pkgRoot) {
+        Get-ChildItem $pkgRoot -Filter "*Claude*" -Directory -ErrorAction SilentlyContinue | ForEach-Object {
+            $paths += (Join-Path $_.FullName "LocalCache\Roaming\Claude\claude_desktop_config.json")
+        }
+    }
+    return ($paths | Select-Object -Unique)
+}
+
+# 등록해 넣을 설정 파일 경로를 고른다. 이미 있는 파일이 최우선이고, 없으면 Claude 설정 폴더가
+# 실제로 존재하는 후보를 쓴다(설치돼 있지도 않은데 엉뚱한 곳에 파일을 새로 만들지 않기 위함).
+# Claude Desktop 흔적이 전혀 없으면 $null을 반환한다.
+function Get-DesktopConfigForWrite {
+    $paths = Get-DesktopConfigPaths
+    $existing = $paths | Where-Object { Test-Path $_ } | Select-Object -First 1
+    if ($existing) { return $existing }
+    return ($paths | Where-Object { Test-Path (Split-Path $_ -Parent) } | Select-Object -First 1)
+}
+
 function Get-RegisteredEiassCommand {
     # 예전 설치는 Claude Code(.claude.json)와 Claude Desktop(claude_desktop_config.json) 중
     # 어디에 등록돼 있을지 모른다. 특히 터미널을 안 쓰는 사용자는 Desktop만 쓸 가능성이 높은데,
     # .claude.json만 보면 그들의 예전 설치를 못 찾아 VWorld 키 이주가 통째로 건너뛰어진다.
     # 우리가 설치했던 흔적(mcp_server\mcp_server.exe 또는 단일 mcp_server.exe)을 가리키는 값을
     # 우선한다 — npx 같은 외부 명령이 아니라 실제 이주 대상 경로여야 하기 때문이다.
-    $configs = @(
-        (Join-Path $env:USERPROFILE ".claude.json"),
-        (Join-Path $env:APPDATA "Claude\claude_desktop_config.json")
-    )
+    $configs = @(Join-Path $env:USERPROFILE ".claude.json") + @(Get-DesktopConfigPaths)
     $fallback = $null
     foreach ($configPath in $configs) {
         $command = Get-EiassCommandFromConfig -ConfigPath $configPath
@@ -464,9 +488,9 @@ try {
 
     # 4) Claude Desktop — 설정 JSON에 직접 등록한다. 터미널도 어려워하는 사용자에게 JSON을
     # 손으로 고치게 할 수는 없다. 실패하면 기존 파일을 되돌리고 수동 안내로 넘어간다.
-    $desktopConfigDir = Join-Path $env:APPDATA "Claude"
-    $desktopConfigPath = Join-Path $desktopConfigDir "claude_desktop_config.json"
-    if (Test-Path $desktopConfigDir) {
+    # 설정 경로는 일반 설치와 Microsoft Store 설치(가상화된 패키지 경로)를 모두 찾는다.
+    $desktopConfigPath = Get-DesktopConfigForWrite
+    if ($desktopConfigPath) {
         $desktopResult = Register-ClaudeDesktop -ConfigPath $desktopConfigPath -ExePath $ExePath
         switch -Wildcard ($desktopResult) {
             'updated' { Write-Host "✅ Claude Desktop에 등록 완료`n" }
