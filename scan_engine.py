@@ -76,6 +76,21 @@ class ScanRunner:
         payload = job['payload']
         kind = job['kind']
         session = core._session()
+        # job heartbeat 펌프: 워커가 이 job을 처리하는 동안 5초마다 heartbeat를 갱신한다.
+        # 문서 다운로드/추출은 문서 하나가 수 분씩 걸릴 수 있어 배치 경계에서만 heartbeat를
+        # 갱신하면 그동안 "멈춘 것"처럼 보였다(사용자가 실제로 겪어 스캔을 포기함). 이 펌프는
+        # 한 작업이 오래 걸려도 프로세스가 살아있음을 상태에 남긴다. 진행량은 checked/
+        # discovery_count가 별도로 보여주므로, "살아있지만 진행 없음"도 구분된다.
+        stop_heartbeat = threading.Event()
+
+        def _heartbeat_pump():
+            while not stop_heartbeat.wait(JOB_HEARTBEAT_INTERVAL_SECONDS):
+                try:
+                    self.store.touch_heartbeat(job_id)
+                except Exception:
+                    pass  # 일시적 SQLite 잠금은 다음 주기에 다시 시도한다
+        pump = threading.Thread(target=_heartbeat_pump, name=f'eiass-hb-{job_id[:8]}', daemon=True)
+        pump.start()
         try:
             if not job['snapshot_complete']:
                 self.store.update(job_id, status='discovering', phase='candidate_snapshot')
@@ -135,6 +150,7 @@ class ScanRunner:
             self.store.update(job_id, status='error', phase='failed',
                               error=_describe_job_failure(exc, kind), clear_owner=True)
         finally:
+            stop_heartbeat.set()
             session.close()
 
 

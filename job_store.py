@@ -119,6 +119,17 @@ class JobStore:
         with self.lock, self._connect() as conn:
             conn.execute('UPDATE jobs SET ' + ', '.join(fields) + ' WHERE job_id=?', values)
 
+    def touch_heartbeat(self, job_id):
+        """job의 heartbeat_at만 현재 시각으로 갱신한다(다른 필드는 건드리지 않는다).
+
+        문서 다운로드/추출은 문서 하나가 수 분씩 걸릴 수 있는데, 그동안 heartbeat를 갱신할
+        지점이 배치 경계밖에 없어 "완전히 멈춘 것"처럼 보였다. 워커가 job을 잡고 있는 동안
+        이걸 주기적으로 호출해, 한 작업이 오래 걸려도 프로세스가 살아있음을 상태에 남긴다.
+        실제 처리 진행량은 checked/discovery_count가 따로 보여준다."""
+        now = time.time()
+        with self.lock, self._connect() as conn:
+            return conn.execute('UPDATE jobs SET heartbeat_at=? WHERE job_id=?', (now, job_id)).rowcount > 0
+
     def request_cancel(self, job_id):
         now = time.time()
         with self.lock, self._connect() as conn:

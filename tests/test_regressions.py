@@ -1,4 +1,5 @@
 # -*- coding: utf-8 -*-
+import os
 import threading
 import time
 import unittest
@@ -349,6 +350,83 @@ class DiscoveryProgressTests(unittest.TestCase):
         with self.assertRaises(core.ScanCancelled):
             core.search_projects('테스트', type_codes=['S'], session=self._session(cancel_flag=flag),
                                  should_cancel=lambda: flag['flag'])
+
+
+class JobHeartbeatPumpTests(unittest.TestCase):
+    """워커가 job을 잡고 있는 동안 heartbeat가 주기적으로 갱신되는지 검증한다.
+
+    문서 하나가 수 분씩 걸릴 수 있는데, heartbeat를 배치 경계에서만 갱신하면 그동안 "멈춘 것"
+    처럼 보였다(사용자가 실제로 겪어 스캔을 포기함). 처리 진행(checked)이 멈춰 있어도 heartbeat는
+    움직여야 "살아있지만 이 문서에서 지연 중"과 "죽음"을 구분할 수 있다.
+    """
+
+    def _tmpdb(self):
+        import tempfile
+        path = os.path.join(tempfile.gettempdir(), f'hbtest_{id(self)}.sqlite3')
+        for ext in ('', '-wal', '-shm'):
+            try:
+                os.remove(path + ext)
+            except OSError:
+                pass
+        self.addCleanup(lambda: [self._rm(path + e) for e in ('', '-wal', '-shm')])
+        return path
+
+    @staticmethod
+    def _rm(p):
+        try:
+            os.remove(p)
+        except OSError:
+            pass
+
+    def test_touch_heartbeat_bumps_only_heartbeat(self):
+        import job_store
+        store = job_store.JobStore(path=self._tmpdb())
+        store.create('j1', 'document', {'keyword': 'x', 'batch_size': 10, 'text_queries': ['q']})
+        before = store.get('j1')
+        time.sleep(0.02)
+        self.assertTrue(store.touch_heartbeat('j1'))
+        after = store.get('j1')
+        self.assertGreater(after['heartbeat_at'], before['heartbeat_at'])
+        self.assertEqual(after['status'], before['status'])
+        self.assertEqual(after['checked'], before['checked'])
+
+    def test_heartbeat_advances_during_a_blocking_batch(self):
+        import scan_engine
+        import job_store
+        original_interval = scan_engine.JOB_HEARTBEAT_INTERVAL_SECONDS
+        original_search = core.search_projects
+        original_batch = scan_engine.run_document_batch
+        scan_engine.JOB_HEARTBEAT_INTERVAL_SECONDS = 0.2
+        core.search_projects = lambda *a, **kw: [
+            {'name': f'n{i}', 'eia_cd': f'E{i}', 'view_type': 'v', 'revirpt_seq': f'r{i}', 'type': 'S'}
+            for i in range(20)]
+        entered = threading.Event()
+
+        def blocking_batch(payload, candidates, should_cancel, session=None):
+            entered.set()
+            time.sleep(1.5)   # one slow document holds the whole batch
+            return {'matches': [], 'skipped': [], 'checked_no_match': [], 'stage_stats': {}}
+        scan_engine.run_document_batch = blocking_batch
+
+        try:
+            store = job_store.JobStore(path=self._tmpdb())
+            runner = scan_engine.ScanRunner(store=store, worker_count=1)
+            store.create('j2', 'document', {'keyword': 'x', 'batch_size': 10, 'text_queries': ['q']})
+            runner.submit('j2')
+            self.assertTrue(entered.wait(timeout=10), 'batch never started')
+
+            frozen_checked = store.get('j2')['checked']
+            samples = set()
+            deadline = time.time() + 1.0   # sample while still inside the 1.5s blocking batch
+            while time.time() < deadline:
+                samples.add(round(store.get('j2')['heartbeat_at'], 3))
+                time.sleep(0.2)
+            self.assertEqual(store.get('j2')['checked'], frozen_checked)  # batch not committed yet
+            self.assertGreaterEqual(len(samples), 3)  # heartbeat moved despite frozen progress
+        finally:
+            scan_engine.JOB_HEARTBEAT_INTERVAL_SECONDS = original_interval
+            core.search_projects = original_search
+            scan_engine.run_document_batch = original_batch
 
 
 if __name__ == '__main__':
