@@ -57,9 +57,12 @@ from mcp.server.fastmcp import FastMCP
 
 import eiass_core as core
 import requests
-from config import JOB_RESULT_PAGE_LIMIT, MAX_DOCUMENT_SCAN_BATCH_SIZE, MAX_SCAN_BATCH_SIZE
+from config import (JOB_RESULT_PAGE_LIMIT, MAX_DOCUMENT_SCAN_BATCH_SIZE, MAX_SCAN_BATCH_SIZE,
+                    SCAN_MONITOR_POLL_SECONDS, SCAN_NORMAL_REPORT_SECONDS,
+                    SCAN_UNCHANGED_REPORT_SECONDS)
 from job_store import JobStore
-from scan_engine import ScanRunner, document_status, spatial_status
+from scan_engine import (ScanRunner, document_status, make_monitor_cursor, spatial_status,
+                         wait_document_update)
 
 mcp = FastMCP('eiass')
 
@@ -504,8 +507,9 @@ def eiass_start_document_keyword_scan(
 ) -> dict:
     """대량 후보(수십~수백 건)를 타임아웃 걱정 없이 끝까지 훑는 백그라운드 스캔을 시작한다.
     즉시 job_id를 반환하고, 실제 조회(사업 상세조회 + PDF 다운로드/추출 + 키워드 매칭)는
-    서버 안에서 백그라운드로 계속 진행된다. eiass_get_scan_status(job_id)로 주기적으로
-    진행 상황과 지금까지의 매칭 결과를 확인하라 — done이 될 때까지 몇 번이고 다시 불러도 된다.
+    서버 안에서 백그라운드로 계속 진행된다. 반환되는 monitor_cursor로
+    eiass_wait_scan_update를 terminal 상태까지 반복 호출해 진행 상황을 자동 안내하라.
+    eiass_get_scan_status(job_id)는 사용자가 수동으로 즉시 상태를 확인할 때 사용한다.
     상태조회/취소는 스캔이 실행 중이어도 즉시 응답한다(백그라운드 스레드와 별도로 처리됨).
 
     **실행 전 확인 필수**: confirmed=False(기본값)면 스캔을 시작하지 않고 eiass_preview_search와
@@ -563,7 +567,20 @@ def eiass_start_document_keyword_scan(
         job_store.update(job_id, status='error', phase='queue_full',
                          error='스캔 대기열이 가득 찼습니다. 잠시 후 다시 시도하세요.')
         return {'error': '스캔 대기열이 가득 찼습니다. 잠시 후 다시 시도하세요.'}
-    return {'job_id': job_id, 'status': 'queued'}
+    initial_status = document_status(job_store, job_id)
+    return {
+        'job_id': job_id, 'status': 'queued',
+        'monitor_required': True,
+        'monitor_tool': 'eiass_wait_scan_update',
+        'monitor_cursor': make_monitor_cursor(initial_status),
+        'internal_poll_seconds': SCAN_MONITOR_POLL_SECONDS,
+        'normal_report_interval_seconds': SCAN_NORMAL_REPORT_SECONDS,
+        'unchanged_keepalive_seconds': SCAN_UNCHANGED_REPORT_SECONDS,
+        'monitoring_instruction': (
+            '스캔이 terminal 상태가 될 때까지 eiass_wait_scan_update를 반복 호출하세요. '
+            'should_notify=true일 때만 progress_message를 사용자에게 그대로 전달하고, '
+            'false이면 메시지를 보내지 말고 같은 monitor_cursor로 즉시 다시 호출하세요.'),
+    }
 
 
 @mcp.tool()
@@ -588,6 +605,31 @@ def eiass_get_scan_status(job_id: str, include_matches: bool = False,
     job_store, _ = _jobs_backend()
     return document_status(job_store, job_id, include_matches, result_offset,
                            min(result_limit, JOB_RESULT_PAGE_LIMIT))
+
+
+@mcp.tool()
+def eiass_wait_scan_update(job_id: str, monitor_cursor: str = '',
+                           timeout_seconds: int = SCAN_MONITOR_POLL_SECONDS) -> dict:
+    """백그라운드 문서 스캔의 사용자 알림 시점까지 내부적으로 기다린다.
+
+    eiass_start_document_keyword_scan이 반환한 monitor_cursor를 그대로 넘겨라. 정상 진행은
+    60초에 최대 한 번, 의미 있는 변화가 없으면 5분에 한 번만 should_notify=true가 된다.
+    느림·자원압박·정지·회복·완료·취소·오류는 즉시 true가 된다.
+
+    should_notify=true이면 progress_message를 사용자에게 그대로 보여준 뒤 반환된 새
+    monitor_cursor로 다시 호출하라. false이면 사용자에게 반복 메시지를 보내지 말고 반환된
+    동일 cursor로 즉시 다시 호출하라. status가 done/cancelled/error가 될 때까지 이 모니터링
+    루프를 끝내거나 사용자에게 추가 질문을 요구하지 말라.
+
+    timeout_seconds는 내부 long-poll 시간이며 5~60초로 제한된다. 기본값은 30초다.
+    """
+    if not isinstance(timeout_seconds, int) or not 5 <= timeout_seconds <= 60:
+        return {'error': 'timeout_seconds는 5~60 범위의 정수여야 합니다.'}
+    job_store, _ = _jobs_backend()
+    try:
+        return wait_document_update(job_store, job_id, monitor_cursor, timeout_seconds)
+    except ValueError as exc:
+        return {'error': str(exc)}
 
 
 @mcp.tool()

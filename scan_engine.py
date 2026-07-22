@@ -1,4 +1,6 @@
 """영속 JobStore를 사용하는 bounded worker 기반 스캔 실행기."""
+import base64
+import json
 import queue
 import sys
 import threading
@@ -6,7 +8,9 @@ import time
 import uuid
 
 import eiass_core as core
-from config import JOB_HEARTBEAT_INTERVAL_SECONDS, JOB_QUEUE_SIZE, JOB_WORKER_COUNT
+from config import (JOB_HEARTBEAT_INTERVAL_SECONDS, JOB_QUEUE_SIZE, JOB_WORKER_COUNT,
+                    SCAN_MONITOR_POLL_SECONDS, SCAN_NORMAL_REPORT_SECONDS,
+                    SCAN_UNCHANGED_REPORT_SECONDS)
 from document_engine import outcomes as document_outcomes, run_batch as run_document_batch
 from job_store import JobStore
 from spatial_engine import outcomes as spatial_outcomes, run_batch as run_spatial_batch
@@ -274,6 +278,123 @@ def _merge_stage_stats(total, batch):
     return total
 
 
+_IMMEDIATE_ACTIVITY_STATES = {
+    'active_slow', 'server_slow', 'local_resource_pressure', 'timed_out', 'stalled',
+}
+_TERMINAL_JOB_STATES = {'done', 'cancelled', 'error'}
+
+
+def _progress_message(status, unchanged=False):
+    job_status = status['status']
+    checked = status.get('checked') or 0
+    total = status.get('candidates_total')
+    percent = status.get('progress_percent')
+    work = status.get('work_progress') or {}
+    state = status.get('activity_state')
+    if job_status == 'done':
+        heading = f"스캔이 완료되었습니다 — 후보 {checked}/{total or checked}건을 확인했습니다."
+    elif job_status == 'cancelled':
+        heading = f"스캔이 취소되었습니다 — 후보 {checked}/{total or '?'}건까지 확인했습니다."
+    elif job_status == 'error':
+        heading = f"스캔이 오류로 중단되었습니다 — {status.get('error') or '원인 미상'}"
+    elif job_status == 'discovering':
+        heading = f"스캔 후보 목록을 수집 중입니다 — 현재 {status.get('discovery_count') or 0}건."
+    else:
+        ratio = f" ({percent:.1f}%)" if percent is not None else ''
+        heading = f"스캔 진행 중 — 후보 {checked}/{total or '?'}건{ratio}을 확인했습니다."
+    if unchanged and job_status not in _TERMINAL_JOB_STATES:
+        heading = '처리 건수에는 변화가 없지만 작업은 계속 실행 중입니다. ' + heading
+    lines = [heading]
+    if job_status not in ('queued', 'discovering'):
+        lines.append(
+            f"결과: 일치 {status.get('match_count', 0)}건 · 매칭 없음 "
+            f"{status.get('checked_no_match_count', 0)}건 · 제외/실패 {status.get('skipped_count', 0)}건")
+    current = ' / '.join(filter(None, (work.get('current_candidate'), work.get('current_file'))))
+    if current:
+        lines.append(f"현재: {current} ({work.get('phase') or status.get('current_phase')})")
+    if state:
+        lines.append(
+            f"상태: {state} · 마지막 작업 활동 {status.get('seconds_since_activity', 0):.0f}초 전 · "
+            f"heartbeat {status.get('seconds_since_heartbeat', 0):.0f}초 전")
+    return '\n'.join(lines)
+
+
+def make_monitor_cursor(status, reported_at=None):
+    payload = {
+        'seq': int(status.get('progress_seq') or 0),
+        'reported_at': float(reported_at or time.time()),
+        'activity_state': status.get('activity_state') or '',
+    }
+    raw = json.dumps(payload, separators=(',', ':'), ensure_ascii=True).encode('ascii')
+    return base64.urlsafe_b64encode(raw).decode('ascii').rstrip('=')
+
+
+def _parse_monitor_cursor(cursor, status):
+    if not cursor:
+        return {'seq': int(status.get('progress_seq') or 0),
+                'reported_at': time.time(),
+                'activity_state': status.get('activity_state') or ''}
+    try:
+        raw = base64.urlsafe_b64decode(cursor + '=' * (-len(cursor) % 4))
+        payload = json.loads(raw.decode('ascii'))
+        return {'seq': int(payload['seq']), 'reported_at': float(payload['reported_at']),
+                'activity_state': str(payload.get('activity_state') or '')}
+    except (ValueError, TypeError, KeyError, json.JSONDecodeError):
+        raise ValueError('유효하지 않은 monitor_cursor입니다.')
+
+
+def wait_document_update(store, job_id, monitor_cursor='', timeout_seconds=SCAN_MONITOR_POLL_SECONDS):
+    """사용자 메시지 주기와 내부 상태 확인을 분리하는 bounded long-poll."""
+    timeout_seconds = max(5, min(60, int(timeout_seconds)))
+    initial = document_status(store, job_id)
+    if initial.get('error'):
+        return initial
+    baseline = _parse_monitor_cursor(monitor_cursor, initial)
+    deadline = time.monotonic() + timeout_seconds
+    while True:
+        status = document_status(store, job_id)
+        if status.get('error'):
+            return status
+        now = time.time()
+        state = status.get('activity_state') or ''
+        seq = int(status.get('progress_seq') or 0)
+        changed = seq > baseline['seq']
+        state_changed = state != baseline['activity_state']
+        report_age = max(0.0, now - baseline['reported_at'])
+        terminal = status['status'] in _TERMINAL_JOB_STATES
+        immediate = state_changed and (
+            state in _IMMEDIATE_ACTIVITY_STATES or
+            baseline['activity_state'] in _IMMEDIATE_ACTIVITY_STATES)
+        reason = None
+        unchanged = False
+        if terminal:
+            reason = 'terminal'
+        elif immediate:
+            reason = 'state_transition'
+        elif changed and report_age >= SCAN_NORMAL_REPORT_SECONDS:
+            reason = 'normal_interval'
+        elif not changed and report_age >= SCAN_UNCHANGED_REPORT_SECONDS:
+            reason = 'unchanged_keepalive'
+            unchanged = True
+        if reason:
+            status['progress_message'] = _progress_message(status, unchanged=unchanged)
+            return {
+                'should_notify': True, 'reason': reason,
+                'monitor_cursor': make_monitor_cursor(status, now),
+                'next_poll_seconds': SCAN_MONITOR_POLL_SECONDS,
+                'progress_message': status['progress_message'], 'scan_status': status,
+            }
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return {
+                'should_notify': False, 'reason': 'poll_timeout',
+                'monitor_cursor': monitor_cursor or make_monitor_cursor(initial, baseline['reported_at']),
+                'next_poll_seconds': SCAN_MONITOR_POLL_SECONDS,
+                'progress_message': None, 'scan_status': status,
+            }
+        time.sleep(min(1.0, remaining))
+
+
 def document_status(store, job_id, include_results=False, offset=0, limit=100):
     job = store.get(job_id)
     if not job or job['kind'] != 'document':
@@ -300,8 +421,13 @@ def document_status(store, job_id, include_results=False, offset=0, limit=100):
     else:
         activity_state = job['status']
 
+    progress_percent = (round(job['checked'] * 100 / job['candidates_total'], 1)
+                        if job['candidates_total'] else None)
     result = {'status': job['status'], 'activity_state': activity_state,
               'checked': job['checked'], 'candidates_total': job['candidates_total'],
+              'progress_percent': progress_percent,
+              'progress_seq': job.get('progress_seq', 0),
+              'progress_changed_at': job.get('progress_changed_at'),
               'match_count': counts.get('match', 0), 'checked_no_match_count': counts.get('no_match', 0),
               'skipped_count': counts.get('skipped', 0), 'stage_stats': job['meta'].get('stage_stats', {}),
               'needs_refinement': bool(job['meta'].get('needs_refinement')),
@@ -315,6 +441,13 @@ def document_status(store, job_id, include_results=False, offset=0, limit=100):
               'seconds_since_activity': round(activity_age, 1),
               'error': job['error'], 'current_phase': job['current_phase'],
               'updated_at': job['updated_at'], 'heartbeat_at': job['heartbeat_at'], 'resume_count': job['resume_count']}
+    result['notification_policy'] = {
+        'internal_poll_seconds': SCAN_MONITOR_POLL_SECONDS,
+        'normal_report_seconds': SCAN_NORMAL_REPORT_SECONDS,
+        'unchanged_keepalive_seconds': SCAN_UNCHANGED_REPORT_SECONDS,
+        'immediate_on_state_change_or_terminal': True,
+    }
+    result['progress_message'] = _progress_message(result)
     if include_results:
         if offset < 0 or limit <= 0:
             return {'error': 'result_offset은 0 이상, result_limit은 1 이상이어야 합니다.'}

@@ -15,6 +15,9 @@ from config import (JOB_LEASE_TIMEOUT_SECONDS, JOB_RETENTION_SECONDS,
 from models import candidate_key
 
 
+_PROCESS_INSTANCE_ID = uuid.uuid4().hex
+
+
 class _ClosingConnection(sqlite3.Connection):
     """Windows에서도 WAL 파일 핸들을 남기지 않는 SQLite 연결."""
     def __exit__(self, exc_type, exc_value, traceback):
@@ -53,7 +56,8 @@ class JobStore:
                 cancel_requested INTEGER NOT NULL DEFAULT 0, current_phase TEXT NOT NULL,
                 error TEXT, meta_json TEXT NOT NULL DEFAULT '{}', created_at REAL NOT NULL,
                 updated_at REAL NOT NULL, heartbeat_at REAL NOT NULL, resume_count INTEGER NOT NULL DEFAULT 0,
-                owner_id TEXT, snapshot_complete INTEGER NOT NULL DEFAULT 0
+                owner_id TEXT, snapshot_complete INTEGER NOT NULL DEFAULT 0,
+                progress_seq INTEGER NOT NULL DEFAULT 0, progress_changed_at REAL NOT NULL DEFAULT 0
             );
             CREATE TABLE IF NOT EXISTS job_candidates (
                 job_id TEXT NOT NULL, candidate_key TEXT NOT NULL, ordinal INTEGER NOT NULL,
@@ -76,6 +80,11 @@ class JobStore:
                 conn.execute('ALTER TABLE jobs ADD COLUMN snapshot_complete INTEGER NOT NULL DEFAULT 0')
                 conn.execute('''UPDATE jobs SET snapshot_complete=1
                              WHERE candidates_total IS NOT NULL''')
+            if 'progress_seq' not in columns:
+                conn.execute('ALTER TABLE jobs ADD COLUMN progress_seq INTEGER NOT NULL DEFAULT 0')
+            if 'progress_changed_at' not in columns:
+                conn.execute('ALTER TABLE jobs ADD COLUMN progress_changed_at REAL NOT NULL DEFAULT 0')
+                conn.execute('UPDATE jobs SET progress_changed_at=updated_at WHERE progress_changed_at=0')
 
     @staticmethod
     def _decode(row):
@@ -92,9 +101,10 @@ class JobStore:
         now = time.time()
         with self.lock, self._connect() as conn:
             conn.execute('''INSERT INTO jobs
-                (job_id,kind,status,payload_json,current_phase,created_at,updated_at,heartbeat_at)
-                VALUES (?,?, 'queued', ?, 'queued', ?, ?, ?)''',
-                         (job_id, kind, json.dumps(payload, ensure_ascii=False), now, now, now))
+                (job_id,kind,status,payload_json,current_phase,created_at,updated_at,heartbeat_at,
+                 progress_changed_at)
+                VALUES (?,?, 'queued', ?, 'queued', ?, ?, ?, ?)''',
+                         (job_id, kind, json.dumps(payload, ensure_ascii=False), now, now, now, now))
 
     def get(self, job_id):
         with self.lock, self._connect() as conn:
@@ -103,7 +113,9 @@ class JobStore:
     def update(self, job_id, *, status=None, phase=None, error=None, meta=None, checked=None,
                owner_id=None, clear_owner=False):
         now = time.time()
-        fields, values = ['updated_at=?', 'heartbeat_at=?'], [now, now]
+        fields, values = [
+            'updated_at=?', 'heartbeat_at=?', 'progress_seq=progress_seq+1',
+            'progress_changed_at=?'], [now, now, now]
         for column, value in (('status', status), ('current_phase', phase), ('error', error), ('checked', checked)):
             if value is not None:
                 fields.append(column + '=?')
@@ -124,19 +136,44 @@ class JobStore:
         """동시 진행 callback이 서로의 meta 필드를 덮어쓰지 않도록 한 transaction에서 병합한다."""
         now = time.time()
         with self.lock, self._connect() as conn:
-            row = conn.execute('SELECT meta_json FROM jobs WHERE job_id=?', (job_id,)).fetchone()
+            row = conn.execute(
+                'SELECT meta_json,current_phase FROM jobs WHERE job_id=?', (job_id,)).fetchone()
             if not row:
                 return False
-            meta = json.loads(row[0])
+            meta = json.loads(row['meta_json'])
+            before = self._progress_signature(meta, row['current_phase'])
             meta.update(updates)
+            after = self._progress_signature(meta, phase or row['current_phase'])
+            bump = before != after
+            progress_sql = (',progress_seq=progress_seq+1,progress_changed_at=?' if bump else '')
+            progress_values = [now] if bump else []
             if phase is None:
-                conn.execute('UPDATE jobs SET meta_json=?,updated_at=?,heartbeat_at=? WHERE job_id=?',
-                             (json.dumps(meta, ensure_ascii=False), now, now, job_id))
+                conn.execute(f'''UPDATE jobs SET meta_json=?,updated_at=?,heartbeat_at=?
+                                 {progress_sql} WHERE job_id=?''',
+                             (json.dumps(meta, ensure_ascii=False), now, now,
+                              *progress_values, job_id))
             else:
-                conn.execute('''UPDATE jobs SET meta_json=?,current_phase=?,updated_at=?,heartbeat_at=?
-                                WHERE job_id=?''',
-                             (json.dumps(meta, ensure_ascii=False), phase, now, now, job_id))
+                conn.execute(f'''UPDATE jobs SET meta_json=?,current_phase=?,updated_at=?,heartbeat_at=?
+                                 {progress_sql} WHERE job_id=?''',
+                             (json.dumps(meta, ensure_ascii=False), phase, now, now,
+                              *progress_values, job_id))
             return True
+
+    @staticmethod
+    def _progress_signature(meta, phase):
+        """heartbeat용 시각만 달라진 갱신은 사용자에게 보일 진행 변화로 세지 않는다."""
+        work = dict(meta.get('work_progress') or {})
+        for key in ('last_activity_at', 'progress_at', 'document_elapsed_ms'):
+            work.pop(key, None)
+        visible = {
+            'phase': phase,
+            'discovery_count': meta.get('discovery_count'),
+            'work_progress': work,
+            'stage_stats': meta.get('stage_stats'),
+            'needs_refinement': meta.get('needs_refinement'),
+            'heartbeat_diagnostics': meta.get('heartbeat_diagnostics'),
+        }
+        return json.dumps(visible, ensure_ascii=False, sort_keys=True, default=str)
 
     def touch_heartbeat(self, job_id, owner_id=None):
         """job의 heartbeat_at만 현재 시각으로 갱신한다(다른 필드는 건드리지 않는다).
@@ -166,7 +203,8 @@ class JobStore:
                 status=CASE WHEN status='queued' THEN 'cancelled' ELSE status END,
                 current_phase=CASE WHEN status='queued' THEN 'cancelled' ELSE current_phase END,
                 owner_id=CASE WHEN status='queued' THEN NULL ELSE owner_id END,
-                updated_at=?, heartbeat_at=? WHERE job_id=?''', (now, now, job_id)).rowcount > 0
+                updated_at=?, heartbeat_at=?, progress_seq=progress_seq+1,
+                progress_changed_at=? WHERE job_id=?''', (now, now, now, job_id)).rowcount > 0
 
     def cancel_requested(self, job_id):
         with self.lock, self._connect() as conn:
@@ -180,12 +218,14 @@ class JobStore:
             now = time.time()
             if meta is None:
                 conn.execute('''UPDATE jobs SET candidates_total=?, snapshot_complete=1,
-                             updated_at=?, heartbeat_at=? WHERE job_id=?''',
-                             (len(candidates), now, now, job_id))
+                             updated_at=?, heartbeat_at=?, progress_seq=progress_seq+1,
+                             progress_changed_at=? WHERE job_id=?''',
+                             (len(candidates), now, now, now, job_id))
             else:
                 conn.execute('''UPDATE jobs SET candidates_total=?, snapshot_complete=1,
-                             meta_json=?, updated_at=?, heartbeat_at=? WHERE job_id=?''',
-                             (len(candidates), json.dumps(meta, ensure_ascii=False), now, now, job_id))
+                             meta_json=?, updated_at=?, heartbeat_at=?, progress_seq=progress_seq+1,
+                             progress_changed_at=? WHERE job_id=?''',
+                             (len(candidates), json.dumps(meta, ensure_ascii=False), now, now, now, job_id))
 
     def candidates(self, job_id, only_pending=False):
         query = 'SELECT c.candidate_key,c.ordinal,c.payload_json FROM job_candidates c'
@@ -210,12 +250,13 @@ class JobStore:
             conn.executemany('INSERT OR REPLACE INTO job_results VALUES (?,?,?,?,?,?)', rows)
             checked = conn.execute('SELECT COUNT(*) FROM job_results WHERE job_id=?', (job_id,)).fetchone()[0]
             if meta is None:
-                conn.execute('UPDATE jobs SET checked=?, updated_at=?, heartbeat_at=? WHERE job_id=?',
-                             (checked, now, now, job_id))
+                conn.execute('''UPDATE jobs SET checked=?, updated_at=?, heartbeat_at=?,
+                             progress_seq=progress_seq+1, progress_changed_at=? WHERE job_id=?''',
+                             (checked, now, now, now, job_id))
             else:
-                conn.execute('''UPDATE jobs SET checked=?, meta_json=?, updated_at=?, heartbeat_at=?
-                             WHERE job_id=?''',
-                             (checked, json.dumps(meta, ensure_ascii=False), now, now, job_id))
+                conn.execute('''UPDATE jobs SET checked=?, meta_json=?, updated_at=?, heartbeat_at=?,
+                             progress_seq=progress_seq+1, progress_changed_at=? WHERE job_id=?''',
+                             (checked, json.dumps(meta, ensure_ascii=False), now, now, now, job_id))
 
     def result_counts(self, job_id):
         with self.lock, self._connect() as conn:
@@ -251,9 +292,10 @@ class JobStore:
         now = time.time()
         with self.lock, self._connect() as conn:
             return conn.execute('''UPDATE jobs SET status='running', current_phase='starting',
-                owner_id=?, updated_at=?, heartbeat_at=?
+                owner_id=?, updated_at=?, heartbeat_at=?, progress_seq=progress_seq+1,
+                progress_changed_at=?
                 WHERE job_id=? AND status='queued' AND cancel_requested=0''',
-                                (owner_id, now, now, job_id)).rowcount > 0
+                                (owner_id, now, now, now, job_id)).rowcount > 0
 
     def recover_interrupted(self, owner_id=None):
         owner_id = owner_id or f'manual-{os.getpid()}-{id(self)}'
@@ -262,15 +304,17 @@ class JobStore:
         with self.lock, self._connect() as conn:
             conn.execute('INSERT OR REPLACE INTO runner_instances VALUES (?,?)', (owner_id, now))
             conn.execute("""UPDATE jobs SET status='cancelled', current_phase='cancelled', owner_id=NULL,
-                         updated_at=?, heartbeat_at=? WHERE cancel_requested=1
-                         AND status IN ('queued','running','discovering')""", (now, now))
+                         updated_at=?, heartbeat_at=?, progress_seq=progress_seq+1,
+                         progress_changed_at=? WHERE cancel_requested=1
+                         AND status IN ('queued','running','discovering')""", (now, now, now))
             conn.execute("""UPDATE jobs SET status='queued', current_phase='recovery_pending',
-                         owner_id=NULL, resume_count=resume_count+1, updated_at=?, heartbeat_at=?
+                         owner_id=NULL, resume_count=resume_count+1, updated_at=?, heartbeat_at=?,
+                         progress_seq=progress_seq+1, progress_changed_at=?
                          WHERE status IN ('running','discovering') AND cancel_requested=0
                          AND (heartbeat_at<? OR owner_id IS NULL OR NOT EXISTS (
                              SELECT 1 FROM runner_instances r
                              WHERE r.owner_id=jobs.owner_id AND r.heartbeat_at>=?
-                         ))""", (now, now, cutoff, cutoff))
+                         ))""", (now, now, now, cutoff, cutoff))
             conn.execute('DELETE FROM runner_instances WHERE heartbeat_at<? AND owner_id<>?',
                          (cutoff, owner_id))
             return [r[0] for r in conn.execute("SELECT job_id FROM jobs WHERE status='queued' AND cancel_requested=0")]
@@ -307,20 +351,24 @@ class SharedSlotLimiter:
         with self._connect() as conn:
             conn.execute('''CREATE TABLE IF NOT EXISTS shared_slots (
                 slot_name TEXT NOT NULL, token TEXT PRIMARY KEY, expires_at REAL NOT NULL,
-                owner_pid INTEGER NOT NULL DEFAULT 0)''')
+                owner_pid INTEGER NOT NULL DEFAULT 0,
+                owner_instance TEXT NOT NULL DEFAULT '')''')
             columns = {row[1] for row in conn.execute('PRAGMA table_info(shared_slots)')}
             if 'owner_pid' not in columns:
                 conn.execute(
                     'ALTER TABLE shared_slots ADD COLUMN owner_pid INTEGER NOT NULL DEFAULT 0')
+            if 'owner_instance' not in columns:
+                conn.execute(
+                    "ALTER TABLE shared_slots ADD COLUMN owner_instance TEXT NOT NULL DEFAULT ''")
             conn.execute('CREATE INDEX IF NOT EXISTS idx_shared_slots_name ON shared_slots(slot_name,expires_at)')
 
     def _connect(self):
         return sqlite3.connect(self.path, timeout=5, factory=_ClosingConnection)
 
     @staticmethod
-    def _pid_is_alive(pid):
+    def _pid_is_alive(pid, owner_instance=''):
         if pid == os.getpid():
-            return True
+            return owner_instance == _PROCESS_INSTANCE_ID
         if not pid:
             return False
         try:
@@ -343,17 +391,21 @@ class SharedSlotLimiter:
                 with self._connect() as conn:
                     conn.execute('BEGIN IMMEDIATE')
                     conn.execute('DELETE FROM shared_slots WHERE expires_at<?', (now,))
-                    owner_pids = [row[0] for row in conn.execute(
-                        'SELECT DISTINCT owner_pid FROM shared_slots')]
-                    for owner_pid in owner_pids:
-                        if not self._pid_is_alive(owner_pid):
-                            conn.execute('DELETE FROM shared_slots WHERE owner_pid=?', (owner_pid,))
+                    owners = list(conn.execute(
+                        'SELECT DISTINCT owner_pid,owner_instance FROM shared_slots'))
+                    for owner_pid, owner_instance in owners:
+                        if not self._pid_is_alive(owner_pid, owner_instance):
+                            conn.execute('''DELETE FROM shared_slots
+                                         WHERE owner_pid=? AND owner_instance=?''',
+                                         (owner_pid, owner_instance))
                     used = conn.execute(
                         'SELECT COUNT(*) FROM shared_slots WHERE slot_name=?', (self.name,)).fetchone()[0]
                     if used < self.capacity:
                         conn.execute('''INSERT INTO shared_slots
-                                     (slot_name,token,expires_at,owner_pid) VALUES (?,?,?,?)''',
-                                     (self.name, token, now + self.lease_seconds, os.getpid()))
+                                     (slot_name,token,expires_at,owner_pid,owner_instance)
+                                     VALUES (?,?,?,?,?)''',
+                                     (self.name, token, now + self.lease_seconds, os.getpid(),
+                                      _PROCESS_INSTANCE_ID))
                         return token
             except sqlite3.OperationalError:
                 pass

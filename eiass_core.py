@@ -63,7 +63,7 @@ except ImportError:
 
 # 저장소 루트 VERSION 파일과 항상 같은 값으로 맞춰서 커밋할 것(버전 두 곳 중복 관리).
 # 어긋난 채로 커밋되지 않도록 build_mcp.py가 빌드 시작 전에 두 값을 대조한다.
-__version__ = '1.16.0'
+__version__ = '1.16.1'
 
 REQUEST_TIMEOUT = (8, 30)
 
