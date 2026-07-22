@@ -290,7 +290,12 @@ function Get-CompatibleReleases {
         [hashtable]$Headers
     )
     $url = "https://api.github.com/repos/$RepoOwner/$RepoName/releases?per_page=100"
-    $releases = @(Invoke-RestMethod -Uri $url -Headers $Headers -TimeoutSec 15)
+    # Windows PowerShell 5.1에서 Invoke-RestMethod의 JSON 배열 응답을 명령 호출째
+    # @()로 감싸면 Object[] 하나가 다시 배열 안에 들어갈 수 있다. 그러면 foreach가
+    # 전체 릴리스 배열을 단일 릴리스처럼 검사해 모든 항목을 탈락시킨다.
+    # 먼저 응답을 변수에 받은 뒤 배열로 정규화해야 0/1/N건을 모두 같은 형태로 처리한다.
+    $rawReleases = Invoke-RestMethod -Uri $url -Headers $Headers -TimeoutSec 15 -ErrorAction Stop
+    $releases = @($rawReleases)
     $result = @()
     foreach ($release in $releases) {
         $descriptor = ConvertTo-ReleaseDescriptor -Release $release
