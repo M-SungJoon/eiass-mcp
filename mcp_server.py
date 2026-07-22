@@ -981,13 +981,16 @@ def eiass_export_spatial_matches_csv(rows_json: str, filename: str = '') -> dict
 
 @mcp.tool()
 def eiass_check_server_status() -> dict:
-    """EIASS 본사이트/검색 API, VWorld 지오코딩 API, KDPA(보호구역) WFS 세 외부 서비스가
-    지금 정상 응답하는지 점검한다. 검색/조회/공간조회 도구가 갑자기 실패하거나 느릴 때,
-    EIASS 자체 장애인지 VWorld/KDPA 쪽 문제인지 원인을 좁히는 용도로 먼저 호출하면 좋다.
+    """MCP가 사용하는 모든 EIASS HTTP 경로와 VWorld/KDPA 외부 서비스의 현재 상태를 점검한다.
 
-    각 서비스별로 ok(정상 여부)/status_code(HTTP 상태코드)/latency_ms(응답시간)/error를
-    반환한다. VWORLD_API_KEY가 .env에 없으면 vworld 항목은 호출 없이 error로 그 사실만
-    알린다. all_ok가 false면 어느 서비스가 문제인지 응답 내용을 사용자에게 그대로 보여줘라.
+    EIASS 본사이트, 통합 검색 API, 환경영향평가 상세조회, 전략·소규모·사전환경성 상세조회,
+    사후환경영향조사 상세조회, PDF 다운로드 API를 각각 확인한다. PDF 다운로드는 최근 정상
+    문서(없는 경우 공개 검색에서 동적으로 찾은 문서)의 첫 4 KiB만 받아 실제 PDF 응답 여부와
+    첫 바이트 응답시간을 확인한 뒤 즉시 연결을 닫는다. PDF 전체 다운로드나 텍스트 추출은 하지 않는다.
+
+    각 서비스별로 ok/kind/status_code/latency_ms/error를 반환한다. PDF 항목에는 추가로
+    bytes_checked/sample_source가 포함된다. eiass_all_ok는 EIASS 경로만의 종합 상태이고,
+    all_ok는 VWorld/KDPA까지 포함한다. 일부 항목만 실패해도 정상 항목과 함께 모두 보여줘라.
     """
     return core.check_server_status()
 

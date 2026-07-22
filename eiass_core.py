@@ -55,7 +55,7 @@ except ImportError:
 
 # 저장소 루트 VERSION 파일과 항상 같은 값으로 맞춰서 커밋할 것(버전 두 곳 중복 관리).
 # 어긋난 채로 커밋되지 않도록 build_mcp.py가 빌드 시작 전에 두 값을 대조한다.
-__version__ = '1.15.0'
+__version__ = '1.15.1'
 
 REQUEST_TIMEOUT = (8, 30)
 
@@ -2966,6 +2966,13 @@ def scan_projects_protected_area_adjacency(
 # 확인하고 싶을 때 쓴다. 각 서비스 호출부(search_projects/geocode_address/
 # find_nearby_protected_areas)와 동일한 엔드포인트·verify 설정을 그대로 재사용한다.
 
+HEALTH_REQUEST_TIMEOUT = (5, 15)
+HEALTH_PDF_BYTES_TO_READ = 4096
+HEALTH_PDF_DISCOVERY_TIMEOUT_SECONDS = 30
+_HEALTH_PDF_SAMPLE_LOCK = threading.Lock()
+_HEALTH_PDF_SAMPLE_FILE_SEQ = None
+
+
 def _http_probe(method, url, session, **kwargs):
     """단순 HTTP 헬스체크 한 번을 수행해 상태코드/응답시간(ms)/에러를 기록한다.
     5xx나 예외는 실패로 보되, 4xx는 "서비스는 응답했다"는 의미로 성공 취급한다
@@ -2977,32 +2984,42 @@ def _http_probe(method, url, session, **kwargs):
       'slow' — 타임아웃. 서버가 살아있지만 느린 것일 수 있어 장애로 단정하지 않는다.
       'down' — 5xx / 연결 거부 / DNS 실패 등 명백한 장애.
     """
+    timeout = kwargs.pop('timeout', HEALTH_REQUEST_TIMEOUT)
     started = time.monotonic()
     try:
-        res = session.request(method, url, timeout=REQUEST_TIMEOUT, **kwargs)
+        res = session.request(method, url, timeout=timeout, **kwargs)
     except requests.exceptions.Timeout as exc:
         return {'ok': False, 'kind': 'slow', 'status_code': None,
                 'latency_ms': round((time.monotonic() - started) * 1000), 'error': str(exc)}
     except Exception as exc:
-        return {'ok': False, 'kind': 'down', 'status_code': None, 'latency_ms': None, 'error': str(exc)}
-    latency_ms = round((time.monotonic() - started) * 1000)
-    ok = res.status_code < 500
-    return {'ok': ok, 'kind': 'ok' if ok else 'down', 'status_code': res.status_code,
-            'latency_ms': latency_ms, 'error': None}
+        return {'ok': False, 'kind': 'down', 'status_code': None,
+                'latency_ms': round((time.monotonic() - started) * 1000), 'error': str(exc)}
+    try:
+        latency_ms = round((time.monotonic() - started) * 1000)
+        ok = res.status_code < 500
+        return {'ok': ok, 'kind': 'ok' if ok else 'down', 'status_code': res.status_code,
+                'latency_ms': latency_ms, 'error': None}
+    finally:
+        res.close()
 
 
 def check_server_status(session=None):
-    """EIASS 본사이트/검색 API, VWorld 지오코딩 API, KDPA WFS의 접속 가능 여부를 점검한다.
+    """MCP가 사용하는 모든 EIASS HTTP 경로와 VWorld/KDPA의 접속 가능 여부를 점검한다.
 
     각 서비스가 정상 응답 중인지, HTTP 상태코드와 응답시간(ms)은 어떤지 즉시 확인할 때
     쓴다(EIASS도 운영체제 신뢰 저장소로 TLS 인증서를 검증한다). VWORLD_API_KEY가
     설정되어 있지 않으면 VWorld 항목은 호출 자체를 생략하고 그 사실을 error로 남긴다.
 
-    반환: {'eiass_site','eiass_search_api','vworld','kdpa': {'ok','status_code',
-        'latency_ms','error'}, 'all_ok': bool, 'checked_at': ISO8601 UTC 문자열}
+    EIASS는 본사이트, 검색, EIA/PER/사후 상세조회, 실제 PDF 다운로드의 첫 4 KiB까지
+    각각 확인한다. PDF 전체를 내려받거나 텍스트를 추출하지 않으므로 상태확인 자체가 무거운
+    문서 작업이 되지는 않는다.
+
+    반환: 각 서비스별 {'ok','kind','status_code','latency_ms','error'},
+        'eiass_all_ok': bool, 'all_ok': bool, 'checked_at': ISO8601 UTC 문자열
     """
     result = dict(probe_services(SERVICE_ORDER, session=session, use_cache=False))
     result['checked_at'] = datetime.utcnow().isoformat() + 'Z'
+    result['eiass_all_ok'] = all(result[name]['ok'] for name in EIASS_SERVICE_ORDER)
     result['all_ok'] = all(v['ok'] for v in result.values() if isinstance(v, dict) and 'ok' in v)
     return result
 
@@ -3027,6 +3044,164 @@ def _probe_eiass_search_api(s):
             'Origin': EIASS_BASE, 'Referer': EIASS_BASE + '/biz/base/info/perList.do',
         },
     )
+
+
+def _probe_eiass_eia_detail_api(s):
+    return _http_probe(
+        'GET', EIASS_BASE + '/biz/base/info/eiaInfo.do', s,
+        params={'EIA_CD': 'HEALTHCHECK', 'REVIRPT_SEQ': '0'},
+        headers={'User-Agent': 'Mozilla/5.0', 'Origin': EIASS_BASE},
+    )
+
+
+def _probe_eiass_per_detail_api(s):
+    return _http_probe(
+        'GET', EIASS_BASE + '/biz/base/info/perInfo.do', s,
+        params={'PER_CD': 'HEALTHCHECK'},
+        headers={'User-Agent': 'Mozilla/5.0', 'Origin': EIASS_BASE},
+    )
+
+
+def _probe_eiass_after_detail_api(s):
+    return _http_probe(
+        'POST', EIASS_BASE + '/biz/base/info/afterInfo.do', s,
+        data={'EIA_CD': 'HEALTHCHECK', 'AES_SEQ': '0'},
+        headers={'User-Agent': 'Mozilla/5.0', 'Referer': EIASS_BASE + '/'},
+    )
+
+
+def _cached_health_pdf_file_seqs(limit=5):
+    """최근 실제로 읽은 PDF 식별자를 반환한다. 캐시 내용은 읽기만 하며 텍스트는 열지 않는다."""
+    try:
+        path = os.path.abspath(_cache_db_path()).replace('\\', '/')
+        uri = 'file:///' + urllib.parse.quote(path, safe=':/') + '?mode=ro'
+        with sqlite3.connect(uri, uri=True, timeout=1) as conn:
+            rows = conn.execute(
+                'SELECT file_seq FROM doc_text_cache ORDER BY fetched_at DESC LIMIT ?', (limit,)
+            ).fetchall()
+        return [str(row[0]) for row in rows if row and row[0]]
+    except (OSError, sqlite3.Error):
+        return []
+
+
+def _discover_health_pdf_file_seq(session):
+    """빈 캐시인 새 설치에서도 고정 ID 없이 공개 검색 결과에서 점검용 PDF를 찾는다."""
+    deadline = time.monotonic() + HEALTH_PDF_DISCOVERY_TIMEOUT_SECONDS
+    candidates = search_projects(
+        keyword='', type_codes=['E'], max_pages=1, session=session,
+        consult_date_from=f'{date.today().year - 1}-01-01')
+    for item in candidates[:10]:
+        remaining = deadline - time.monotonic()
+        if remaining < 1:
+            break
+        bounded_timeout = (min(5, remaining), min(15, remaining))
+        try:
+            detail = get_project_detail(
+                item['view_type'], item['eia_cd'], item['revirpt_seq'], session=session,
+                use_cache=False, request_timeout=bounded_timeout)
+        except Exception:
+            continue
+        for categories in (detail.get('stage_docs') or {}).values():
+            for files in (categories or {}).values():
+                for file_info in files or []:
+                    if file_info.get('is_pdf') and file_info.get('seq'):
+                        return str(file_info['seq'])
+    return None
+
+
+def _probe_pdf_file_seq(session, file_seq, sample_source):
+    started = time.monotonic()
+    response = None
+    try:
+        response = session.get(
+            FILE_DOWNLOAD_URL,
+            params={'FILE_SEQ': file_seq},
+            headers={
+                'User-Agent': 'Mozilla/5.0', 'Referer': EIASS_BASE + '/',
+                'Range': f'bytes=0-{HEALTH_PDF_BYTES_TO_READ - 1}',
+            },
+            timeout=HEALTH_REQUEST_TIMEOUT,
+            stream=True,
+        )
+        first_bytes = next(response.iter_content(chunk_size=HEALTH_PDF_BYTES_TO_READ), b'')
+        latency_ms = round((time.monotonic() - started) * 1000)
+        is_pdf = first_bytes.startswith(b'%PDF-')
+        ok = response.status_code in (200, 206) and is_pdf
+        if response.status_code not in (200, 206):
+            error = f'PDF 다운로드 HTTP {response.status_code}'
+        elif not is_pdf:
+            error = 'PDF 다운로드 응답이 PDF 형식이 아닙니다.'
+        else:
+            error = None
+        kind = 'ok' if ok else ('down' if response.status_code >= 500 else 'degraded')
+        return {
+            'ok': ok, 'kind': kind,
+            'status_code': response.status_code, 'latency_ms': latency_ms, 'error': error,
+            'bytes_checked': len(first_bytes), 'sample_source': sample_source,
+        }
+    except requests.exceptions.Timeout as exc:
+        return {
+            'ok': False, 'kind': 'slow', 'status_code': None,
+            'latency_ms': round((time.monotonic() - started) * 1000), 'error': str(exc),
+            'bytes_checked': 0, 'sample_source': sample_source,
+        }
+    except Exception as exc:
+        return {
+            'ok': False, 'kind': 'down', 'status_code': None,
+            'latency_ms': round((time.monotonic() - started) * 1000),
+            'error': str(exc), 'bytes_checked': 0, 'sample_source': sample_source,
+        }
+    finally:
+        if response is not None:
+            response.close()
+
+
+def _probe_eiass_pdf_download_api(s):
+    global _HEALTH_PDF_SAMPLE_FILE_SEQ
+    with _HEALTH_PDF_SAMPLE_LOCK:
+        remembered = _HEALTH_PDF_SAMPLE_FILE_SEQ
+    candidates = []
+    if remembered:
+        candidates.append((remembered, 'memory'))
+    candidates.extend((seq, 'document_cache') for seq in _cached_health_pdf_file_seqs())
+
+    seen = set()
+    last_failure = None
+    for file_seq, source in candidates:
+        if file_seq in seen:
+            continue
+        seen.add(file_seq)
+        result = _probe_pdf_file_seq(s, file_seq, source)
+        if result['ok']:
+            with _HEALTH_PDF_SAMPLE_LOCK:
+                _HEALTH_PDF_SAMPLE_FILE_SEQ = file_seq
+            return result
+        if result['kind'] in ('slow', 'down'):
+            return result
+        last_failure = result
+
+    try:
+        discovered = _discover_health_pdf_file_seq(s)
+    except Exception as exc:
+        discovered = None
+        discovery_error = str(exc)
+    else:
+        discovery_error = None
+    if discovered and discovered not in seen:
+        result = _probe_pdf_file_seq(s, discovered, 'live_discovery')
+        if result['ok']:
+            with _HEALTH_PDF_SAMPLE_LOCK:
+                _HEALTH_PDF_SAMPLE_FILE_SEQ = discovered
+        return result
+    if last_failure:
+        if discovery_error:
+            last_failure['error'] = f"{last_failure['error']} 점검용 PDF 재탐색 실패: {discovery_error}"
+        return last_failure
+    return {
+        'ok': False, 'kind': 'unknown', 'status_code': None, 'latency_ms': None,
+        'error': discovery_error or '점검 가능한 공개 PDF를 찾지 못했습니다.',
+        'bytes_checked': 0, 'sample_source': None,
+    }
 
 
 def _probe_vworld(s):
@@ -3054,13 +3229,25 @@ def _probe_kdpa(s):
 _PROBES = {
     'eiass_site': _probe_eiass_site,
     'eiass_search_api': _probe_eiass_search_api,
+    'eiass_eia_detail_api': _probe_eiass_eia_detail_api,
+    'eiass_per_detail_api': _probe_eiass_per_detail_api,
+    'eiass_after_detail_api': _probe_eiass_after_detail_api,
+    'eiass_pdf_download_api': _probe_eiass_pdf_download_api,
     'vworld': _probe_vworld,
     'kdpa': _probe_kdpa,
 }
-SERVICE_ORDER = ('eiass_site', 'eiass_search_api', 'vworld', 'kdpa')
+EIASS_SERVICE_ORDER = (
+    'eiass_site', 'eiass_search_api', 'eiass_eia_detail_api', 'eiass_per_detail_api',
+    'eiass_after_detail_api', 'eiass_pdf_download_api',
+)
+SERVICE_ORDER = EIASS_SERVICE_ORDER + ('vworld', 'kdpa')
 SERVICE_LABELS = {
     'eiass_site': 'EIASS 본사이트',
     'eiass_search_api': 'EIASS 검색 API',
+    'eiass_eia_detail_api': 'EIASS 환경영향평가 상세조회 API',
+    'eiass_per_detail_api': 'EIASS 전략·소규모·사전환경성 상세조회 API',
+    'eiass_after_detail_api': 'EIASS 사후환경영향조사 상세조회 API',
+    'eiass_pdf_download_api': 'EIASS PDF 다운로드 API',
     'vworld': 'VWorld 지오코딩 API',
     'kdpa': 'KDPA 보호지역 WFS',
 }
@@ -3088,9 +3275,34 @@ def probe_services(names, session=None, use_cache=True):
                 continue
         missing.append(name)
     if missing:
-        s = session or _session(retry=False)
+        def run_probe(name):
+            probe_session = session or _session(retry=False)
+            try:
+                return _PROBES[name](probe_session)
+            finally:
+                if session is None:
+                    probe_session.close()
+
+        # 운영 호출은 독립 세션으로 동시에 확인해 한 API의 타임아웃이 다른 API 상태까지
+        # 순차적으로 지연시키지 않는다. 테스트/호출자가 세션을 주입한 경우에는 그 세션의
+        # 순서·호출 기록을 보존하기 위해 기존처럼 순차 실행한다.
+        if session is not None or len(missing) == 1:
+            completed = {name: run_probe(name) for name in missing}
+        else:
+            completed = {}
+            with ThreadPoolExecutor(max_workers=len(missing)) as executor:
+                futures = {executor.submit(run_probe, name): name for name in missing}
+                for future in as_completed(futures):
+                    name = futures[future]
+                    try:
+                        completed[name] = future.result()
+                    except Exception as exc:
+                        completed[name] = {
+                            'ok': False, 'kind': 'down', 'status_code': None,
+                            'latency_ms': None, 'error': str(exc),
+                        }
         for name in missing:
-            probe = _PROBES[name](s)
+            probe = completed[name]
             result[name] = probe
             with _HEALTH_CACHE_LOCK:
                 _HEALTH_CACHE[name] = (probe, time.monotonic())
