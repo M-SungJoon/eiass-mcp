@@ -1,9 +1,45 @@
 """문서 후보 배치 실행과 후보별 단일 결과 정규화."""
 from concurrent.futures import ThreadPoolExecutor, as_completed
+import inspect
 
 import eiass_core as core
 from config import DOC_DOWNLOAD_CONCURRENCY
 from models import candidate_key
+
+
+class ScanPayloadError(RuntimeError):
+    """백그라운드 작업 제어값이 문서 검색 호출 경계로 누출된 경우."""
+
+
+class RepeatedCandidateFailure(RuntimeError):
+    """동일한 후보 처리 예외가 반복되어 작업 전체 결함/장애로 판단된 경우."""
+
+
+_SCAN_CONTROL_KEYS = frozenset({
+    'batch_size', 'survey_method', 'adaptive_strategy', '_on_progress',
+})
+_RUNTIME_QUERY_KEYS = frozenset({
+    'session', 'candidates', 'offset', 'max_candidates', 'should_cancel', 'on_progress',
+})
+_DOCUMENT_QUERY_KEYS = (
+    frozenset(inspect.signature(core.search_projects_by_document_keyword).parameters)
+    - _RUNTIME_QUERY_KEYS
+)
+_REPEATED_FAILURE_LIMIT = 3
+
+
+def _document_query_options(payload):
+    """job payload에서 core 문서 검색 함수가 선언한 검색 인자만 분리한다.
+
+    제어 인자는 명시적으로 소비하고, 그 밖의 알 수 없는 키는 조용히 버리지 않는다. 새 제어값을
+    추가하면서 이 경계를 갱신하지 않으면 첫 후보를 열기 전에 작업 오류로 드러나야 한다.
+    """
+    keys = set(payload)
+    unexpected = sorted(keys - _SCAN_CONTROL_KEYS - _DOCUMENT_QUERY_KEYS)
+    if unexpected:
+        raise ScanPayloadError(
+            '지원하지 않는 문서 스캔 payload 키가 있습니다: ' + ', '.join(unexpected))
+    return {key: value for key, value in payload.items() if key in _DOCUMENT_QUERY_KEYS}
 
 
 def _merge_stage_stats(total, batch):
@@ -15,9 +51,8 @@ def _merge_stage_stats(total, batch):
 
 def run_batch(payload, candidates, should_cancel, session=None, on_candidate_complete=None):
     """후보를 독립 작업으로 처리해 느린 PDF 하나가 다른 후보의 저장을 막지 않게 한다."""
-    options = dict(payload)
-    options.pop('batch_size', None)
-    on_progress = options.pop('_on_progress', None)
+    options = _document_query_options(payload)
+    on_progress = payload.get('_on_progress')
     audit_remaining = max(0, int(options.pop('audit_sample_size', 0) or 0))
     candidates = list(candidates)
     aggregate = {
@@ -49,6 +84,7 @@ def run_batch(payload, candidates, should_cancel, session=None, on_candidate_com
 
     max_workers = max(1, min(DOC_DOWNLOAD_CONCURRENCY, len(candidates)))
     completed = 0
+    failure_counts = {}
     with ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix='eiass-candidate') as pool:
         future_map = {pool.submit(scan_one, index, candidate): candidate
                       for index, candidate in enumerate(candidates)}
@@ -60,7 +96,19 @@ def run_batch(payload, candidates, should_cancel, session=None, on_candidate_com
                 result = future.result()
             except core.ScanCancelled:
                 raise
+            except TypeError as exc:
+                for pending in future_map:
+                    pending.cancel()
+                raise ScanPayloadError(f'문서 검색 호출 계약 오류: {exc}') from exc
             except Exception as exc:
+                signature = (type(exc).__name__, str(exc))
+                failure_counts[signature] = failure_counts.get(signature, 0) + 1
+                if failure_counts[signature] >= _REPEATED_FAILURE_LIMIT:
+                    for pending in future_map:
+                        pending.cancel()
+                    raise RepeatedCandidateFailure(
+                        f'동일 후보 처리 오류가 {_REPEATED_FAILURE_LIMIT}회 반복되어 조기 중단했습니다: '
+                        f'{signature[0]}: {signature[1]}') from exc
                 result = {
                     'matches': [], 'checked_no_match': [],
                     'skipped': [{'name': candidate.get('name'), 'eia_cd': candidate.get('eia_cd'),

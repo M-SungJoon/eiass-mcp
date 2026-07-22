@@ -676,7 +676,9 @@ def eiass_get_scan_status(job_id: str, include_matches: bool = False,
     seconds_since_heartbeat/activity로 DB 기록 장애와 실제 작업 정지를 구분할 수 있다.
     survey_phase/coverage_status/adaptive_state에는 적응형 라운드·감사 결과·판정 기록과
     adaptive_complete/coverage_insufficient/exhaustive_fallback/exhaustive_complete 상태가
-    표시된다. 적응형 실패 후에는 coverage_status가 exhaustive_complete가 될 때까지 기다려라.
+    표시된다. exhaustive_incomplete는 일부 후보 미확인, failed는 실제 확인 성공 없이 종료된
+    오류다. 적응형 실패 후에는 coverage_status가 exhaustive_complete가 될 때까지 기다리고,
+    exhaustive_incomplete/failed를 완전한 전수조사 결과로 보고하지 마라.
 
     needs_refinement가 true면 매칭이 과도하거나 참고문헌/부록 문맥으로 보이는 매칭이 많다는
     뜻이다 — refinement_hints를 참고해 스캔 결과를 그대로 최종 답으로 쓰지 말고, 사용자에게

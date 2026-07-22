@@ -21,6 +21,58 @@ _HEARTBEAT_DIAGNOSTICS = {}
 _HEARTBEAT_DIAGNOSTICS_LOCK = threading.Lock()
 
 
+def _document_result_counts(store, job_id):
+    counts = store.result_counts(job_id)
+    verified = counts.get('match', 0) + counts.get('no_match', 0)
+    skipped = counts.get('skipped', 0)
+    return counts, verified, skipped
+
+
+def _require_verified_document_results(store, job_id, label):
+    """후보가 있는데 실제 확인 성공이 0건인 작업을 성공으로 확정하지 않는다."""
+    job = store.get(job_id)
+    _, verified, skipped = _document_result_counts(store, job_id)
+    total = int((job or {}).get('candidates_total') or 0)
+    if total > 0 and verified == 0:
+        raise RuntimeError(
+            f'{label}를 완료할 수 없습니다: 실제 문서 확인 성공 0건, 제외/실패 {skipped}건, '
+            f'전체 후보 {total}건입니다.')
+
+
+def _finalize_exhaustive_document_job(store, job_id):
+    """전수 경로의 실제 검증/skip 수에 맞춰 완료·불완전·실패 상태를 확정한다."""
+    job = store.get(job_id)
+    counts, verified, skipped = _document_result_counts(store, job_id)
+    total = int((job or {}).get('candidates_total') or 0)
+    summary = {
+        'candidates_total': total,
+        'verified': verified,
+        'matched': counts.get('match', 0),
+        'no_match': counts.get('no_match', 0),
+        'skipped': skipped,
+    }
+    if total > 0 and verified == 0:
+        message = (
+            f'전수조사를 완료할 수 없습니다: 실제 문서 확인 성공 0건, '
+            f'제외/실패 {skipped}건, 전체 후보 {total}건입니다.')
+        store.merge_meta(job_id, {
+            'coverage_status': 'failed',
+            'completion_summary': summary,
+            'completion_warning': message,
+        }, phase='document_scan_failed')
+        store.update(job_id, status='error', phase='document_scan_failed',
+                     error=message, clear_owner=True)
+        return False
+    coverage_status = 'exhaustive_incomplete' if skipped else 'exhaustive_complete'
+    updates = {'coverage_status': coverage_status, 'completion_summary': summary}
+    if skipped:
+        updates['completion_warning'] = (
+            f'전수조사가 종료됐지만 전체 후보 {total}건 중 {skipped}건은 확인하지 못했습니다.')
+    store.merge_meta(job_id, updates)
+    store.update(job_id, status='done', phase='completed', clear_owner=True)
+    return True
+
+
 class ScanRunner:
     def __init__(self, store=None, worker_count=JOB_WORKER_COUNT, queue_size=JOB_QUEUE_SIZE):
         self.store = store or JobStore()
@@ -253,6 +305,8 @@ class ScanRunner:
                         adaptive_state = initial_state(
                             self.store.get(job_id)['candidates_total'] or 0, strategy)
                     if adaptive_state.get('coverage_status') == 'adaptive_complete':
+                        _require_verified_document_results(
+                            self.store, job_id, '적응형 조사')
                         self.store.update(job_id, status='done', phase='adaptive_completed',
                                           clear_owner=True)
                         return
@@ -261,6 +315,8 @@ class ScanRunner:
                     while adaptive_state.get('coverage_status') != 'coverage_insufficient':
                         pending = self.store.candidates(job_id, only_pending=True)
                         if not pending:
+                            _require_verified_document_results(
+                                self.store, job_id, '적응형 조사')
                             adaptive_state['coverage_status'] = 'adaptive_complete'
                             adaptive_state['survey_phase'] = 'adaptive'
                             self.store.merge_meta(job_id, {
@@ -352,7 +408,8 @@ class ScanRunner:
                 if kind == 'document':
                     final_meta = self.store.get(job_id)['meta']
                     if final_meta.get('survey_phase') in ('exhaustive', 'exhaustive_fallback'):
-                        self.store.merge_meta(job_id, {'coverage_status': 'exhaustive_complete'})
+                        _finalize_exhaustive_document_job(self.store, job_id)
+                        return
                 self.store.update(job_id, status='done', phase='completed', clear_owner=True)
         except core.ScanCancelled:
             if self.store.owner_is(job_id, self.owner_id):
@@ -404,7 +461,12 @@ def _progress_message(status, unchanged=False):
     state = status.get('activity_state')
     survey_phase = status.get('survey_phase')
     if job_status == 'done':
-        heading = f"스캔이 완료되었습니다 — 후보 {checked}/{total or checked}건을 확인했습니다."
+        if status.get('coverage_status') == 'exhaustive_incomplete':
+            heading = (
+                f"스캔이 종료됐지만 일부 후보는 확인하지 못했습니다 — "
+                f"후보 {checked}/{total or checked}건 처리.")
+        else:
+            heading = f"스캔이 완료되었습니다 — 후보 {checked}/{total or checked}건을 확인했습니다."
     elif job_status == 'cancelled':
         heading = f"스캔이 취소되었습니다 — 후보 {checked}/{total or '?'}건까지 확인했습니다."
     elif job_status == 'error':
@@ -432,6 +494,8 @@ def _progress_message(status, unchanged=False):
         lines.append(
             f"결과: 일치 {status.get('match_count', 0)}건 · 매칭 없음 "
             f"{status.get('checked_no_match_count', 0)}건 · 제외/실패 {status.get('skipped_count', 0)}건")
+    if status.get('completion_warning'):
+        lines.append(f"주의: {status['completion_warning']}")
     current = ' / '.join(filter(None, (work.get('current_candidate'), work.get('current_file'))))
     if current:
         lines.append(f"현재: {current} ({work.get('phase') or status.get('current_phase')})")
@@ -523,6 +587,27 @@ def document_status(store, job_id, include_results=False, offset=0, limit=100):
     if not job or job['kind'] != 'document':
         return {'error': f'알 수 없는 job_id: {job_id}'}
     counts = store.result_counts(job_id)
+    verified_count = counts.get('match', 0) + counts.get('no_match', 0)
+    skipped_count = counts.get('skipped', 0)
+    reported_status = job['status']
+    reported_error = job['error']
+    reported_coverage = job['meta'].get('coverage_status')
+    completion_summary = job['meta'].get('completion_summary')
+    completion_warning = job['meta'].get('completion_warning')
+    # 1.17.0~1.17.1이 전 후보를 호출 계약 오류로 skip하고도 done으로 저장한 작업도,
+    # 업그레이드 후 상태조회에서는 성공으로 보이지 않게 읽기 시점에 바로잡는다.
+    if (reported_status == 'done' and job['candidates_total'] and verified_count == 0):
+        reported_status = 'error'
+        reported_coverage = 'failed'
+        reported_error = reported_error or (
+            f'실제 문서 확인 성공 0건, 제외/실패 {skipped_count}건, '
+            f'전체 후보 {job["candidates_total"]}건으로 완료 결과를 인정할 수 없습니다.')
+        completion_warning = completion_warning or reported_error
+        completion_summary = completion_summary or {
+            'candidates_total': job['candidates_total'], 'verified': 0,
+            'matched': counts.get('match', 0), 'no_match': counts.get('no_match', 0),
+            'skipped': skipped_count,
+        }
     now = time.time()
     work_progress = job['meta'].get('work_progress') or {}
     heartbeat_diagnostics = job['meta'].get('heartbeat_diagnostics') or {}
@@ -532,28 +617,30 @@ def document_status(store, job_id, include_results=False, offset=0, limit=100):
     heartbeat_age = max(0.0, now - job['heartbeat_at'])
     activity_at = work_progress.get('last_activity_at') or work_progress.get('progress_at') or job['updated_at']
     activity_age = max(0.0, now - activity_at)
-    if job['status'] in ('running', 'discovering'):
+    if reported_status in ('running', 'discovering'):
         activity_state = work_progress.get('activity_state') or 'running'
         if (heartbeat_diagnostics.get('consecutive_failures', 0) > 0 or
                 activity_state == 'local_resource_pressure'):
             activity_state = 'local_resource_pressure'
         if heartbeat_age > JOB_HEARTBEAT_INTERVAL_SECONDS * 3 and activity_age > 60:
             activity_state = 'stalled'
-    elif job['status'] == 'done':
+    elif reported_status == 'done':
         activity_state = 'completed'
     else:
-        activity_state = job['status']
+        activity_state = reported_status
 
     progress_percent = (round(job['checked'] * 100 / job['candidates_total'], 1)
                         if job['candidates_total'] else None)
-    result = {'status': job['status'], 'activity_state': activity_state,
+    result = {'status': reported_status, 'activity_state': activity_state,
               'checked': job['checked'], 'candidates_total': job['candidates_total'],
               'progress_percent': progress_percent,
               'candidate_coverage_percent': progress_percent,
               'survey_method': job['payload'].get('survey_method') or 'exhaustive',
               'survey_phase': job['meta'].get('survey_phase') or
                               job['payload'].get('survey_method') or 'exhaustive',
-              'coverage_status': job['meta'].get('coverage_status'),
+              'coverage_status': reported_coverage,
+              'completion_summary': completion_summary,
+              'completion_warning': completion_warning,
               'fallback_reason': job['meta'].get('fallback_reason'),
               'adaptive_state': job['meta'].get('adaptive_state'),
               'progress_seq': job.get('progress_seq', 0),
@@ -569,7 +656,7 @@ def document_status(store, job_id, include_results=False, offset=0, limit=100):
               'heartbeat_diagnostics': heartbeat_diagnostics or None,
               'seconds_since_heartbeat': round(heartbeat_age, 1),
               'seconds_since_activity': round(activity_age, 1),
-              'error': job['error'], 'current_phase': job['current_phase'],
+              'error': reported_error, 'current_phase': job['current_phase'],
               'updated_at': job['updated_at'], 'heartbeat_at': job['heartbeat_at'], 'resume_count': job['resume_count']}
     result['notification_policy'] = {
         'internal_poll_seconds': SCAN_MONITOR_POLL_SECONDS,
