@@ -25,6 +25,7 @@ typer는 mcp 실행에 필요 없지만, mcp.cli.cli가 optional import로 typer
 import os
 import argparse
 import hashlib
+import json
 import re
 import shutil
 import stat
@@ -69,6 +70,41 @@ def configure_stdio():
                 stream.reconfigure(encoding='utf-8', errors='replace')
             except Exception:
                 pass
+
+
+def git_output(*args):
+    return subprocess.check_output(
+        ['git', *args], cwd=BASE_DIR, text=True, encoding='utf-8',
+        stderr=subprocess.DEVNULL,
+    ).strip()
+
+
+def assert_clean_release_source():
+    """배포 자산이 태그 밖의 미커밋 소스에서 만들어지는 일을 막는다."""
+    try:
+        branch = git_output('branch', '--show-current')
+        source_commit = git_output('rev-parse', 'HEAD')
+        tracked_changes = git_output('status', '--porcelain', '--untracked-files=no')
+    except (OSError, subprocess.SubprocessError) as exc:
+        print(f'❌ Git 배포 출처를 확인하지 못했습니다: {exc}')
+        sys.exit(8)
+    if branch != 'main':
+        print(f'❌ 배포 빌드는 main 브랜치에서만 허용됩니다(현재: {branch or "detached"}).')
+        sys.exit(8)
+    if tracked_changes:
+        print('❌ 추적 파일에 미커밋 변경이 있어 재현 가능한 배포를 만들 수 없습니다.')
+        print(tracked_changes)
+        sys.exit(8)
+    return source_commit
+
+
+def write_build_info(source_commit):
+    path = os.path.join(WORK_DIR, 'eiass_build_info.json')
+    with open(path, 'w', encoding='utf-8', newline='\n') as stream:
+        json.dump({'source_commit': source_commit,
+                   'tls_verification': 'system_trust_store'}, stream, ensure_ascii=False)
+        stream.write('\n')
+    return path
 
 
 def write_manifest(path):
@@ -146,10 +182,12 @@ def assert_version_in_sync():
 def build():
     assert_build_python()
     assert_version_in_sync()
+    source_commit = assert_clean_release_source()
     os.makedirs(DIST_DIR, exist_ok=True)
     os.makedirs(WORK_DIR, exist_ok=True)
     os.environ['PYTHONHASHSEED'] = '0'
     os.environ.setdefault('SOURCE_DATE_EPOCH', '0')
+    build_info_path = write_build_info(source_commit)
     app_dir = os.path.join(DIST_DIR, OUTPUT_NAME)
     rmtree_resilient(app_dir)  # 이전 빌드의 잔여 파일이 새 배포본에 섞여 들어가지 않게 한다
     cmd = [
@@ -166,6 +204,7 @@ def build():
         '--workpath', WORK_DIR,
         '--specpath', SPEC_DIR,
         '--hidden-import', 'bs4',
+        '--add-data', build_info_path + os.pathsep + '.',
         '--clean',
         SRC,
     ]
@@ -201,10 +240,10 @@ def build():
     size_mb = os.path.getsize(versioned_zip) / (1024 * 1024)
     print(f'\n✅ 빌드 완료: {app_dir}')
     print(f'   릴리스 자산: {asset_zip} ({size_mb:.1f} MB)')
-    return asset_zip
+    return asset_zip, source_commit
 
 
-def publish_release(asset_zip):
+def publish_release(asset_zip, source_commit):
     """빌드 산출물을 GitHub 릴리스로 올린다.
 
     저장소에 41MB zip을 커밋하면 git 히스토리에 영구히 쌓인다(실측: 22회 커밋에 .git 907MB).
@@ -215,12 +254,21 @@ def publish_release(asset_zip):
                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode == 0
     assets = [asset_zip, asset_zip + '.sha256']
     if exists:
+        try:
+            tag_commit = git_output('rev-list', '-n', '1', tag)
+        except (OSError, subprocess.SubprocessError):
+            tag_commit = ''
+        if tag_commit != source_commit:
+            print(f'❌ 기존 {tag} 태그({tag_commit or "unknown"})가 빌드 커밋({source_commit})과 다릅니다.')
+            sys.exit(8)
         print(f'릴리스 {tag}가 이미 있어 자산만 갱신합니다.')
         cmd = ['gh', 'release', 'upload', tag] + assets + ['--clobber']
     else:
         cmd = ['gh', 'release', 'create', tag] + assets + [
+            '--target', source_commit,
             '--title', f'EIASS MCP {VERSION}',
-            '--notes', f'EIASS MCP {VERSION}\n\n설치/업데이트: `install.bat`을 더블클릭하세요.',
+            '--notes', (f'EIASS MCP {VERSION}\n\nSource commit: `{source_commit}`\n\n'
+                        '설치/업데이트: `install.bat`을 더블클릭하세요.'),
         ]
     result = subprocess.run(cmd, cwd=BASE_DIR)
     if result.returncode != 0:
@@ -235,6 +283,6 @@ if __name__ == '__main__':
     parser.add_argument('--publish-release', action='store_true',
                         help='빌드 후 GitHub 릴리스(v<VERSION>)에 배포본을 올린다')
     args = parser.parse_args()
-    built_asset = build()
+    built_asset, source_commit = build()
     if args.publish_release:
-        publish_release(built_asset)
+        publish_release(built_asset, source_commit)

@@ -24,11 +24,11 @@ import shutil
 import sys
 import tempfile
 
-import requests
 from mcp.server.fastmcp import FastMCP
 
 import eiass_core as core
-from config import JOB_RESULT_PAGE_LIMIT
+import requests
+from config import JOB_RESULT_PAGE_LIMIT, MAX_SCAN_BATCH_SIZE
 from job_store import JobStore
 from scan_engine import ScanRunner, document_status, spatial_status
 
@@ -523,8 +523,8 @@ def eiass_start_document_keyword_scan(
         except (core.EiassError, requests.exceptions.RequestException) as exc:
             return _fail(exc, SVC_SEARCH)
 
-    if batch_size <= 0:
-        return {'error': 'batch_size는 1 이상의 정수여야 합니다.'}
+    if not isinstance(batch_size, int) or not 1 <= batch_size <= MAX_SCAN_BATCH_SIZE:
+        return {'error': f'batch_size는 1~{MAX_SCAN_BATCH_SIZE} 범위의 정수여야 합니다.'}
     job_id = uuid.uuid4().hex[:12]
     kwargs = dict(text_queries=query_list, batch_size=batch_size,
                   audit_sample_size=audit_sample_size, **common_kwargs)
@@ -543,7 +543,8 @@ def eiass_get_scan_status(job_id: str, include_matches: bool = False,
                           result_offset: int = 0, result_limit: int = 100) -> dict:
     """eiass_start_document_keyword_scan이 반환한 job_id로 진행 상황과 지금까지의 매칭
     결과를 조회한다(스캔이 running이어도 즉시 응답한다). status는
-    'running' | 'done' | 'cancelled' | 'error'.
+    'queued' | 'discovering' | 'running' | 'done' | 'cancelled' | 'error'. work_progress는
+    현재 배치의 prefetch/matching 단계, 완료 후보 수, 현재 사업을 보여준다.
 
     needs_refinement가 true면 매칭이 과도하거나 참고문헌/부록 문맥으로 보이는 매칭이 많다는
     뜻이다 — refinement_hints를 참고해 스캔 결과를 그대로 최종 답으로 쓰지 말고, 사용자에게
@@ -899,8 +900,8 @@ def eiass_start_spatial_scan(
         except (core.EiassError, requests.exceptions.RequestException) as exc:
             return _fail(exc, SVC_SEARCH_SPATIAL)
 
-    if batch_size <= 0:
-        return {'error': 'batch_size는 1 이상의 정수여야 합니다.'}
+    if not isinstance(batch_size, int) or not 1 <= batch_size <= MAX_SCAN_BATCH_SIZE:
+        return {'error': f'batch_size는 1~{MAX_SCAN_BATCH_SIZE} 범위의 정수여야 합니다.'}
     job_id = uuid.uuid4().hex[:12]
     kwargs = dict(radius_m=radius_m, designations=designation_list, allow_admin_fallback=allow_admin_fallback,
                   batch_size=batch_size, **common_kwargs)
@@ -995,7 +996,7 @@ def eiass_check_server_status() -> dict:
 def eiass_version() -> dict:
     """이 EIASS MCP 서버(exe)의 버전을 반환한다. 설치된 버전과 최신 버전을 비교하고
     싶을 때 사용자에게 알려줄 용도로 쓴다(최신 버전 확인은 install.ps1/install.bat이 담당)."""
-    return {'version': core.__version__}
+    return {'version': core.__version__, **core.runtime_build_info()}
 
 
 @mcp.tool()

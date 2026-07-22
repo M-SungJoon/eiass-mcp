@@ -6,7 +6,9 @@ from models import candidate_key
 def run_batch(payload, candidates, should_cancel, session=None):
     options = dict(payload)
     options.pop('batch_size', None)
-    options.update(candidates=candidates, offset=0, max_candidates=len(candidates), should_cancel=should_cancel, session=session)
+    on_progress = options.pop('_on_progress', None)
+    options.update(candidates=candidates, offset=0, max_candidates=len(candidates),
+                   should_cancel=should_cancel, session=session, on_progress=on_progress)
     return core.search_projects_by_document_keyword(**options)
 
 

@@ -3,12 +3,23 @@ import os
 import tempfile
 
 
+def bounded_env_int(name, default, minimum, maximum):
+    """환경변수 정수를 안전한 실행 범위로 제한한다."""
+    raw = os.environ.get(name)
+    try:
+        value = int(raw) if raw not in (None, '') else default
+    except (TypeError, ValueError):
+        value = default
+    return max(minimum, min(maximum, value))
+
+
 APP_NAME = 'DOHWA EIASS Agent'
 JOB_WORKER_COUNT = 2
 JOB_QUEUE_SIZE = 32
 JOB_RETENTION_SECONDS = 24 * 60 * 60
 MAX_RETAINED_JOBS = 100
 JOB_RESULT_PAGE_LIMIT = 500
+MAX_SCAN_BATCH_SIZE = 25
 JOB_HEARTBEAT_INTERVAL_SECONDS = 5
 JOB_LEASE_TIMEOUT_SECONDS = 30
 PDF_EXTRACT_TIMEOUT_SECONDS = 90
@@ -17,11 +28,14 @@ PDF_MAX_PAGES = 3000
 # 문서 스캔 처리량 튜닝.
 # 한 배치의 문서를 이만큼 동시에 내려받아 캐시를 데운다(다운로드는 네트워크 대기라 병렬화
 # 효과가 크다). EIASS는 정부 사이트라 과한 동시요청은 rate-limit/차단 위험이 있으니, 차단이
-# 보이면 이 값을 낮춘다. 환경변수 EIASS_DOC_CONCURRENCY로도 덮어쓸 수 있다.
-DOC_DOWNLOAD_CONCURRENCY = int(os.environ.get('EIASS_DOC_CONCURRENCY') or 10)
+# 보이면 이 값을 낮춘다. 이 값은 job별이 아니라 프로세스 전체 상한으로도 사용한다.
+# 환경변수가 잘못되거나 과도해도 서버 기동 실패/과부하가 나지 않게 1~10으로 제한한다.
+DOC_DOWNLOAD_CONCURRENCY = bounded_env_int('EIASS_DOC_CONCURRENCY', 8, 1, 10)
 # 문서 다운로드 재시도 횟수(discovery와 달리 대량 다운로드는 빨리 실패하고 건너뛰는 게 낫다).
 # 느린 문서 하나가 재시도로 스캔을 오래 잡는 것을 막는다(실패는 로그로 남기고 계속 진행).
-DOC_DOWNLOAD_RETRY_TOTAL = int(os.environ.get('EIASS_DOC_RETRY') or 1)
+DOC_DOWNLOAD_RETRY_TOTAL = bounded_env_int('EIASS_DOC_RETRY', 1, 0, 3)
+DOC_DOWNLOAD_READ_TIMEOUT_SECONDS = bounded_env_int('EIASS_DOC_READ_TIMEOUT', 15, 5, 60)
+DETAIL_PREFETCH_READ_TIMEOUT_SECONDS = bounded_env_int('EIASS_DETAIL_READ_TIMEOUT', 15, 5, 60)
 DOC_CACHE_TTL_SECONDS = 30 * 24 * 60 * 60
 DOC_CACHE_MAX_CHARS = 100 * 1024 * 1024
 DETAIL_CACHE_TTL_SECONDS = 60 * 60
@@ -44,4 +58,7 @@ def app_data_dir():
 
 
 def job_db_path():
+    override = os.environ.get('EIASS_JOB_DB_PATH')
+    if override:
+        return os.path.abspath(os.path.expandvars(override))
     return os.path.join(app_data_dir(), 'mcp_jobs.sqlite3')

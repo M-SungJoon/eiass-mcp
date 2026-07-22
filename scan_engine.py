@@ -1,6 +1,7 @@
 """영속 JobStore를 사용하는 bounded worker 기반 스캔 실행기."""
 import queue
 import threading
+import time
 import uuid
 
 import eiass_core as core
@@ -59,7 +60,16 @@ class ScanRunner:
         while True:
             job_id = self.queue.get()
             try:
-                self._run(job_id)
+                try:
+                    self._run(job_id)
+                except Exception as exc:
+                    # 오류 상태를 기록하는 SQLite 호출 자체가 실패해도 워커 스레드는 죽지 않는다.
+                    # job heartbeat가 stale해지면 maintenance가 lease를 회수해 다시 실행한다.
+                    try:
+                        self.store.update(job_id, status='error', phase='worker_failure',
+                                          error=f'스캔 워커 내부 오류: {exc}', clear_owner=True)
+                    except Exception:
+                        pass
             finally:
                 with self._lock:
                     self._queued.discard(job_id)
@@ -86,7 +96,7 @@ class ScanRunner:
         def _heartbeat_pump():
             while not stop_heartbeat.wait(JOB_HEARTBEAT_INTERVAL_SECONDS):
                 try:
-                    self.store.touch_heartbeat(job_id)
+                    self.store.touch_heartbeat(job_id, owner_id=self.owner_id)
                 except Exception:
                     pass  # 일시적 SQLite 잠금은 다음 주기에 다시 시도한다
         pump = threading.Thread(target=_heartbeat_pump, name=f'eiass-hb-{job_id[:8]}', daemon=True)
@@ -120,6 +130,8 @@ class ScanRunner:
             pending = self.store.candidates(job_id, only_pending=True)
             batch_size = int(payload['batch_size'])
             for start in range(0, len(pending), batch_size):
+                if not self.store.owner_is(job_id, self.owner_id):
+                    return  # 다른 runner가 stale lease를 회수했으므로 이전 실행 결과를 쓰지 않는다.
                 if self.store.cancel_requested(job_id):
                     raise core.ScanCancelled('사용자 요청으로 취소했습니다.')
                 batch_meta = pending[start:start + batch_size]
@@ -127,7 +139,16 @@ class ScanRunner:
                 ordinal_by_key = {key: ordinal for key, ordinal, _ in batch_meta}
                 should_cancel = lambda: self.store.cancel_requested(job_id)
                 if kind == 'document':
-                    result = run_document_batch(payload, candidates, should_cancel, session)
+                    def _on_work_progress(progress):
+                        if not self.store.owner_is(job_id, self.owner_id):
+                            raise core.ScanCancelled('작업 lease가 다른 runner로 이전되었습니다.')
+                        progress_meta = self.store.get(job_id)['meta']
+                        progress_meta['work_progress'] = dict(progress, progress_at=time.time())
+                        self.store.update(job_id, phase=progress.get('phase', 'document_scan'),
+                                          meta=progress_meta)
+
+                    batch_payload = dict(payload, _on_progress=_on_work_progress)
+                    result = run_document_batch(batch_payload, candidates, should_cancel, session)
                     normalized = document_outcomes(candidates, result, ordinal_by_key)
                     meta = self.store.get(job_id)['meta']
                     meta['stage_stats'] = _merge_stage_stats(meta.get('stage_stats', {}), result.get('stage_stats', {}))
@@ -140,15 +161,20 @@ class ScanRunner:
                     result = run_spatial_batch(payload, candidates, should_cancel, session)
                     normalized = spatial_outcomes(candidates, result, ordinal_by_key)
                     meta = self.store.get(job_id)['meta']
+                if not self.store.owner_is(job_id, self.owner_id):
+                    return
                 self.store.save_outcomes(job_id, normalized, meta=meta)
-            self.store.update(job_id, status='done', phase='completed', clear_owner=True)
+            if self.store.owner_is(job_id, self.owner_id):
+                self.store.update(job_id, status='done', phase='completed', clear_owner=True)
         except core.ScanCancelled:
-            self.store.update(job_id, status='cancelled', phase='cancelled', clear_owner=True)
+            if self.store.owner_is(job_id, self.owner_id):
+                self.store.update(job_id, status='cancelled', phase='cancelled', clear_owner=True)
         except Exception as exc:
             # 개별 문서/사업 실패는 안쪽 루프가 이미 잡아서 스캔을 계속 진행시킨다. 여기까지 온 건
             # 후보 검색 같은 스캔 전체를 세우는 오류이므로, 외부 서비스 탓이면 어느 서버인지 남긴다.
-            self.store.update(job_id, status='error', phase='failed',
-                              error=_describe_job_failure(exc, kind), clear_owner=True)
+            if self.store.owner_is(job_id, self.owner_id):
+                self.store.update(job_id, status='error', phase='failed',
+                                  error=_describe_job_failure(exc, kind), clear_owner=True)
         finally:
             stop_heartbeat.set()
             session.close()
@@ -188,6 +214,7 @@ def document_status(store, job_id, include_results=False, offset=0, limit=100):
               'audit_samples': job['meta'].get('audit_samples', []),
               'date_filter_exclusions': job['meta'].get('date_filter_exclusions', []),
               'discovery_count': job['meta'].get('discovery_count'),
+              'work_progress': job['meta'].get('work_progress'),
               'error': job['error'], 'current_phase': job['current_phase'],
               'updated_at': job['updated_at'], 'heartbeat_at': job['heartbeat_at'], 'resume_count': job['resume_count']}
     if include_results:

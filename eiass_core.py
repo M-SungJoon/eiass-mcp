@@ -30,15 +30,22 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import date, datetime
 import multiprocessing
 
+import truststore
+
+# requests/certifi만으로는 EIASS가 제공하는 인증서 체인의 중간 CA를 찾지 못하지만 Windows
+# 신뢰 저장소에서는 정상 검증된다. requests를 import하기 전에 시스템 신뢰 저장소를 연결한다.
+truststore.inject_into_ssl()
+
 import requests
-import urllib3
 from bs4 import BeautifulSoup
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
-from config import (DETAIL_CACHE_MAX_ITEMS, DETAIL_CACHE_TTL_SECONDS, DOC_CACHE_MAX_CHARS,
-                    DOC_CACHE_TTL_SECONDS, DOC_DOWNLOAD_CONCURRENCY, DOC_DOWNLOAD_RETRY_TOTAL,
-                    HEALTH_CACHE_TTL_SECONDS, PDF_EXTRACT_TIMEOUT_SECONDS,
-                    PDF_MAX_BYTES, PDF_MAX_PAGES)
+from config import (DETAIL_CACHE_MAX_ITEMS, DETAIL_CACHE_TTL_SECONDS,
+                    DETAIL_PREFETCH_READ_TIMEOUT_SECONDS, DOC_CACHE_MAX_CHARS,
+                    DOC_CACHE_TTL_SECONDS, DOC_DOWNLOAD_CONCURRENCY,
+                    DOC_DOWNLOAD_READ_TIMEOUT_SECONDS, DOC_DOWNLOAD_RETRY_TOTAL,
+                    HEALTH_CACHE_TTL_SECONDS, PDF_EXTRACT_TIMEOUT_SECONDS, PDF_MAX_BYTES,
+                    PDF_MAX_PAGES)
 from pdf_worker import worker_entry
 
 try:
@@ -46,17 +53,52 @@ try:
 except ImportError:
     fitz = None
 
-urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
-
 # 저장소 루트 VERSION 파일과 항상 같은 값으로 맞춰서 커밋할 것(버전 두 곳 중복 관리).
 # 어긋난 채로 커밋되지 않도록 build_mcp.py가 빌드 시작 전에 두 값을 대조한다.
-__version__ = '1.14.0'
+__version__ = '1.15.0'
 
 REQUEST_TIMEOUT = (8, 30)
 
 EIASS_BASE = 'https://www.eiass.go.kr'
 SEARCH_API_URL = EIASS_BASE + '/searchApi/search.do'
 FILE_DOWNLOAD_URL = EIASS_BASE + '/common/file/downloadFileByFileSeq.do'
+
+# 여러 scan worker가 동시에 배치를 처리해도 EIASS로 나가는 문서/상세 요청 총량은 이 상한을
+# 넘지 않는다. job마다 별도 ThreadPoolExecutor를 두더라도 실제 외부 요청은 여기서 조절된다.
+_DOCUMENT_IO_SLOTS = threading.BoundedSemaphore(DOC_DOWNLOAD_CONCURRENCY)
+
+
+def runtime_build_info():
+    """소스 실행과 배포 EXE에서 동일한 빌드 출처 정보를 반환한다."""
+    bundled = os.path.join(getattr(sys, '_MEIPASS', ''), 'eiass_build_info.json')
+    if bundled and os.path.isfile(bundled):
+        try:
+            with open(bundled, encoding='utf-8') as stream:
+                return json.load(stream)
+        except (OSError, ValueError):
+            pass
+    source_commit = 'unknown'
+    git_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), '.git')
+    try:
+        with open(os.path.join(git_dir, 'HEAD'), encoding='ascii') as stream:
+            head = stream.read().strip()
+        if re.fullmatch(r'[0-9a-fA-F]{40}', head):
+            source_commit = head.lower()
+        elif head.startswith('ref: '):
+            ref = head[5:].strip()
+            loose_ref = os.path.join(git_dir, *ref.split('/'))
+            if os.path.isfile(loose_ref):
+                with open(loose_ref, encoding='ascii') as stream:
+                    source_commit = stream.read().strip().lower()
+            else:
+                with open(os.path.join(git_dir, 'packed-refs'), encoding='ascii') as stream:
+                    for line in stream:
+                        if line.rstrip().endswith(' ' + ref):
+                            source_commit = line.split(' ', 1)[0].lower()
+                            break
+    except OSError:
+        pass
+    return {'source_commit': source_commit, 'tls_verification': 'system_trust_store'}
 
 TYPE_NAME_MAP = {
     'S': '전략환경영향평가',
@@ -484,7 +526,7 @@ def _session(retry=True, retry_total=3, pool_maxsize=10):
         connect=retry_total,
         read=retry_total,                 # 읽기 타임아웃(= 느린 응답)도 재시도 대상
         status=retry_total,
-        status_forcelist=(500, 502, 503, 504),
+        status_forcelist=(429, 500, 502, 503, 504),
         allowed_methods=frozenset(['GET', 'POST']),
         backoff_factor=0.5,               # 0.5s → 1s → 2s
         raise_on_status=False,
@@ -522,35 +564,93 @@ def _map_concurrent(items, fn, max_workers, should_cancel=None):
     return results
 
 
-def _prefetch_batch_documents(batch, stages, doc_title_contains, session,
+def _candidate_detail_key(item):
+    return (str(item.get('view_type')), str(item.get('eia_cd')), str(item.get('revirpt_seq')))
+
+
+def _with_document_io_slot(operation, should_cancel=None):
+    while not _DOCUMENT_IO_SLOTS.acquire(timeout=0.5):
+        _check_cancelled(should_cancel)
+    try:
+        _check_cancelled(should_cancel)
+        return operation()
+    finally:
+        _DOCUMENT_IO_SLOTS.release()
+
+
+def _call_project_detail(item, session, use_cache=True, request_timeout=None):
+    kwargs = {'session': session, 'use_cache': use_cache}
+    if request_timeout is not None:
+        kwargs['request_timeout'] = request_timeout
+    try:
+        return get_project_detail(
+            item['view_type'], item['eia_cd'], item['revirpt_seq'], **kwargs)
+    except TypeError as exc:
+        if 'unexpected keyword argument' not in str(exc):
+            raise
+        kwargs.pop('request_timeout', None)
+        return get_project_detail(
+            item['view_type'], item['eia_cd'], item['revirpt_seq'], **kwargs)
+
+
+def _call_full_document_text(file_seq, session, should_cancel=None, request_timeout=None):
+    """취소 인자를 모르는 기존 문서 로더 대체 구현과도 호환되는 단일 호출 지점."""
+    kwargs = {'session': session, 'should_cancel': should_cancel}
+    if request_timeout is not None:
+        kwargs['request_timeout'] = request_timeout
+    try:
+        return _get_full_document_text(file_seq, **kwargs)
+    except TypeError as exc:
+        if 'unexpected keyword argument' not in str(exc):
+            raise
+        return _get_full_document_text(file_seq, session=session)
+
+
+def _prefetch_batch_documents(batch, stages, doc_title_contains, session=None,
                               should_cancel=None, max_workers=None):
     """한 배치가 열어볼 모든 PDF를 동시에 내려받아 텍스트 캐시를 미리 데운다.
 
     이걸 먼저 돌려두면 뒤따르는 순차 매칭 루프의 _get_full_document_text 호출이 전부 캐시에
     적중해, 매칭 로직은 그대로 두고 다운로드/추출만 병렬화하는 효과를 낸다.
     """
+    outcome = {'details': {}, 'detail_errors': {}, 'document_errors': {}}
     if max_workers is None:
         max_workers = DOC_DOWNLOAD_CONCURRENCY
     if max_workers <= 1:
-        return  # 병렬화 꺼짐 — 기존 순차 경로 그대로
+        return outcome  # 병렬화 꺼짐 — 기존 순차 경로 그대로
 
-    # 1) 후보 상세를 동시에 받아 파일 목록을 파악한다(상세 캐시도 함께 데운다).
+    # 1) 후보 상세를 동시에 받아 파일 목록을 파악한다. requests.Session 하나를 여러 스레드가
+    # 공유하지 않고 작업별 세션을 쓰며, 프로세스 전역 semaphore로 다른 job과의 총 요청 수도 묶는다.
     def _load_detail(item):
+        detail_session = _session(retry_total=DOC_DOWNLOAD_RETRY_TOTAL, pool_maxsize=1)
         try:
-            return get_project_detail(item['view_type'], item['eia_cd'], item['revirpt_seq'],
-                                       session=session, use_cache=True)
-        except Exception:
-            return None
+            _check_cancelled(should_cancel)
+            detail = _with_document_io_slot(
+                lambda: _call_project_detail(
+                    item, detail_session, use_cache=True,
+                    request_timeout=(8, DETAIL_PREFETCH_READ_TIMEOUT_SECONDS)),
+                should_cancel)
+            return True, detail
+        except Exception as exc:
+            return False, str(exc)
+        finally:
+            detail_session.close()
     details = _map_concurrent(batch, _load_detail, max_workers, should_cancel)
     if should_cancel and should_cancel():
-        return
+        return outcome
+
+    for item, result in zip(batch, details):
+        key = _candidate_detail_key(item)
+        if result and result[0]:
+            outcome['details'][key] = result[1]
+        else:
+            reason = result[1] if result else '취소 또는 상세조회 작업 미완료'
+            outcome['detail_errors'][key] = reason
 
     # 2) 열어볼 PDF의 file_seq를 중복 없이 모은다.
     file_seqs = []
     seen = set()
-    for detail in details:
-        if not detail:
-            continue
+    for detail in outcome['details'].values():
         for stage in stages:
             raw_files = [f for cat_files in (detail['stage_docs'].get(stage) or {}).values()
                          for f in cat_files if f.get('is_pdf')]
@@ -560,16 +660,31 @@ def _prefetch_batch_documents(batch, stages, doc_title_contains, session,
                     seen.add(seq)
                     file_seqs.append(seq)
     if not file_seqs:
-        return
+        return outcome
 
-    # 3) 동시에 다운로드+추출해 캐시를 데운다. 대량 다운로드용 fast-fail 세션 + K 크기 커넥션 풀.
-    dl_session = _session(retry_total=DOC_DOWNLOAD_RETRY_TOTAL, pool_maxsize=max_workers)
-    try:
-        _map_concurrent(file_seqs,
-                        lambda seq: _get_full_document_text(seq, session=dl_session),
-                        max_workers, should_cancel)
-    finally:
-        dl_session.close()
+    # 3) 동시에 다운로드+추출해 캐시를 데운다. 실패를 명시적으로 반환해 아래 순차 매칭 루프가
+    # 같은 문서를 기본 3회 재시도하지 않게 한다.
+    def _load_document(seq):
+        dl_session = _session(retry_total=DOC_DOWNLOAD_RETRY_TOTAL, pool_maxsize=1)
+        try:
+            _check_cancelled(should_cancel)
+            _with_document_io_slot(
+                lambda: _call_full_document_text(
+                    seq, session=dl_session, should_cancel=should_cancel,
+                    request_timeout=(8, DOC_DOWNLOAD_READ_TIMEOUT_SECONDS)),
+                should_cancel)
+            return True, None
+        except Exception as exc:
+            return False, str(exc)
+        finally:
+            dl_session.close()
+
+    document_results = _map_concurrent(file_seqs, _load_document, max_workers, should_cancel)
+    for seq, result in zip(file_seqs, document_results):
+        if not result or not result[0]:
+            outcome['document_errors'][seq] = (
+                result[1] if result else '취소 또는 다운로드 작업 미완료')
+    return outcome
 
 
 # ── 검색 ──
@@ -855,9 +970,9 @@ def search_projects(keyword='', type_codes=None, agency_code='', max_pages=0, se
         'Referer': EIASS_BASE + '/biz/base/info/perList.do',
     }
 
-    # eiass.go.kr은 인증서 체인 문제로 원본 앱도 verify=False로 접속한다.
+    # 세션 쿠키를 먼저 받되 운영체제 신뢰 저장소로 EIASS 인증서 체인을 검증한다.
     s = session or _session()
-    s.get(EIASS_BASE + '/', headers={'User-Agent': headers['User-Agent']}, verify=False, timeout=REQUEST_TIMEOUT)
+    s.get(EIASS_BASE + '/', headers={'User-Agent': headers['User-Agent']}, timeout=REQUEST_TIMEOUT)
 
     results = []
     seen_keys = set()
@@ -928,9 +1043,9 @@ def search_projects(keyword='', type_codes=None, agency_code='', max_pages=0, se
             # 호출이 되어 job heartbeat가 얼어붙고(=멈춘 것처럼 보임) 취소도 먹지 않는다.
             _check_cancelled(should_cancel)
             payload['currentPage'] = str(page_no)
-            res = s.post(SEARCH_API_URL, data=payload, headers=headers, timeout=REQUEST_TIMEOUT, verify=False)
-            if res.status_code != 200:
-                break
+            res = s.post(SEARCH_API_URL, data=payload, headers=headers, timeout=REQUEST_TIMEOUT)
+            if res.status_code >= 400:
+                raise EiassNetworkError(f'EIASS 검색 API 실패: HTTP {res.status_code}')
             soup = BeautifulSoup(_strip_search_highlight_markers(res.text), 'html.parser')
             rows = soup.select('table.disTm tbody tr')
             if not rows:
@@ -1449,7 +1564,8 @@ def _detail_cache_put(cache_key, result):
             _DETAIL_CACHE.popitem(last=False)
 
 
-def get_project_detail(view_type, eia_cd, revirpt_seq, session=None, use_cache=False):
+def get_project_detail(view_type, eia_cd, revirpt_seq, session=None, use_cache=False,
+                       request_timeout=REQUEST_TIMEOUT):
     """사업 개요 필드 + 단계별 첨부문서(stage_docs, '협의의견' 포함) 조회.
 
     use_cache=True면 같은 (view_type, eia_cd, revirpt_seq) 재조회 시 재요청하지 않고
@@ -1472,8 +1588,10 @@ def get_project_detail(view_type, eia_cd, revirpt_seq, session=None, use_cache=F
             EIASS_BASE + '/biz/base/info/afterInfo.do',
             data={'EIA_CD': eia_cd, 'AES_SEQ': revirpt_seq},
             headers={'User-Agent': 'Mozilla/5.0', 'Referer': EIASS_BASE + '/'},
-            timeout=REQUEST_TIMEOUT, verify=False,
+            timeout=request_timeout,
         )
+        if res.status_code >= 400:
+            raise EiassNetworkError(f'EIASS 사업 상세조회 실패: HTTP {res.status_code}')
         soup = BeautifulSoup(res.text, 'html.parser')
 
         def get_td_text(*keywords):
@@ -1509,7 +1627,10 @@ def get_project_detail(view_type, eia_cd, revirpt_seq, session=None, use_cache=F
     else:
         detail_url = f'{EIASS_BASE}/biz/base/info/perInfo.do?PER_CD={eia_cd}'
 
-    res = s.get(detail_url, headers={'User-Agent': 'Mozilla/5.0', 'Origin': EIASS_BASE}, timeout=REQUEST_TIMEOUT, verify=False)
+    res = s.get(detail_url, headers={'User-Agent': 'Mozilla/5.0', 'Origin': EIASS_BASE},
+                timeout=request_timeout)
+    if res.status_code >= 400:
+        raise EiassNetworkError(f'EIASS 사업 상세조회 실패: HTTP {res.status_code}')
     soup = BeautifulSoup(res.text, 'html.parser')
 
     def get_detail_label(*keywords):
@@ -1538,9 +1659,11 @@ def get_project_detail(view_type, eia_cd, revirpt_seq, session=None, use_cache=F
     return result
 
 
-def _get_full_document_text(file_seq, session=None):
+def _get_full_document_text(file_seq, session=None, should_cancel=None,
+                            request_timeout=(8, DOC_DOWNLOAD_READ_TIMEOUT_SECONDS)):
     """캐시 우선 조회 후 없으면 다운로드+추출한다. 검색용이므로 절대 잘리지 않은 전체
     텍스트를 반환한다(요약/표시용 자르기는 download_document_text에서만 한다)."""
+    _check_cancelled(should_cancel)
     cached = _cache_get(file_seq)
     if cached:
         return {'text': cached['text'], 'page_offsets': cached['page_offsets'],
@@ -1550,22 +1673,39 @@ def _get_full_document_text(file_seq, session=None):
     s = session or _session()
     url = f'{FILE_DOWNLOAD_URL}?FILE_SEQ={file_seq}'
     res = s.get(url, headers={'User-Agent': 'Mozilla/5.0', 'Referer': EIASS_BASE + '/'},
-                timeout=(8, 60), verify=False)
-    if res.status_code != 200 or not res.content:
-        raise EiassNetworkError(f'문서 다운로드 실패: HTTP {res.status_code}')
-    if len(res.content) > PDF_MAX_BYTES:
-        raise EiassError(f'문서 크기가 제한({PDF_MAX_BYTES // (1024 * 1024)}MB)을 초과했습니다.')
+                timeout=request_timeout, stream=True)
+    try:
+        if res.status_code != 200:
+            raise EiassNetworkError(f'문서 다운로드 실패: HTTP {res.status_code}')
+        content = bytearray()
+        for chunk in res.iter_content(chunk_size=1024 * 1024):
+            _check_cancelled(should_cancel)
+            if not chunk:
+                continue
+            content.extend(chunk)
+            if len(content) > PDF_MAX_BYTES:
+                raise EiassError(
+                    f'문서 크기가 제한({PDF_MAX_BYTES // (1024 * 1024)}MB)을 초과했습니다.')
+    finally:
+        res.close()
+    if not content:
+        raise EiassNetworkError('문서 다운로드 실패: 빈 응답')
+    pdf_bytes = bytes(content)
     # PyMuPDF는 손상 PDF에서 장시간 멈출 수 있어 별도 프로세스에서 제한 시간 안에 추출한다.
     ctx = multiprocessing.get_context('spawn')
     parent_pipe, child_pipe = ctx.Pipe(duplex=False)
-    process = ctx.Process(target=worker_entry, args=(res.content, PDF_MAX_PAGES, child_pipe), daemon=True)
+    process = ctx.Process(target=worker_entry, args=(pdf_bytes, PDF_MAX_PAGES, child_pipe), daemon=True)
     try:
         process.start()
         child_pipe.close()
-        if not parent_pipe.poll(PDF_EXTRACT_TIMEOUT_SECONDS):
-            process.terminate()
-            process.join(5)
-            raise EiassError(f'PDF 텍스트 추출 시간이 제한({PDF_EXTRACT_TIMEOUT_SECONDS}초)을 초과했습니다.')
+        deadline = time.monotonic() + PDF_EXTRACT_TIMEOUT_SECONDS
+        while not parent_pipe.poll(min(0.5, max(0.0, deadline - time.monotonic()))):
+            _check_cancelled(should_cancel)
+            if time.monotonic() >= deadline:
+                process.terminate()
+                process.join(5)
+                raise EiassError(
+                    f'PDF 텍스트 추출 시간이 제한({PDF_EXTRACT_TIMEOUT_SECONDS}초)을 초과했습니다.')
         try:
             status, payload = parent_pipe.recv()
         except EOFError as exc:
@@ -1575,6 +1715,11 @@ def _get_full_document_text(file_seq, session=None):
         if process.is_alive():
             process.terminate()
             process.join(5)
+    except BaseException:
+        if process.is_alive():
+            process.terminate()
+            process.join(5)
+        raise
     finally:
         parent_pipe.close()
         child_pipe.close()
@@ -1809,6 +1954,7 @@ def search_projects_by_document_keyword(
     record_pattern=True,
     candidates=None,
     should_cancel=None,
+    on_progress=None,
     date_filter_exclusions=None,
     climate_filter='',
 ):
@@ -1900,13 +2046,28 @@ def search_projects_by_document_keyword(
 
     # 이 배치가 열어볼 PDF를 동시에 미리 받아 캐시를 데운다. 아래 순차 루프의 문서 조회는
     # 그 캐시에 적중하므로, 매칭 로직은 그대로 두고 다운로드/추출만 병렬화된다.
-    _prefetch_batch_documents(batch, stages, doc_title_contains, session, should_cancel=should_cancel)
+    if on_progress:
+        on_progress({'phase': 'prefetch_documents', 'batch_completed': 0,
+                     'batch_total': len(batch), 'current_candidate': None})
+    prefetched = _prefetch_batch_documents(
+        batch, stages, doc_title_contains, session, should_cancel=should_cancel)
 
-    for item in batch:
+    for batch_index, item in enumerate(batch):
         _check_cancelled(should_cancel)
+        if on_progress:
+            on_progress({'phase': 'matching', 'batch_completed': batch_index,
+                         'batch_total': len(batch), 'current_candidate': item.get('name'),
+                         'current_eia_cd': item.get('eia_cd')})
+        detail_key = _candidate_detail_key(item)
+        if detail_key in prefetched['detail_errors']:
+            exc = prefetched['detail_errors'][detail_key]
+            skipped.append({'name': item['name'], 'eia_cd': item['eia_cd'], 'reason': f'상세조회 실패: {exc}'})
+            continue
         try:
-            detail = get_project_detail(item['view_type'], item['eia_cd'], item['revirpt_seq'],
-                                         session=session, use_cache=True)
+            detail = prefetched['details'].get(detail_key)
+            if detail is None:
+                detail = get_project_detail(item['view_type'], item['eia_cd'], item['revirpt_seq'],
+                                             session=session, use_cache=True)
         except Exception as exc:
             skipped.append({'name': item['name'], 'eia_cd': item['eia_cd'], 'reason': f'상세조회 실패: {exc}'})
             continue
@@ -1932,8 +2093,14 @@ def search_projects_by_document_keyword(
             stage_had_match = False
             for f in files:
                 _check_cancelled(should_cancel)
+                prefetched_error = prefetched['document_errors'].get(f['seq'])
+                if prefetched_error:
+                    document_errors.append(
+                        f"{f['name']} 다운로드/추출 실패: {prefetched_error}")
+                    continue
                 try:
-                    doc = _get_full_document_text(f['seq'], session=session)
+                    doc = _call_full_document_text(
+                        f['seq'], session=session, should_cancel=should_cancel)
                 except Exception as exc:
                     document_errors.append(f"{f['name']} 다운로드/추출 실패: {exc}")
                     continue
@@ -1985,6 +2152,9 @@ def search_projects_by_document_keyword(
             else:
                 checked_no_match.append({'name': item['name'], 'eia_cd': item['eia_cd']})
 
+    if on_progress:
+        on_progress({'phase': 'matching', 'batch_completed': len(batch),
+                     'batch_total': len(batch), 'current_candidate': None})
     checked = len(batch)
     next_offset = offset + checked if (offset + checked) < total else None
 
@@ -2024,7 +2194,8 @@ def search_projects_by_document_keyword(
                 audit_checked += 1
                 for f in files[:3]:
                     try:
-                        doc = _get_full_document_text(f['seq'], session=session)
+                        doc = _call_full_document_text(
+                            f['seq'], session=session, should_cancel=should_cancel)
                     except Exception:
                         continue
                     text = doc['text']
@@ -2824,7 +2995,7 @@ def check_server_status(session=None):
     """EIASS 본사이트/검색 API, VWorld 지오코딩 API, KDPA WFS의 접속 가능 여부를 점검한다.
 
     각 서비스가 정상 응답 중인지, HTTP 상태코드와 응답시간(ms)은 어떤지 즉시 확인할 때
-    쓴다(원본 데스크톱 앱과 동일하게 EIASS는 verify=False로 접속). VWORLD_API_KEY가
+    쓴다(EIASS도 운영체제 신뢰 저장소로 TLS 인증서를 검증한다). VWORLD_API_KEY가
     설정되어 있지 않으면 VWorld 항목은 호출 자체를 생략하고 그 사실을 error로 남긴다.
 
     반환: {'eiass_site','eiass_search_api','vworld','kdpa': {'ok','status_code',
@@ -2839,7 +3010,7 @@ def check_server_status(session=None):
 def _probe_eiass_site(s):
     return _http_probe(
         'GET', EIASS_BASE + '/', s,
-        headers={'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'}, verify=False,
+        headers={'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'},
     )
 
 
@@ -2855,7 +3026,6 @@ def _probe_eiass_search_api(s):
             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)', 'X-Requested-With': 'XMLHttpRequest',
             'Origin': EIASS_BASE, 'Referer': EIASS_BASE + '/biz/base/info/perList.do',
         },
-        verify=False,
     )
 
 

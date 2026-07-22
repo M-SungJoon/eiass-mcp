@@ -119,7 +119,7 @@ class JobStore:
         with self.lock, self._connect() as conn:
             conn.execute('UPDATE jobs SET ' + ', '.join(fields) + ' WHERE job_id=?', values)
 
-    def touch_heartbeat(self, job_id):
+    def touch_heartbeat(self, job_id, owner_id=None):
         """job의 heartbeat_at만 현재 시각으로 갱신한다(다른 필드는 건드리지 않는다).
 
         문서 다운로드/추출은 문서 하나가 수 분씩 걸릴 수 있는데, 그동안 heartbeat를 갱신할
@@ -128,7 +128,17 @@ class JobStore:
         실제 처리 진행량은 checked/discovery_count가 따로 보여준다."""
         now = time.time()
         with self.lock, self._connect() as conn:
-            return conn.execute('UPDATE jobs SET heartbeat_at=? WHERE job_id=?', (now, job_id)).rowcount > 0
+            if owner_id is None:
+                query, params = 'UPDATE jobs SET heartbeat_at=? WHERE job_id=?', (now, job_id)
+            else:
+                query = 'UPDATE jobs SET heartbeat_at=? WHERE job_id=? AND owner_id=?'
+                params = (now, job_id, owner_id)
+            return conn.execute(query, params).rowcount > 0
+
+    def owner_is(self, job_id, owner_id):
+        with self.lock, self._connect() as conn:
+            row = conn.execute('SELECT owner_id FROM jobs WHERE job_id=?', (job_id,)).fetchone()
+            return bool(row and row[0] == owner_id)
 
     def request_cancel(self, job_id):
         now = time.time()
@@ -238,10 +248,10 @@ class JobStore:
             conn.execute("""UPDATE jobs SET status='queued', current_phase='recovery_pending',
                          owner_id=NULL, resume_count=resume_count+1, updated_at=?, heartbeat_at=?
                          WHERE status IN ('running','discovering') AND cancel_requested=0
-                         AND (owner_id IS NULL OR NOT EXISTS (
+                         AND (heartbeat_at<? OR owner_id IS NULL OR NOT EXISTS (
                              SELECT 1 FROM runner_instances r
                              WHERE r.owner_id=jobs.owner_id AND r.heartbeat_at>=?
-                         ))""", (now, now, cutoff))
+                         ))""", (now, now, cutoff, cutoff))
             conn.execute('DELETE FROM runner_instances WHERE heartbeat_at<? AND owner_id<>?',
                          (cutoff, owner_id))
             return [r[0] for r in conn.execute("SELECT job_id FROM jobs WHERE status='queued' AND cancel_requested=0")]
