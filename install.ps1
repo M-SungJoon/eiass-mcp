@@ -24,7 +24,12 @@
 
 param(
     [string]$InstallRoot,
-    [switch]$SkipUpdateCheck
+    [switch]$SkipUpdateCheck,
+    [ValidateSet("Menu", "Latest", "Specific", "Reinstall")]
+    [string]$InstallMode = "Menu",
+    [string]$TargetVersion,
+    [switch]$AllowDowngrade,
+    [switch]$DryRun
 )
 
 $ErrorActionPreference = "Stop"
@@ -232,6 +237,124 @@ function Get-LegacyInstallRoot {
     return $parent
 }
 
+function Test-InteractiveConsole {
+    return ([Environment]::UserInteractive -and -not ([Console]::IsInputRedirected))
+}
+
+function Normalize-ReleaseTag {
+    param([string]$VersionOrTag)
+    if (-not $VersionOrTag) { return $null }
+    $value = $VersionOrTag.Trim()
+    if ($value -notmatch '^v') { $value = "v$value" }
+    return $value
+}
+
+function ConvertTo-ReleaseDescriptor {
+    param($Release)
+    if (-not $Release -or -not $Release.tag_name -or $Release.draft -or $Release.prerelease) {
+        return $null
+    }
+    $downloadUrl = $null
+    $manifestUrl = $null
+    foreach ($asset in @($Release.assets)) {
+        if ($asset.name -eq "mcp_server_dist.zip") { $downloadUrl = $asset.browser_download_url }
+        if ($asset.name -eq "mcp_server_dist.zip.sha256") { $manifestUrl = $asset.browser_download_url }
+    }
+    if (-not $downloadUrl -or -not $manifestUrl) { return $null }
+    return [PSCustomObject]@{
+        Tag = [string]$Release.tag_name
+        Version = ([string]$Release.tag_name -replace '^v', '')
+        DownloadUrl = [string]$downloadUrl
+        ManifestUrl = [string]$manifestUrl
+        PublishedAt = [string]$Release.published_at
+    }
+}
+
+function Get-ReleaseByTag {
+    param(
+        [string]$RepoOwner,
+        [string]$RepoName,
+        [string]$Tag,
+        [hashtable]$Headers
+    )
+    $escapedTag = [Uri]::EscapeDataString($Tag)
+    $url = "https://api.github.com/repos/$RepoOwner/$RepoName/releases/tags/$escapedTag"
+    $release = Invoke-RestMethod -Uri $url -Headers $Headers -TimeoutSec 15
+    return (ConvertTo-ReleaseDescriptor -Release $release)
+}
+
+function Get-CompatibleReleases {
+    param(
+        [string]$RepoOwner,
+        [string]$RepoName,
+        [hashtable]$Headers
+    )
+    $url = "https://api.github.com/repos/$RepoOwner/$RepoName/releases?per_page=100"
+    $releases = @(Invoke-RestMethod -Uri $url -Headers $Headers -TimeoutSec 15)
+    $result = @()
+    foreach ($release in $releases) {
+        $descriptor = ConvertTo-ReleaseDescriptor -Release $release
+        if ($descriptor) { $result += $descriptor }
+    }
+    return $result
+}
+
+function ConvertTo-SemanticVersion {
+    param([string]$Value)
+    if (-not $Value) { return $null }
+    try { return [Version]($Value.Trim() -replace '^v', '') } catch { return $null }
+}
+
+function Backup-DowngradeJobDatabase {
+    param([string]$TargetVersion)
+    $dataDir = Join-Path $env:LOCALAPPDATA "DOHWA EIASS Agent"
+    $names = @("mcp_jobs.sqlite3", "mcp_jobs.sqlite3-wal", "mcp_jobs.sqlite3-shm")
+    $existing = @()
+    foreach ($name in $names) {
+        $source = Join-Path $dataDir $name
+        if (Test-Path -LiteralPath $source) { $existing += $source }
+    }
+    if ($existing.Count -eq 0) { return $null }
+
+    $stamp = Get-Date -Format "yyyyMMdd-HHmmss"
+    $safeVersion = $TargetVersion -replace '[^0-9A-Za-z._-]', '_'
+    $backupDir = Join-Path $dataDir "job-backup-before-downgrade-$safeVersion-$stamp"
+    New-Item -ItemType Directory -Path $backupDir -Force | Out-Null
+    $moved = @()
+    try {
+        foreach ($source in $existing) {
+            $destination = Join-Path $backupDir (Split-Path $source -Leaf)
+            [System.IO.File]::Move($source, $destination)
+            $moved += $destination
+        }
+    } catch {
+        foreach ($destination in $moved) {
+            $source = Join-Path $dataDir (Split-Path $destination -Leaf)
+            if ((Test-Path -LiteralPath $destination) -and -not (Test-Path -LiteralPath $source)) {
+                try { [System.IO.File]::Move($destination, $source) } catch {}
+            }
+        }
+        Remove-Item -LiteralPath $backupDir -Recurse -Force -ErrorAction SilentlyContinue
+        throw "진행 기록 DB를 백업할 수 없습니다. Claude Code/Codex를 완전히 종료한 뒤 다시 실행하세요."
+    }
+    return $backupDir
+}
+
+function Restore-DowngradeJobDatabase {
+    param([string]$BackupDir)
+    if (-not $BackupDir -or -not (Test-Path -LiteralPath $BackupDir)) { return }
+    $dataDir = Split-Path $BackupDir -Parent
+    foreach ($item in @(Get-ChildItem -LiteralPath $BackupDir -File -ErrorAction SilentlyContinue)) {
+        $destination = Join-Path $dataDir $item.Name
+        if (-not (Test-Path -LiteralPath $destination)) {
+            try { [System.IO.File]::Move($item.FullName, $destination) } catch {}
+        }
+    }
+    if ((Get-ChildItem -LiteralPath $BackupDir -Force -ErrorAction SilentlyContinue).Count -eq 0) {
+        Remove-Item -LiteralPath $BackupDir -Force -ErrorAction SilentlyContinue
+    }
+}
+
 try {
     Write-Host ""
     Write-Host "=========================================="
@@ -242,38 +365,45 @@ try {
     # 설치 폴더는 고정한다. -InstallRoot로 덮어쓸 수는 있게 두되(테스트/특수 상황용),
     # 평소에는 사용자가 위치를 고민할 일이 없어야 한다.
     if (-not $InstallRoot) { $InstallRoot = Join-Path $env:LOCALAPPDATA "Programs\EIASS MCP" }
-    if (-not (Test-Path $InstallRoot)) { New-Item -ItemType Directory -Path $InstallRoot -Force | Out-Null }
-    $ExeDir = (Resolve-Path $InstallRoot).Path
+    if ($DryRun) {
+        $ExeDir = [System.IO.Path]::GetFullPath([Environment]::ExpandEnvironmentVariables($InstallRoot))
+    } else {
+        if (-not (Test-Path $InstallRoot)) { New-Item -ItemType Directory -Path $InstallRoot -Force | Out-Null }
+        $ExeDir = (Resolve-Path $InstallRoot).Path
+    }
     $AppDir = Join-Path $ExeDir "mcp_server"
     $ExePath = Join-Path $AppDir "mcp_server.exe"
     Write-Host "설치 위치: $ExeDir`n"
 
     # 예전 위치에 설치돼 있으면 VWorld 키를 먼저 가져온다. 사용자가 키를 다시 발급/입력하는
     # 일이 없어야 한다. 예전 설치본 정리는 새 배포본이 자리를 잡은 뒤에 한다.
-    $legacyRoot = Get-LegacyInstallRoot -CurrentRoot $ExeDir
-    if ($legacyRoot) {
-        Write-Host "기존 설치를 발견했습니다: $legacyRoot"
-        $legacyEnv = Join-Path $legacyRoot ".env"
-        $newEnv = Join-Path $ExeDir ".env"
-        if ((Test-Path $legacyEnv) -and -not (Test-Path $newEnv)) {
-            Copy-Item $legacyEnv $newEnv -Force
-            Write-Host "  VWorld API 키(.env)를 새 위치로 옮겼습니다."
+    $legacyRoot = $null
+    if (-not $DryRun) {
+        $legacyRoot = Get-LegacyInstallRoot -CurrentRoot $ExeDir
+        if ($legacyRoot) {
+            Write-Host "기존 설치를 발견했습니다: $legacyRoot"
+            $legacyEnv = Join-Path $legacyRoot ".env"
+            $newEnv = Join-Path $ExeDir ".env"
+            if ((Test-Path $legacyEnv) -and -not (Test-Path $newEnv)) {
+                Copy-Item $legacyEnv $newEnv -Force
+                Write-Host "  VWorld API 키(.env)를 새 위치로 옮겼습니다."
+            }
+            $legacyVersionFile = Join-Path $legacyRoot ".eiass_mcp_version"
+            $newVersionFile = Join-Path $ExeDir ".eiass_mcp_version"
+            if ((Test-Path $legacyVersionFile) -and -not (Test-Path $newVersionFile)) {
+                Copy-Item $legacyVersionFile $newVersionFile -Force
+            }
+            Write-Host ""
         }
-        $legacyVersionFile = Join-Path $legacyRoot ".eiass_mcp_version"
-        $newVersionFile = Join-Path $ExeDir ".eiass_mcp_version"
-        if ((Test-Path $legacyVersionFile) -and -not (Test-Path $newVersionFile)) {
-            Copy-Item $legacyVersionFile $newVersionFile -Force
-        }
-        Write-Host ""
+
+        # 옛 onefile 버전이 남긴 %TEMP%/_MEI 폴더 정리 — 업데이트 여부와 무관하게 매번 한다.
+        Clear-OrphanMeiDirs
+
+        # 이전 업데이트에서 물러난 구버전 폴더. 그때는 서버가 실행 중이라 못 지웠을 수 있으니
+        # 매번 다시 시도한다(아직 쓰는 중이면 조용히 실패하고 다음 기회에 지운다).
+        Get-ChildItem -LiteralPath $ExeDir -Directory -Filter "mcp_server.old*" -ErrorAction SilentlyContinue |
+            ForEach-Object { Remove-Item $_.FullName -Recurse -Force -ErrorAction SilentlyContinue }
     }
-
-    # 옛 onefile 버전이 남긴 %TEMP%/_MEI 폴더 정리 — 업데이트 여부와 무관하게 매번 한다.
-    Clear-OrphanMeiDirs
-
-    # 이전 업데이트에서 물러난 구버전 폴더. 그때는 서버가 실행 중이라 못 지웠을 수 있으니
-    # 매번 다시 시도한다(아직 쓰는 중이면 조용히 실패하고 다음 기회에 지운다).
-    Get-ChildItem -LiteralPath $ExeDir -Directory -Filter "mcp_server.old*" -ErrorAction SilentlyContinue |
-        ForEach-Object { Remove-Item $_.FullName -Recurse -Force -ErrorAction SilentlyContinue }
 
     # 0) 버전 확인 + 자동 업데이트 — git 없이 GitHub Releases API만 사용한다.
     # 배포본(mcp_server_dist.zip)은 저장소에 커밋하지 않고 릴리스 자산으로 올린다. 41MB 바이너리를
@@ -292,34 +422,152 @@ try {
         if ($versionLines.Count -ge 1 -and $versionLines[0]) { $localTag = $versionLines[0].Trim() }
         if ($versionLines.Count -ge 2 -and $versionLines[1]) { $localVersion = $versionLines[1].Trim() }
     }
+    # v1.11.0 이하의 1행 마커에는 태그 대신 커밋 SHA가 들어 있다. 그런 값은 GitHub 릴리스
+    # 태그로 재설치할 수 없으므로 3번 선택지를 비활성화하고 최신 설치만 허용한다.
+    $canReinstallCurrent = ($localTag -and $localTag -match '^v\d+\.\d+\.\d+$')
     Write-Host "현재 설치된 버전: $localVersion"
 
     if (-not $SkipUpdateCheck) {
-        $latestTag = $null
-        $latestVersion = "알 수 없음"
-        $downloadUrl = $null
-        $manifestUrl = $null
-        try {
-            $apiUrl = "https://api.github.com/repos/$RepoOwner/$RepoName/releases/latest"
-            $release = Invoke-RestMethod -Uri $apiUrl -Headers $ghHeaders -TimeoutSec 15
-            $latestTag = $release.tag_name
-            $latestVersion = $latestTag -replace '^v', ''
-            foreach ($asset in $release.assets) {
-                if ($asset.name -eq "mcp_server_dist.zip") { $downloadUrl = $asset.browser_download_url }
-                if ($asset.name -eq "mcp_server_dist.zip.sha256") { $manifestUrl = $asset.browser_download_url }
+        # -TargetVersion은 자동화/지원 상황에서 메뉴 없이 특정 버전을 선택하는 공개 진입점이다.
+        if ($TargetVersion) { $InstallMode = "Specific" }
+
+        if ($InstallMode -eq "Menu") {
+            if (Test-InteractiveConsole) {
+                while ($InstallMode -eq "Menu") {
+                    Write-Host ""
+                    Write-Host "설치 방법을 선택하세요:"
+                    Write-Host "  [1] 최신 버전 설치/업데이트"
+                    Write-Host "  [2] 특정 버전 선택"
+                    if ($canReinstallCurrent) {
+                        Write-Host "  [3] 현재 버전 재설치 ($localVersion)"
+                    } else {
+                        Write-Host "  [3] 현재 버전 재설치 (현재 설치 없음)"
+                    }
+                    $menuChoice = Read-Host "선택 (1~3)"
+                    switch ($menuChoice.Trim()) {
+                        "1" { $InstallMode = "Latest" }
+                        "2" { $InstallMode = "Specific" }
+                        "3" {
+                            if ($canReinstallCurrent) { $InstallMode = "Reinstall" }
+                            else { Write-Host "현재 설치된 버전이 없어 재설치할 수 없습니다." -ForegroundColor Yellow }
+                        }
+                        default { Write-Host "1, 2, 3 중 하나를 입력해 주세요." -ForegroundColor Yellow }
+                    }
+                }
+            } else {
+                # 파이프/자동화 실행은 메뉴 입력을 기다리면 영원히 멈추므로 기존 동작과 같은 최신 설치로 둔다.
+                $InstallMode = "Latest"
+                Write-Host "비대화식 실행: 최신 버전 설치/업데이트를 선택했습니다."
             }
-            Write-Host "배포된 최신 버전: $latestVersion"
-            if (-not $downloadUrl -or -not $manifestUrl) {
-                Write-Host "⚠ 최신 릴리스에 배포본 자산이 없습니다 — 기존 배포본으로 계속 진행합니다.`n"
-                $latestTag = $null
-            }
-        } catch {
-            Write-Host "⚠ 최신 버전 확인 실패(네트워크 문제일 수 있음) — 기존 배포본으로 계속 진행합니다.`n"
         }
 
-        if ($latestTag) {
-            if (($latestTag -ne $localTag) -or (-not (Test-Path $ExePath))) {
-                Write-Host "새 버전 발견 — 배포본 다운로드 중... ($latestVersion)"
+        $selectedRelease = $null
+        if ($InstallMode -eq "Specific" -and -not $TargetVersion) {
+            if (-not (Test-InteractiveConsole)) {
+                throw "비대화식 특정 버전 설치에는 -TargetVersion을 지정해야 합니다."
+            }
+            Write-Host "`n설치 가능한 정식 릴리스를 확인하는 중..."
+            $compatibleReleases = @(Get-CompatibleReleases -RepoOwner $RepoOwner -RepoName $RepoName -Headers $ghHeaders)
+            if ($compatibleReleases.Count -eq 0) {
+                throw "선택 설치가 가능한 정식 릴리스를 찾지 못했습니다."
+            }
+            Write-Host ""
+            for ($index = 0; $index -lt $compatibleReleases.Count; $index++) {
+                $marker = ""
+                if ($compatibleReleases[$index].Tag -eq $localTag) { $marker = " (현재 설치)" }
+                Write-Host ("  [{0}] {1}{2}" -f ($index + 1), $compatibleReleases[$index].Version, $marker)
+            }
+            while (-not $selectedRelease) {
+                $versionChoice = (Read-Host "번호 또는 버전 입력 (예: 2 또는 1.16.1)").Trim()
+                $choiceNumber = 0
+                if ([int]::TryParse($versionChoice, [ref]$choiceNumber) -and
+                    $choiceNumber -ge 1 -and $choiceNumber -le $compatibleReleases.Count) {
+                    $selectedRelease = $compatibleReleases[$choiceNumber - 1]
+                } elseif ($versionChoice) {
+                    $TargetVersion = $versionChoice
+                    break
+                } else {
+                    Write-Host "번호 또는 버전을 입력해 주세요." -ForegroundColor Yellow
+                }
+            }
+        }
+
+        $targetRelease = $null
+        try {
+            if ($selectedRelease) {
+                $targetRelease = $selectedRelease
+            } elseif ($InstallMode -eq "Latest") {
+                $apiUrl = "https://api.github.com/repos/$RepoOwner/$RepoName/releases/latest"
+                $release = Invoke-RestMethod -Uri $apiUrl -Headers $ghHeaders -TimeoutSec 15
+                $targetRelease = ConvertTo-ReleaseDescriptor -Release $release
+            } elseif ($InstallMode -eq "Specific") {
+                $targetTagInput = Normalize-ReleaseTag -VersionOrTag $TargetVersion
+                if (-not $targetTagInput) { throw "설치할 버전을 지정하지 않았습니다." }
+                $targetRelease = Get-ReleaseByTag -RepoOwner $RepoOwner -RepoName $RepoName `
+                    -Tag $targetTagInput -Headers $ghHeaders
+            } elseif ($InstallMode -eq "Reinstall") {
+                if (-not $canReinstallCurrent) { throw "현재 설치된 버전 태그가 없어 재설치할 수 없습니다." }
+                $targetRelease = Get-ReleaseByTag -RepoOwner $RepoOwner -RepoName $RepoName `
+                    -Tag $localTag -Headers $ghHeaders
+            }
+            if (-not $targetRelease) {
+                throw "선택한 릴리스에 필수 배포 자산(mcp_server_dist.zip 및 SHA-256)이 없습니다."
+            }
+        } catch {
+            if ($InstallMode -eq "Latest" -and (Test-Path $ExePath) -and -not $DryRun) {
+                Write-Host "⚠ 최신 버전 확인 실패: $($_.Exception.Message)"
+                Write-Host "   기존 배포본으로 계속 진행합니다.`n"
+            } else {
+                throw "릴리스 확인 실패: $($_.Exception.Message)"
+            }
+        }
+
+        if ($targetRelease) {
+            $targetTag = $targetRelease.Tag
+            $targetReleaseVersion = $targetRelease.Version
+            $downloadUrl = $targetRelease.DownloadUrl
+            $manifestUrl = $targetRelease.ManifestUrl
+            Write-Host "선택한 배포 버전: $targetReleaseVersion ($targetTag)"
+
+            $currentSemantic = ConvertTo-SemanticVersion -Value $localVersion
+            $targetSemantic = ConvertTo-SemanticVersion -Value $targetReleaseVersion
+            $isDowngrade = ($null -ne $currentSemantic -and $null -ne $targetSemantic -and
+                $targetSemantic.CompareTo($currentSemantic) -lt 0)
+            $installAction = "설치"
+            if ($localTag) {
+                if ($isDowngrade) { $installAction = "다운그레이드" }
+                elseif ($targetTag -eq $localTag) {
+                    if ($InstallMode -eq "Latest" -and (Test-Path $ExePath)) { $installAction = "최신 유지" }
+                    else { $installAction = "재설치" }
+                }
+                else { $installAction = "업그레이드" }
+            }
+
+            if ($isDowngrade -and -not $AllowDowngrade) {
+                Write-Host ""
+                Write-Host "⚠ 다운그레이드: $localVersion → $targetReleaseVersion" -ForegroundColor Yellow
+                Write-Host "  새 버전의 진행 중 스캔 기록은 이전 버전과 호환되지 않을 수 있습니다."
+                Write-Host "  계속하면 작업 DB를 별도 폴더에 백업한 뒤 초기화합니다."
+                if (Test-InteractiveConsole) {
+                    $downgradeAnswer = (Read-Host "다운그레이드를 계속하려면 Y를 입력하세요").Trim()
+                    if ($downgradeAnswer -notmatch '(?i)^y(es)?$') {
+                        throw "사용자가 다운그레이드를 취소했습니다."
+                    }
+                } else {
+                    throw "비대화식 다운그레이드에는 -AllowDowngrade가 필요합니다."
+                }
+            }
+
+            Write-Host "선택 결과: mode=$InstallMode action=$installAction target=$targetReleaseVersion tag=$targetTag"
+            if ($DryRun) {
+                Write-Host "DRY RUN — 릴리스 선택과 안전 조건을 확인했으며 파일은 변경하지 않았습니다."
+                return
+            }
+
+            $shouldInstall = (($targetTag -ne $localTag) -or (-not (Test-Path $ExePath)) -or
+                $InstallMode -eq "Specific" -or $InstallMode -eq "Reinstall")
+            if ($shouldInstall) {
+                Write-Host "$installAction 진행 — 배포본 다운로드 중... ($targetReleaseVersion)"
                 # 확장자가 반드시 .zip이어야 한다 — Expand-Archive는 그 외 확장자를 아예 거부한다
                 # (".zip.new"로 뒀다가 모든 업데이트가 실패했다).
                 $tmpZip = Join-Path $ExeDir "mcp_server_dist.download.zip"
@@ -328,6 +576,8 @@ try {
                 # 물러날 폴더는 매번 새 이름을 쓴다. 이전 구버전이 아직 실행 중이라 삭제되지 않고
                 # 남아 있으면, 고정 이름이면 rename 대상이 이미 존재해 교체가 통째로 막힌다.
                 $retireDir = Join-Path $ExeDir ("mcp_server.old-" + [guid]::NewGuid().ToString('N').Substring(0, 8))
+                $jobDbBackupDir = $null
+                $newAppInstalled = $false
                 try {
                     Invoke-WebRequest -Uri $downloadUrl -OutFile $tmpZip -Headers $ghHeaders -TimeoutSec 300
                     Invoke-WebRequest -Uri $manifestUrl -OutFile $tmpManifestPath -Headers $ghHeaders -TimeoutSec 30
@@ -344,6 +594,12 @@ try {
                     $extracted = Join-Path $stageDir "mcp_server"
                     if (-not (Test-Path (Join-Path $extracted "mcp_server.exe"))) {
                         throw "배포 zip 구조가 예상과 다릅니다 (mcp_server/mcp_server.exe 없음)."
+                    }
+
+                    # 새 버전이 기록한 작업 payload를 구버전이 읽지 않도록 다운그레이드 직전에
+                    # 기본 작업 DB와 WAL/SHM을 함께 옮긴다. 교체가 실패하면 아래 catch에서 복구한다.
+                    if ($isDowngrade) {
+                        $jobDbBackupDir = Backup-DowngradeJobDatabase -TargetVersion $targetReleaseVersion
                     }
 
                     # 교체는 반드시 [System.IO.Directory]::Move로 한다. Move-Item은 폴더를 통째로
@@ -363,16 +619,24 @@ try {
                     }
                     try {
                         [System.IO.Directory]::Move($extracted, $AppDir)
+                        $newAppInstalled = $true
                     } catch {
                         # 새 배포본을 못 넣었으면 치워둔 구버전을 반드시 제자리로 되돌린다.
                         if ($retired) { [System.IO.Directory]::Move($retireDir, $AppDir) }
                         throw
                     }
 
-                    Set-Content -Path $versionFile -Value @($latestTag, $latestVersion) -Encoding utf8
-                    Write-Host "✅ 배포본을 최신 버전($latestVersion)으로 설치했습니다.`n"
+                    Set-Content -Path $versionFile -Value @($targetTag, $targetReleaseVersion) -Encoding utf8
+                    Write-Host "✅ $installAction 완료: $targetReleaseVersion"
+                    if ($jobDbBackupDir) {
+                        Write-Host "  이전 작업 기록 백업: $jobDbBackupDir"
+                    }
+                    Write-Host ""
                 } catch {
-                    Write-Host "⚠ 업데이트 다운로드/교체 실패: $($_.Exception.Message)"
+                    if ($jobDbBackupDir -and -not $newAppInstalled) {
+                        Restore-DowngradeJobDatabase -BackupDir $jobDbBackupDir
+                    }
+                    Write-Host "⚠ $installAction 다운로드/교체 실패: $($_.Exception.Message)"
                     Write-Host "   (Claude Code/Codex가 실행 중이면 파일이 잠겨 있을 수 있습니다 — 완전히 종료한 뒤 다시 실행해보세요.)"
                     # 실행 파일이 제자리에 없으면 아직 복구가 안 된 것이다. 폴더 존재 여부로 판단하면
                     # 안 된다 — 껍데기만 남은 폴더를 "복구 완료"로 오인해 그냥 지나친다(실제로 겪음).
@@ -381,6 +645,9 @@ try {
                     }
                     if (-not (Test-Path $ExePath)) {
                         throw "배포본을 받지 못해 설치를 진행할 수 없습니다."
+                    }
+                    if ($InstallMode -ne "Latest") {
+                        throw "선택한 버전 설치를 완료하지 못했습니다. 기존 배포본은 유지되었습니다."
                     }
                     Write-Host "   기존 배포본으로 계속 진행합니다.`n"
                 } finally {
