@@ -8,9 +8,10 @@ import sqlite3
 import threading
 import time
 import tempfile
+import uuid
 
 from config import (JOB_LEASE_TIMEOUT_SECONDS, JOB_RETENTION_SECONDS,
-                    MAX_RETAINED_JOBS, job_db_path)
+                    MAX_RETAINED_JOBS, job_db_path, shared_limit_db_path)
 from models import candidate_key
 
 
@@ -118,6 +119,24 @@ class JobStore:
         values.append(job_id)
         with self.lock, self._connect() as conn:
             conn.execute('UPDATE jobs SET ' + ', '.join(fields) + ' WHERE job_id=?', values)
+
+    def merge_meta(self, job_id, updates, phase=None):
+        """동시 진행 callback이 서로의 meta 필드를 덮어쓰지 않도록 한 transaction에서 병합한다."""
+        now = time.time()
+        with self.lock, self._connect() as conn:
+            row = conn.execute('SELECT meta_json FROM jobs WHERE job_id=?', (job_id,)).fetchone()
+            if not row:
+                return False
+            meta = json.loads(row[0])
+            meta.update(updates)
+            if phase is None:
+                conn.execute('UPDATE jobs SET meta_json=?,updated_at=?,heartbeat_at=? WHERE job_id=?',
+                             (json.dumps(meta, ensure_ascii=False), now, now, job_id))
+            else:
+                conn.execute('''UPDATE jobs SET meta_json=?,current_phase=?,updated_at=?,heartbeat_at=?
+                                WHERE job_id=?''',
+                             (json.dumps(meta, ensure_ascii=False), phase, now, now, job_id))
+            return True
 
     def touch_heartbeat(self, job_id, owner_id=None):
         """job의 heartbeat_at만 현재 시각으로 갱신한다(다른 필드는 건드리지 않는다).
@@ -265,3 +284,88 @@ class JobStore:
                 conn.execute('DELETE FROM job_results WHERE job_id=?', (job_id,))
                 conn.execute('DELETE FROM job_candidates WHERE job_id=?', (job_id,))
                 conn.execute('DELETE FROM jobs WHERE job_id=?', (job_id,))
+
+
+class SharedSlotLimiter:
+    """SQLite lease로 같은 PC의 여러 MCP 프로세스가 공유하는 bounded semaphore."""
+
+    def __init__(self, name, capacity, lease_seconds, path=None):
+        self.name = name
+        self.capacity = max(1, int(capacity))
+        self.lease_seconds = max(30, int(lease_seconds))
+        self.path = path or shared_limit_db_path()
+        try:
+            self._init_db()
+        except (OSError, sqlite3.OperationalError):
+            if path:
+                raise
+            self.path = os.path.join(tempfile.gettempdir(), 'DOHWA EIASS Agent', 'mcp_limits.sqlite3')
+            self._init_db()
+
+    def _init_db(self):
+        os.makedirs(os.path.dirname(os.path.abspath(self.path)), exist_ok=True)
+        with self._connect() as conn:
+            conn.execute('''CREATE TABLE IF NOT EXISTS shared_slots (
+                slot_name TEXT NOT NULL, token TEXT PRIMARY KEY, expires_at REAL NOT NULL,
+                owner_pid INTEGER NOT NULL DEFAULT 0)''')
+            columns = {row[1] for row in conn.execute('PRAGMA table_info(shared_slots)')}
+            if 'owner_pid' not in columns:
+                conn.execute(
+                    'ALTER TABLE shared_slots ADD COLUMN owner_pid INTEGER NOT NULL DEFAULT 0')
+            conn.execute('CREATE INDEX IF NOT EXISTS idx_shared_slots_name ON shared_slots(slot_name,expires_at)')
+
+    def _connect(self):
+        return sqlite3.connect(self.path, timeout=5, factory=_ClosingConnection)
+
+    @staticmethod
+    def _pid_is_alive(pid):
+        if pid == os.getpid():
+            return True
+        if not pid:
+            return False
+        try:
+            os.kill(pid, 0)
+            return True
+        except PermissionError:
+            return True
+        except OSError:
+            return False
+
+    def acquire(self, should_cancel=None, deadline=None, on_wait=None):
+        token = f'{os.getpid()}-{threading.get_ident()}-{uuid.uuid4().hex}'
+        while True:
+            if should_cancel and should_cancel():
+                return None
+            now = time.time()
+            if deadline is not None and time.monotonic() >= deadline:
+                return None
+            try:
+                with self._connect() as conn:
+                    conn.execute('BEGIN IMMEDIATE')
+                    conn.execute('DELETE FROM shared_slots WHERE expires_at<?', (now,))
+                    owner_pids = [row[0] for row in conn.execute(
+                        'SELECT DISTINCT owner_pid FROM shared_slots')]
+                    for owner_pid in owner_pids:
+                        if not self._pid_is_alive(owner_pid):
+                            conn.execute('DELETE FROM shared_slots WHERE owner_pid=?', (owner_pid,))
+                    used = conn.execute(
+                        'SELECT COUNT(*) FROM shared_slots WHERE slot_name=?', (self.name,)).fetchone()[0]
+                    if used < self.capacity:
+                        conn.execute('''INSERT INTO shared_slots
+                                     (slot_name,token,expires_at,owner_pid) VALUES (?,?,?,?)''',
+                                     (self.name, token, now + self.lease_seconds, os.getpid()))
+                        return token
+            except sqlite3.OperationalError:
+                pass
+            if on_wait:
+                on_wait()
+            time.sleep(0.2)
+
+    def release(self, token):
+        if not token:
+            return
+        try:
+            with self._connect() as conn:
+                conn.execute('DELETE FROM shared_slots WHERE token=?', (token,))
+        except sqlite3.OperationalError:
+            pass

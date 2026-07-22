@@ -20,9 +20,11 @@ JOB_RETENTION_SECONDS = 24 * 60 * 60
 MAX_RETAINED_JOBS = 100
 JOB_RESULT_PAGE_LIMIT = 500
 MAX_SCAN_BATCH_SIZE = 25
+MAX_DOCUMENT_SCAN_BATCH_SIZE = 10
 JOB_HEARTBEAT_INTERVAL_SECONDS = 5
 JOB_LEASE_TIMEOUT_SECONDS = 30
-PDF_EXTRACT_TIMEOUT_SECONDS = 90
+PDF_PROCESS_START_TIMEOUT_SECONDS = bounded_env_int('EIASS_PDF_START_TIMEOUT', 15, 5, 60)
+PDF_EXTRACT_TIMEOUT_SECONDS = bounded_env_int('EIASS_PDF_EXTRACT_TIMEOUT', 90, 30, 300)
 PDF_MAX_BYTES = 100 * 1024 * 1024
 PDF_MAX_PAGES = 3000
 # 문서 스캔 처리량 튜닝.
@@ -30,11 +32,21 @@ PDF_MAX_PAGES = 3000
 # 효과가 크다). EIASS는 정부 사이트라 과한 동시요청은 rate-limit/차단 위험이 있으니, 차단이
 # 보이면 이 값을 낮춘다. 이 값은 job별이 아니라 프로세스 전체 상한으로도 사용한다.
 # 환경변수가 잘못되거나 과도해도 서버 기동 실패/과부하가 나지 않게 1~10으로 제한한다.
-DOC_DOWNLOAD_CONCURRENCY = bounded_env_int('EIASS_DOC_CONCURRENCY', 8, 1, 10)
+DOC_DOWNLOAD_CONCURRENCY = bounded_env_int('EIASS_DOC_CONCURRENCY', 3, 1, 6)
+PDF_EXTRACT_CONCURRENCY = bounded_env_int('EIASS_PDF_EXTRACT_CONCURRENCY', 2, 1, 4)
 # 문서 다운로드 재시도 횟수(discovery와 달리 대량 다운로드는 빨리 실패하고 건너뛰는 게 낫다).
 # 느린 문서 하나가 재시도로 스캔을 오래 잡는 것을 막는다(실패는 로그로 남기고 계속 진행).
 DOC_DOWNLOAD_RETRY_TOTAL = bounded_env_int('EIASS_DOC_RETRY', 1, 0, 3)
-DOC_DOWNLOAD_READ_TIMEOUT_SECONDS = bounded_env_int('EIASS_DOC_READ_TIMEOUT', 15, 5, 60)
+DOC_CONNECT_TIMEOUT_SECONDS = bounded_env_int('EIASS_DOC_CONNECT_TIMEOUT', 8, 3, 30)
+DOC_FIRST_BYTE_TIMEOUT_SECONDS = bounded_env_int('EIASS_DOC_FIRST_BYTE_TIMEOUT', 20, 5, 60)
+DOC_DOWNLOAD_READ_TIMEOUT_SECONDS = bounded_env_int('EIASS_DOC_READ_TIMEOUT', 30, 10, 120)
+DOC_DOWNLOAD_TOTAL_TIMEOUT_SECONDS = bounded_env_int('EIASS_DOC_TOTAL_TIMEOUT', 240, 60, 900)
+DOC_LOW_SPEED_BYTES_PER_SECOND = bounded_env_int(
+    'EIASS_DOC_LOW_SPEED_BPS', 128 * 1024, 16 * 1024, 5 * 1024 * 1024)
+DOC_LOW_SPEED_GRACE_SECONDS = bounded_env_int('EIASS_DOC_LOW_SPEED_GRACE', 30, 10, 120)
+DOC_LOW_SPEED_WINDOW_SECONDS = bounded_env_int('EIASS_DOC_LOW_SPEED_WINDOW', 60, 20, 180)
+DOC_TOTAL_TIMEOUT_SECONDS = bounded_env_int('EIASS_DOC_WALL_TIMEOUT', 360, 120, 1200)
+DOC_PROGRESS_INTERVAL_SECONDS = bounded_env_int('EIASS_DOC_PROGRESS_INTERVAL', 5, 1, 30)
 DETAIL_PREFETCH_READ_TIMEOUT_SECONDS = bounded_env_int('EIASS_DETAIL_READ_TIMEOUT', 15, 5, 60)
 DOC_CACHE_TTL_SECONDS = 30 * 24 * 60 * 60
 DOC_CACHE_MAX_CHARS = 100 * 1024 * 1024
@@ -62,3 +74,11 @@ def job_db_path():
     if override:
         return os.path.abspath(os.path.expandvars(override))
     return os.path.join(app_data_dir(), 'mcp_jobs.sqlite3')
+
+
+def shared_limit_db_path():
+    """여러 MCP 프로세스가 같은 PC에서 공유하는 다운로드/추출 슬롯 저장소."""
+    override = os.environ.get('EIASS_LIMIT_DB_PATH')
+    if override:
+        return os.path.abspath(os.path.expandvars(override))
+    return os.path.join(app_data_dir(), 'mcp_limits.sqlite3')

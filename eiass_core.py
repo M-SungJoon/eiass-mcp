@@ -25,7 +25,7 @@ import tempfile
 import threading
 import time
 import urllib.parse
-from collections import OrderedDict
+from collections import OrderedDict, deque
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import date, datetime
 import multiprocessing
@@ -43,10 +43,16 @@ from urllib3.util.retry import Retry
 from config import (DETAIL_CACHE_MAX_ITEMS, DETAIL_CACHE_TTL_SECONDS,
                     DETAIL_PREFETCH_READ_TIMEOUT_SECONDS, DOC_CACHE_MAX_CHARS,
                     DOC_CACHE_TTL_SECONDS, DOC_DOWNLOAD_CONCURRENCY,
-                    DOC_DOWNLOAD_READ_TIMEOUT_SECONDS, DOC_DOWNLOAD_RETRY_TOTAL,
-                    HEALTH_CACHE_TTL_SECONDS, PDF_EXTRACT_TIMEOUT_SECONDS, PDF_MAX_BYTES,
-                    PDF_MAX_PAGES)
-from pdf_worker import worker_entry
+                    DOC_CONNECT_TIMEOUT_SECONDS, DOC_DOWNLOAD_READ_TIMEOUT_SECONDS,
+                    DOC_DOWNLOAD_RETRY_TOTAL, DOC_DOWNLOAD_TOTAL_TIMEOUT_SECONDS,
+                    DOC_FIRST_BYTE_TIMEOUT_SECONDS, DOC_LOW_SPEED_BYTES_PER_SECOND,
+                    DOC_LOW_SPEED_GRACE_SECONDS, DOC_LOW_SPEED_WINDOW_SECONDS,
+                    DOC_PROGRESS_INTERVAL_SECONDS, DOC_TOTAL_TIMEOUT_SECONDS,
+                    HEALTH_CACHE_TTL_SECONDS, PDF_EXTRACT_CONCURRENCY,
+                    PDF_EXTRACT_TIMEOUT_SECONDS, PDF_MAX_BYTES, PDF_MAX_PAGES,
+                    PDF_PROCESS_START_TIMEOUT_SECONDS)
+from job_store import SharedSlotLimiter
+from pdf_worker import worker_entry_path
 
 try:
     import fitz  # PyMuPDF
@@ -55,7 +61,7 @@ except ImportError:
 
 # 저장소 루트 VERSION 파일과 항상 같은 값으로 맞춰서 커밋할 것(버전 두 곳 중복 관리).
 # 어긋난 채로 커밋되지 않도록 build_mcp.py가 빌드 시작 전에 두 값을 대조한다.
-__version__ = '1.15.1'
+__version__ = '1.16.0'
 
 REQUEST_TIMEOUT = (8, 30)
 
@@ -66,6 +72,11 @@ FILE_DOWNLOAD_URL = EIASS_BASE + '/common/file/downloadFileByFileSeq.do'
 # 여러 scan worker가 동시에 배치를 처리해도 EIASS로 나가는 문서/상세 요청 총량은 이 상한을
 # 넘지 않는다. job마다 별도 ThreadPoolExecutor를 두더라도 실제 외부 요청은 여기서 조절된다.
 _DOCUMENT_IO_SLOTS = threading.BoundedSemaphore(DOC_DOWNLOAD_CONCURRENCY)
+_PDF_EXTRACT_SLOTS = threading.BoundedSemaphore(PDF_EXTRACT_CONCURRENCY)
+_SHARED_DOWNLOAD_SLOTS = SharedSlotLimiter(
+    'eiass_document_download', DOC_DOWNLOAD_CONCURRENCY, DOC_TOTAL_TIMEOUT_SECONDS + 60)
+_SHARED_EXTRACT_SLOTS = SharedSlotLimiter(
+    'eiass_pdf_extract', PDF_EXTRACT_CONCURRENCY, DOC_TOTAL_TIMEOUT_SECONDS + 60)
 
 
 def runtime_build_info():
@@ -568,14 +579,45 @@ def _candidate_detail_key(item):
     return (str(item.get('view_type')), str(item.get('eia_cd')), str(item.get('revirpt_seq')))
 
 
-def _with_document_io_slot(operation, should_cancel=None):
+def _with_document_io_slot(operation, should_cancel=None, deadline=None, on_wait=None):
     while not _DOCUMENT_IO_SLOTS.acquire(timeout=0.5):
         _check_cancelled(should_cancel)
+        if deadline is not None and time.monotonic() >= deadline:
+            raise EiassError('문서 전체 처리 시간이 제한을 초과했습니다 (다운로드 슬롯 대기).')
+        if on_wait:
+            on_wait()
+    shared_token = None
     try:
         _check_cancelled(should_cancel)
+        shared_token = _SHARED_DOWNLOAD_SLOTS.acquire(
+            should_cancel=should_cancel, deadline=deadline, on_wait=on_wait)
+        if not shared_token:
+            _check_cancelled(should_cancel)
+            raise EiassError('문서 전체 처리 시간이 제한을 초과했습니다 (공유 다운로드 슬롯 대기).')
         return operation()
     finally:
+        _SHARED_DOWNLOAD_SLOTS.release(shared_token)
         _DOCUMENT_IO_SLOTS.release()
+
+
+def _with_pdf_extract_slot(operation, should_cancel=None, deadline=None, on_wait=None):
+    while not _PDF_EXTRACT_SLOTS.acquire(timeout=0.5):
+        _check_cancelled(should_cancel)
+        if deadline is not None and time.monotonic() >= deadline:
+            raise EiassError('문서 전체 처리 시간이 제한을 초과했습니다 (PDF 추출 슬롯 대기).')
+        if on_wait:
+            on_wait()
+    shared_token = None
+    try:
+        shared_token = _SHARED_EXTRACT_SLOTS.acquire(
+            should_cancel=should_cancel, deadline=deadline, on_wait=on_wait)
+        if not shared_token:
+            _check_cancelled(should_cancel)
+            raise EiassError('문서 전체 처리 시간이 제한을 초과했습니다 (공유 PDF 추출 슬롯 대기).')
+        return operation()
+    finally:
+        _SHARED_EXTRACT_SLOTS.release(shared_token)
+        _PDF_EXTRACT_SLOTS.release()
 
 
 def _call_project_detail(item, session, use_cache=True, request_timeout=None):
@@ -593,9 +635,10 @@ def _call_project_detail(item, session, use_cache=True, request_timeout=None):
             item['view_type'], item['eia_cd'], item['revirpt_seq'], **kwargs)
 
 
-def _call_full_document_text(file_seq, session, should_cancel=None, request_timeout=None):
+def _call_full_document_text(file_seq, session, should_cancel=None, request_timeout=None,
+                             on_progress=None):
     """취소 인자를 모르는 기존 문서 로더 대체 구현과도 호환되는 단일 호출 지점."""
-    kwargs = {'session': session, 'should_cancel': should_cancel}
+    kwargs = {'session': session, 'should_cancel': should_cancel, 'on_progress': on_progress}
     if request_timeout is not None:
         kwargs['request_timeout'] = request_timeout
     try:
@@ -603,11 +646,15 @@ def _call_full_document_text(file_seq, session, should_cancel=None, request_time
     except TypeError as exc:
         if 'unexpected keyword argument' not in str(exc):
             raise
-        return _get_full_document_text(file_seq, session=session)
+        kwargs.pop('on_progress', None)
+        try:
+            return _get_full_document_text(file_seq, **kwargs)
+        except TypeError:
+            return _get_full_document_text(file_seq, session=session)
 
 
 def _prefetch_batch_documents(batch, stages, doc_title_contains, session=None,
-                              should_cancel=None, max_workers=None):
+                              should_cancel=None, max_workers=None, on_progress=None):
     """한 배치가 열어볼 모든 PDF를 동시에 내려받아 텍스트 캐시를 미리 데운다.
 
     이걸 먼저 돌려두면 뒤따르는 순차 매칭 루프의 _get_full_document_text 호출이 전부 캐시에
@@ -649,8 +696,11 @@ def _prefetch_batch_documents(batch, stages, doc_title_contains, session=None,
 
     # 2) 열어볼 PDF의 file_seq를 중복 없이 모은다.
     file_seqs = []
+    file_context = {}
     seen = set()
-    for detail in outcome['details'].values():
+    item_by_key = {_candidate_detail_key(item): item for item in batch}
+    for detail_key, detail in outcome['details'].items():
+        item = item_by_key.get(detail_key, {})
         for stage in stages:
             raw_files = [f for cat_files in (detail['stage_docs'].get(stage) or {}).values()
                          for f in cat_files if f.get('is_pdf')]
@@ -659,24 +709,44 @@ def _prefetch_batch_documents(batch, stages, doc_title_contains, session=None,
                 if seq and seq not in seen:
                     seen.add(seq)
                     file_seqs.append(seq)
+                    file_context[seq] = {
+                        'current_file': f.get('name'), 'current_candidate': item.get('name'),
+                        'current_eia_cd': item.get('eia_cd'),
+                    }
     if not file_seqs:
         return outcome
 
     # 3) 동시에 다운로드+추출해 캐시를 데운다. 실패를 명시적으로 반환해 아래 순차 매칭 루프가
     # 같은 문서를 기본 3회 재시도하지 않게 한다.
+    progress_lock = threading.Lock()
+    completed_documents = 0
+
+    def _report_document(seq, progress):
+        if not on_progress:
+            return
+        with progress_lock:
+            payload = dict(progress, **file_context.get(seq, {}), file_seq=seq,
+                           documents_total=len(file_seqs),
+                           documents_completed=completed_documents)
+        on_progress(payload)
+
     def _load_document(seq):
+        nonlocal completed_documents
         dl_session = _session(retry_total=DOC_DOWNLOAD_RETRY_TOTAL, pool_maxsize=1)
         try:
             _check_cancelled(should_cancel)
-            _with_document_io_slot(
-                lambda: _call_full_document_text(
-                    seq, session=dl_session, should_cancel=should_cancel,
-                    request_timeout=(8, DOC_DOWNLOAD_READ_TIMEOUT_SECONDS)),
-                should_cancel)
+            _call_full_document_text(
+                seq, session=dl_session, should_cancel=should_cancel,
+                request_timeout=(DOC_CONNECT_TIMEOUT_SECONDS, DOC_FIRST_BYTE_TIMEOUT_SECONDS),
+                on_progress=lambda progress: _report_document(seq, progress))
             return True, None
         except Exception as exc:
             return False, str(exc)
         finally:
+            with progress_lock:
+                completed_documents += 1
+            _report_document(seq, {'phase': 'prefetch_documents', 'activity_state': 'running',
+                                   'last_activity_at': time.time()})
             dl_session.close()
 
     document_results = _map_concurrent(file_seqs, _load_document, max_workers, should_cancel)
@@ -1659,80 +1729,264 @@ def get_project_detail(view_type, eia_cd, revirpt_seq, session=None, use_cache=F
     return result
 
 
+def _set_response_read_timeout(response, seconds):
+    """첫 body chunk 뒤 urllib3 socket의 무응답 제한을 늘린다. 실패 시 더 엄격한 기존 값 유지."""
+    try:
+        response.raw._fp.fp.raw._sock.settimeout(seconds)
+    except (AttributeError, OSError):
+        pass
+
+
 def _get_full_document_text(file_seq, session=None, should_cancel=None,
-                            request_timeout=(8, DOC_DOWNLOAD_READ_TIMEOUT_SECONDS)):
-    """캐시 우선 조회 후 없으면 다운로드+추출한다. 검색용이므로 절대 잘리지 않은 전체
-    텍스트를 반환한다(요약/표시용 자르기는 download_document_text에서만 한다)."""
+                            request_timeout=(DOC_CONNECT_TIMEOUT_SECONDS,
+                                             DOC_FIRST_BYTE_TIMEOUT_SECONDS),
+                            on_progress=None):
+    """PDF를 디스크로 제한 스트리밍한 뒤 별도 프로세스에서 추출한다.
+
+    read timeout만으로는 조금씩 계속 전송되는 저속 응답을 제한할 수 없으므로 첫 바이트,
+    무응답, 전체 다운로드, 지속 저속, 추출, 문서 전체 제한을 각각 적용한다.
+    """
+    document_started = time.monotonic()
+    document_deadline = document_started + DOC_TOTAL_TIMEOUT_SECONDS
+    last_progress_emit = [0.0]
+
+    def report(activity_state, phase, force=False, **extra):
+        now = time.monotonic()
+        if not on_progress:
+            return
+        if not force and now - last_progress_emit[0] < DOC_PROGRESS_INTERVAL_SECONDS:
+            return
+        last_progress_emit[0] = now
+        on_progress(dict(
+            phase=phase, activity_state=activity_state, file_seq=str(file_seq),
+            document_elapsed_ms=round((now - document_started) * 1000),
+            last_activity_at=time.time(), **extra))
+
     _check_cancelled(should_cancel)
     cached = _cache_get(file_seq)
     if cached:
+        report('running', 'document_cache_hit', force=True, bytes_received=0,
+               throughput_bps=None)
         return {'text': cached['text'], 'page_offsets': cached['page_offsets'],
                 'pages': cached['pages'], 'from_cache': True}
     if fitz is None:
         raise EiassError('PyMuPDF(fitz)가 설치되어 있지 않아 PDF 텍스트를 추출할 수 없습니다.')
+
     s = session or _session()
     url = f'{FILE_DOWNLOAD_URL}?FILE_SEQ={file_seq}'
-    res = s.get(url, headers={'User-Agent': 'Mozilla/5.0', 'Referer': EIASS_BASE + '/'},
-                timeout=request_timeout, stream=True)
+    temp_path = None
+    response = None
+    bytes_received = 0
     try:
-        if res.status_code != 200:
-            raise EiassNetworkError(f'문서 다운로드 실패: HTTP {res.status_code}')
-        content = bytearray()
-        for chunk in res.iter_content(chunk_size=1024 * 1024):
-            _check_cancelled(should_cancel)
-            if not chunk:
-                continue
-            content.extend(chunk)
-            if len(content) > PDF_MAX_BYTES:
+        report('server_waiting', 'pdf_waiting_first_byte', force=True,
+               bytes_received=0, throughput_bps=0)
+
+        def download_to_temp():
+            nonlocal response, temp_path, bytes_received
+            remaining = max(0.001, document_deadline - time.monotonic())
+            connect_timeout, first_byte_timeout = request_timeout
+            bounded_timeout = (min(connect_timeout, remaining),
+                               min(first_byte_timeout, remaining))
+            try:
+                response = s.get(
+                    url, headers={'User-Agent': 'Mozilla/5.0', 'Referer': EIASS_BASE + '/'},
+                    timeout=bounded_timeout, stream=True)
+            except requests.exceptions.ConnectTimeout as exc:
+                raise EiassNetworkError(
+                    f'EIASS 연결이 {DOC_CONNECT_TIMEOUT_SECONDS}초 안에 완료되지 않았습니다.') from exc
+            except requests.exceptions.ReadTimeout as exc:
+                raise EiassNetworkError(
+                    f'PDF 첫 데이터가 {DOC_FIRST_BYTE_TIMEOUT_SECONDS}초 안에 오지 않았습니다.') from exc
+            except requests.exceptions.Timeout as exc:
+                raise EiassNetworkError('EIASS PDF 요청 시간이 제한을 초과했습니다.') from exc
+            if response.status_code != 200:
+                raise EiassNetworkError(f'문서 다운로드 실패: HTTP {response.status_code}')
+            fd, temp_path = tempfile.mkstemp(prefix='eiass-pdf-', suffix='.pdf')
+            download_started = time.monotonic()
+            download_deadline = download_started + DOC_DOWNLOAD_TOTAL_TIMEOUT_SECONDS
+            history = deque([(download_started, 0)])
+            first_chunk = True
+            with os.fdopen(fd, 'wb') as stream:
+                try:
+                    for chunk in response.iter_content(chunk_size=1024 * 1024):
+                        _check_cancelled(should_cancel)
+                        now = time.monotonic()
+                        if now >= document_deadline:
+                            raise EiassNetworkError(
+                                f'문서 전체 처리 시간이 제한({DOC_TOTAL_TIMEOUT_SECONDS}초)을 초과했습니다.')
+                        if now >= download_deadline:
+                            raise EiassNetworkError(
+                                f'PDF 전체 다운로드 시간이 제한({DOC_DOWNLOAD_TOTAL_TIMEOUT_SECONDS}초)을 초과했습니다.')
+                        if not chunk:
+                            continue
+                        if first_chunk:
+                            first_chunk = False
+                            _set_response_read_timeout(response, DOC_DOWNLOAD_READ_TIMEOUT_SECONDS)
+                        stream.write(chunk)
+                        bytes_received += len(chunk)
+                        if bytes_received > PDF_MAX_BYTES:
+                            raise EiassError(
+                                f'문서 크기가 제한({PDF_MAX_BYTES // (1024 * 1024)}MB)을 초과했습니다.')
+                        history.append((now, bytes_received))
+                        cutoff = now - DOC_LOW_SPEED_WINDOW_SECONDS
+                        while len(history) > 1 and history[1][0] <= cutoff:
+                            history.popleft()
+                        elapsed = max(0.001, now - download_started)
+                        throughput = round(bytes_received / elapsed)
+                        rolling_elapsed = now - history[0][0]
+                        rolling_speed = ((bytes_received - history[0][1]) / rolling_elapsed
+                                         if rolling_elapsed > 0 else throughput)
+                        slow_ready = elapsed >= (DOC_LOW_SPEED_GRACE_SECONDS +
+                                                 DOC_LOW_SPEED_WINDOW_SECONDS)
+                        if slow_ready and rolling_speed < DOC_LOW_SPEED_BYTES_PER_SECOND:
+                            report('server_slow', 'pdf_low_speed', force=True,
+                                   bytes_received=bytes_received,
+                                   throughput_bps=round(rolling_speed))
+                            raise EiassNetworkError(
+                                'PDF 저속 전송 제한: 최근 '
+                                f'{DOC_LOW_SPEED_WINDOW_SECONDS}초 평균 {round(rolling_speed / 1024)}KiB/s '
+                                f'(기준 {DOC_LOW_SPEED_BYTES_PER_SECOND // 1024}KiB/s 미만)')
+                        state = ('active_slow' if elapsed >= DOC_LOW_SPEED_GRACE_SECONDS and
+                                 rolling_speed < DOC_LOW_SPEED_BYTES_PER_SECOND * 2 else 'running')
+                        report(state, 'pdf_downloading', bytes_received=bytes_received,
+                               throughput_bps=round(rolling_speed))
+                except requests.exceptions.ReadTimeout as exc:
+                    if bytes_received:
+                        message = f'PDF 전송 중 {DOC_DOWNLOAD_READ_TIMEOUT_SECONDS}초간 데이터가 없어 중단했습니다.'
+                    else:
+                        message = f'PDF 첫 데이터가 {DOC_FIRST_BYTE_TIMEOUT_SECONDS}초 안에 오지 않았습니다.'
+                    raise EiassNetworkError(message) from exc
+                except requests.exceptions.ConnectionError as exc:
+                    if 'read timed out' not in str(exc).lower():
+                        raise
+                    if bytes_received:
+                        message = f'PDF 전송 중 {DOC_DOWNLOAD_READ_TIMEOUT_SECONDS}초간 데이터가 없어 중단했습니다.'
+                    else:
+                        message = f'PDF 첫 데이터가 {DOC_FIRST_BYTE_TIMEOUT_SECONDS}초 안에 오지 않았습니다.'
+                    raise EiassNetworkError(message) from exc
+            if bytes_received == 0:
+                raise EiassNetworkError('문서 다운로드 실패: 빈 응답')
+            with open(temp_path, 'rb') as check_stream:
+                if not check_stream.read(5).startswith(b'%PDF-'):
+                    raise EiassNetworkError('문서 다운로드 응답이 PDF 형식이 아닙니다.')
+            report('running', 'pdf_downloaded', force=True, bytes_received=bytes_received,
+                   throughput_bps=round(bytes_received / max(0.001, time.monotonic() - download_started)))
+
+        _with_document_io_slot(
+            download_to_temp, should_cancel=should_cancel, deadline=document_deadline,
+            on_wait=lambda: report('server_waiting', 'download_slot_wait', bytes_received=0,
+                                   throughput_bps=0))
+
+        def extract_from_temp():
+            ctx = multiprocessing.get_context('spawn')
+            parent_pipe, child_pipe = ctx.Pipe(duplex=False)
+            process = ctx.Process(
+                target=worker_entry_path, args=(temp_path, PDF_MAX_PAGES, child_pipe), daemon=True)
+            start_done = threading.Event()
+            start_error = []
+            abandoned = threading.Event()
+
+            def start_process():
+                try:
+                    process.start()
+                    if abandoned.is_set() and process.is_alive():
+                        process.terminate()
+                        process.join(5)
+                except BaseException as exc:
+                    start_error.append(exc)
+                finally:
+                    start_done.set()
+
+            extract_started = time.monotonic()
+            starter = threading.Thread(target=start_process, name='eiass-pdf-start', daemon=True)
+            starter.start()
+            start_wait = min(PDF_PROCESS_START_TIMEOUT_SECONDS,
+                             max(0.0, document_deadline - time.monotonic()))
+            if not start_done.wait(start_wait):
+                abandoned.set()
+                report('local_resource_pressure', 'pdf_process_start_timeout', force=True,
+                       bytes_received=bytes_received, throughput_bps=None)
+                if time.monotonic() >= document_deadline:
+                    raise EiassError(
+                        f'문서 전체 처리 시간이 제한({DOC_TOTAL_TIMEOUT_SECONDS}초)을 초과했습니다.')
                 raise EiassError(
-                    f'문서 크기가 제한({PDF_MAX_BYTES // (1024 * 1024)}MB)을 초과했습니다.')
-    finally:
-        res.close()
-    if not content:
-        raise EiassNetworkError('문서 다운로드 실패: 빈 응답')
-    pdf_bytes = bytes(content)
-    # PyMuPDF는 손상 PDF에서 장시간 멈출 수 있어 별도 프로세스에서 제한 시간 안에 추출한다.
-    ctx = multiprocessing.get_context('spawn')
-    parent_pipe, child_pipe = ctx.Pipe(duplex=False)
-    process = ctx.Process(target=worker_entry, args=(pdf_bytes, PDF_MAX_PAGES, child_pipe), daemon=True)
-    try:
-        process.start()
-        child_pipe.close()
-        deadline = time.monotonic() + PDF_EXTRACT_TIMEOUT_SECONDS
-        while not parent_pipe.poll(min(0.5, max(0.0, deadline - time.monotonic()))):
-            _check_cancelled(should_cancel)
-            if time.monotonic() >= deadline:
-                process.terminate()
+                    f'PDF 추출 프로세스가 {PDF_PROCESS_START_TIMEOUT_SECONDS}초 안에 시작되지 않았습니다.')
+            if start_error:
+                raise EiassError(f'PDF 추출 프로세스 시작 실패: {start_error[0]}')
+            child_pipe.close()
+            deadline = min(document_deadline, extract_started + PDF_EXTRACT_TIMEOUT_SECONDS)
+            try:
+                report('running', 'pdf_extracting', force=True, bytes_received=bytes_received,
+                       throughput_bps=None)
+                while not parent_pipe.poll(min(0.5, max(0.0, deadline - time.monotonic()))):
+                    _check_cancelled(should_cancel)
+                    if time.monotonic() >= deadline:
+                        if process.is_alive():
+                            process.terminate()
+                            process.join(5)
+                        report('timed_out', 'pdf_extract_timeout', force=True,
+                               bytes_received=bytes_received, throughput_bps=None)
+                        if deadline >= document_deadline:
+                            raise EiassError(
+                                f'문서 전체 처리 시간이 제한({DOC_TOTAL_TIMEOUT_SECONDS}초)을 초과했습니다.')
+                        raise EiassError(
+                            f'PDF 텍스트 추출 시간이 제한({PDF_EXTRACT_TIMEOUT_SECONDS}초)을 초과했습니다.')
+                    report('running', 'pdf_extracting', bytes_received=bytes_received,
+                           throughput_bps=None)
+                try:
+                    status, payload = parent_pipe.recv()
+                except EOFError as exc:
+                    raise EiassError(
+                        f'PDF 텍스트 추출 프로세스가 결과 없이 종료했습니다 (exit={process.exitcode}).') from exc
                 process.join(5)
-                raise EiassError(
-                    f'PDF 텍스트 추출 시간이 제한({PDF_EXTRACT_TIMEOUT_SECONDS}초)을 초과했습니다.')
+                if process.is_alive():
+                    process.terminate()
+                    process.join(5)
+                if status != 'ok':
+                    raise EiassError(f'PDF 텍스트 추출 실패: {payload}')
+                return payload
+            except BaseException:
+                if process.is_alive():
+                    process.terminate()
+                    process.join(5)
+                raise
+            finally:
+                parent_pipe.close()
+                child_pipe.close()
+
+        payload = _with_pdf_extract_slot(
+            extract_from_temp, should_cancel=should_cancel, deadline=document_deadline,
+            on_wait=lambda: report('local_resource_pressure', 'pdf_extract_slot_wait',
+                                   bytes_received=bytes_received, throughput_bps=None))
+        full_text = payload['text']
+        page_offsets = payload['page_offsets']
+        pages = payload['pages']
         try:
-            status, payload = parent_pipe.recv()
-        except EOFError as exc:
-            raise EiassError(
-                f'PDF 텍스트 추출 프로세스가 결과 없이 종료했습니다 (exit={process.exitcode}).') from exc
-        process.join(5)
-        if process.is_alive():
-            process.terminate()
-            process.join(5)
-    except BaseException:
-        if process.is_alive():
-            process.terminate()
-            process.join(5)
+            _cache_put(file_seq, full_text, page_offsets, pages)
+        except Exception:
+            pass
+        report('running', 'document_completed', force=True, bytes_received=bytes_received,
+               throughput_bps=None, pages=pages)
+        return {'text': full_text, 'page_offsets': page_offsets,
+                'pages': pages, 'from_cache': False}
+    except ScanCancelled:
+        raise
+    except Exception as exc:
+        text = str(exc)
+        state = ('timed_out' if '시간이 제한' in text or '초과' in text else
+                 'server_slow' if '저속' in text or '데이터가 없어' in text else
+                 'local_resource_pressure' if '프로세스' in text or '슬롯' in text else 'server_waiting')
+        report(state, 'document_failed', force=True, bytes_received=bytes_received,
+               throughput_bps=None, error=text)
         raise
     finally:
-        parent_pipe.close()
-        child_pipe.close()
-    if status != 'ok':
-        raise EiassError(f'PDF 텍스트 추출 실패: {payload}')
-    full_text = payload['text']
-    page_offsets = payload['page_offsets']
-    pages = payload['pages']
-    try:
-        _cache_put(file_seq, full_text, page_offsets, pages)
-    except Exception:
-        pass  # 캐시 저장 실패는 무시(검색 자체는 계속 진행)
-    return {'text': full_text, 'page_offsets': page_offsets, 'pages': pages, 'from_cache': False}
+        if response is not None:
+            response.close()
+        if temp_path:
+            try:
+                os.remove(temp_path)
+            except OSError:
+                pass
 
 
 def _filter_files_by_title(files, title_terms):
@@ -2050,7 +2304,8 @@ def search_projects_by_document_keyword(
         on_progress({'phase': 'prefetch_documents', 'batch_completed': 0,
                      'batch_total': len(batch), 'current_candidate': None})
     prefetched = _prefetch_batch_documents(
-        batch, stages, doc_title_contains, session, should_cancel=should_cancel)
+        batch, stages, doc_title_contains, session, should_cancel=should_cancel,
+        on_progress=on_progress)
 
     for batch_index, item in enumerate(batch):
         _check_cancelled(should_cancel)

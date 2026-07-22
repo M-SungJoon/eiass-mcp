@@ -1,5 +1,6 @@
 """영속 JobStore를 사용하는 bounded worker 기반 스캔 실행기."""
 import queue
+import sys
 import threading
 import time
 import uuid
@@ -9,6 +10,10 @@ from config import JOB_HEARTBEAT_INTERVAL_SECONDS, JOB_QUEUE_SIZE, JOB_WORKER_CO
 from document_engine import outcomes as document_outcomes, run_batch as run_document_batch
 from job_store import JobStore
 from spatial_engine import outcomes as spatial_outcomes, run_batch as run_spatial_batch
+
+
+_HEARTBEAT_DIAGNOSTICS = {}
+_HEARTBEAT_DIAGNOSTICS_LOCK = threading.Lock()
 
 
 class ScanRunner:
@@ -94,11 +99,34 @@ class ScanRunner:
         stop_heartbeat = threading.Event()
 
         def _heartbeat_pump():
+            failures = 0
+            total_failures = 0
+            last_error = None
             while not stop_heartbeat.wait(JOB_HEARTBEAT_INTERVAL_SECONDS):
                 try:
-                    self.store.touch_heartbeat(job_id, owner_id=self.owner_id)
-                except Exception:
-                    pass  # 일시적 SQLite 잠금은 다음 주기에 다시 시도한다
+                    if not self.store.touch_heartbeat(job_id, owner_id=self.owner_id):
+                        return
+                    if failures:
+                        diagnostic = {
+                            'consecutive_failures': 0, 'total_failures': total_failures,
+                            'last_error': last_error, 'recovered_at': time.time(),
+                        }
+                        with _HEARTBEAT_DIAGNOSTICS_LOCK:
+                            _HEARTBEAT_DIAGNOSTICS[job_id] = diagnostic
+                        self.store.merge_meta(job_id, {'heartbeat_diagnostics': diagnostic})
+                    failures = 0
+                except Exception as exc:
+                    failures += 1
+                    total_failures += 1
+                    last_error = f'{type(exc).__name__}: {exc}'
+                    diagnostic = {
+                        'consecutive_failures': failures, 'total_failures': total_failures,
+                        'last_error': last_error, 'last_failure_at': time.time(),
+                    }
+                    with _HEARTBEAT_DIAGNOSTICS_LOCK:
+                        _HEARTBEAT_DIAGNOSTICS[job_id] = diagnostic
+                    print(f'[EIASS heartbeat] job={job_id} failure={failures}: {last_error}',
+                          file=sys.stderr, flush=True)
         pump = threading.Thread(target=_heartbeat_pump, name=f'eiass-hb-{job_id[:8]}', daemon=True)
         pump.start()
         try:
@@ -129,6 +157,9 @@ class ScanRunner:
             self.store.update(job_id, status='running', phase='document_scan' if kind == 'document' else 'spatial_scan')
             pending = self.store.candidates(job_id, only_pending=True)
             batch_size = int(payload['batch_size'])
+            progress_lock = threading.Lock()
+            file_bytes = {}
+            completed_files = set()
             for start in range(0, len(pending), batch_size):
                 if not self.store.owner_is(job_id, self.owner_id):
                     return  # 다른 runner가 stale lease를 회수했으므로 이전 실행 결과를 쓰지 않는다.
@@ -142,28 +173,70 @@ class ScanRunner:
                     def _on_work_progress(progress):
                         if not self.store.owner_is(job_id, self.owner_id):
                             raise core.ScanCancelled('작업 lease가 다른 runner로 이전되었습니다.')
-                        progress_meta = self.store.get(job_id)['meta']
-                        progress_meta['work_progress'] = dict(progress, progress_at=time.time())
-                        self.store.update(job_id, phase=progress.get('phase', 'document_scan'),
-                                          meta=progress_meta)
+                        with progress_lock:
+                            file_seq = progress.get('file_seq')
+                            if file_seq:
+                                file_bytes[file_seq] = max(
+                                    file_bytes.get(file_seq, 0), int(progress.get('bytes_received') or 0))
+                                if progress.get('phase') == 'prefetch_documents':
+                                    completed_files.add(file_seq)
+                            work_progress = dict(
+                                progress, progress_at=time.time(),
+                                documents_completed=len(completed_files),
+                                bytes_received_total=sum(file_bytes.values()),
+                                candidates_completed=self.store.get(job_id)['checked'])
+                        self.store.merge_meta(
+                            job_id, {'work_progress': work_progress},
+                            phase=progress.get('phase', 'document_scan'))
+
+                    def _checkpoint_candidate(candidate, candidate_result):
+                        normalized_one = document_outcomes(
+                            [candidate], candidate_result, ordinal_by_key)
+                        self.store.save_outcomes(job_id, normalized_one)
+                        current = self.store.get(job_id)['meta']
+                        updates = {
+                            'stage_stats': _merge_stage_stats(
+                                current.get('stage_stats', {}),
+                                candidate_result.get('stage_stats', {})),
+                        }
+                        if candidate_result.get('needs_refinement'):
+                            updates['needs_refinement'] = True
+                            hints = list(current.get('refinement_hints', []))
+                            hint = candidate_result.get('refinement_hint')
+                            if hint:
+                                hints.append(hint)
+                            updates['refinement_hints'] = hints
+                        if candidate_result.get('audit_sample'):
+                            samples = list(current.get('audit_samples', []))
+                            samples.append(candidate_result['audit_sample'])
+                            updates['audit_samples'] = samples
+                        self.store.merge_meta(job_id, updates)
 
                     batch_payload = dict(payload, _on_progress=_on_work_progress)
-                    result = run_document_batch(batch_payload, candidates, should_cancel, session)
-                    normalized = document_outcomes(candidates, result, ordinal_by_key)
-                    meta = self.store.get(job_id)['meta']
-                    meta['stage_stats'] = _merge_stage_stats(meta.get('stage_stats', {}), result.get('stage_stats', {}))
-                    if result.get('needs_refinement'):
-                        meta['needs_refinement'] = True
-                        meta.setdefault('refinement_hints', []).append(result.get('refinement_hint'))
-                    if result.get('audit_sample'):
-                        meta.setdefault('audit_samples', []).append(result['audit_sample'])
+                    try:
+                        result = run_document_batch(
+                            batch_payload, candidates, should_cancel, session,
+                            on_candidate_complete=_checkpoint_candidate)
+                        normalized = None
+                        meta = None
+                    except TypeError as exc:
+                        # 기존 플러그인/테스트 대체 구현은 새 callback 인자를 모를 수 있다.
+                        if 'on_candidate_complete' not in str(exc):
+                            raise
+                        result = run_document_batch(
+                            batch_payload, candidates, should_cancel, session)
+                        normalized = document_outcomes(candidates, result, ordinal_by_key)
+                        meta = self.store.get(job_id)['meta']
+                        meta['stage_stats'] = _merge_stage_stats(
+                            meta.get('stage_stats', {}), result.get('stage_stats', {}))
                 else:
                     result = run_spatial_batch(payload, candidates, should_cancel, session)
                     normalized = spatial_outcomes(candidates, result, ordinal_by_key)
                     meta = self.store.get(job_id)['meta']
                 if not self.store.owner_is(job_id, self.owner_id):
                     return
-                self.store.save_outcomes(job_id, normalized, meta=meta)
+                if normalized is not None:
+                    self.store.save_outcomes(job_id, normalized, meta=meta)
             if self.store.owner_is(job_id, self.owner_id):
                 self.store.update(job_id, status='done', phase='completed', clear_owner=True)
         except core.ScanCancelled:
@@ -206,7 +279,29 @@ def document_status(store, job_id, include_results=False, offset=0, limit=100):
     if not job or job['kind'] != 'document':
         return {'error': f'알 수 없는 job_id: {job_id}'}
     counts = store.result_counts(job_id)
-    result = {'status': job['status'], 'checked': job['checked'], 'candidates_total': job['candidates_total'],
+    now = time.time()
+    work_progress = job['meta'].get('work_progress') or {}
+    heartbeat_diagnostics = job['meta'].get('heartbeat_diagnostics') or {}
+    with _HEARTBEAT_DIAGNOSTICS_LOCK:
+        heartbeat_diagnostics = dict(
+            heartbeat_diagnostics, **_HEARTBEAT_DIAGNOSTICS.get(job_id, {}))
+    heartbeat_age = max(0.0, now - job['heartbeat_at'])
+    activity_at = work_progress.get('last_activity_at') or work_progress.get('progress_at') or job['updated_at']
+    activity_age = max(0.0, now - activity_at)
+    if job['status'] in ('running', 'discovering'):
+        activity_state = work_progress.get('activity_state') or 'running'
+        if (heartbeat_diagnostics.get('consecutive_failures', 0) > 0 or
+                activity_state == 'local_resource_pressure'):
+            activity_state = 'local_resource_pressure'
+        if heartbeat_age > JOB_HEARTBEAT_INTERVAL_SECONDS * 3 and activity_age > 60:
+            activity_state = 'stalled'
+    elif job['status'] == 'done':
+        activity_state = 'completed'
+    else:
+        activity_state = job['status']
+
+    result = {'status': job['status'], 'activity_state': activity_state,
+              'checked': job['checked'], 'candidates_total': job['candidates_total'],
               'match_count': counts.get('match', 0), 'checked_no_match_count': counts.get('no_match', 0),
               'skipped_count': counts.get('skipped', 0), 'stage_stats': job['meta'].get('stage_stats', {}),
               'needs_refinement': bool(job['meta'].get('needs_refinement')),
@@ -214,7 +309,10 @@ def document_status(store, job_id, include_results=False, offset=0, limit=100):
               'audit_samples': job['meta'].get('audit_samples', []),
               'date_filter_exclusions': job['meta'].get('date_filter_exclusions', []),
               'discovery_count': job['meta'].get('discovery_count'),
-              'work_progress': job['meta'].get('work_progress'),
+              'work_progress': work_progress or None,
+              'heartbeat_diagnostics': heartbeat_diagnostics or None,
+              'seconds_since_heartbeat': round(heartbeat_age, 1),
+              'seconds_since_activity': round(activity_age, 1),
               'error': job['error'], 'current_phase': job['current_phase'],
               'updated_at': job['updated_at'], 'heartbeat_at': job['heartbeat_at'], 'resume_count': job['resume_count']}
     if include_results:
