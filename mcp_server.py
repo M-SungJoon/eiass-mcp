@@ -19,10 +19,39 @@ import time
 import uuid
 import multiprocessing
 import os
+import pickle
 import re
 import shutil
 import sys
 import tempfile
+
+
+def _run_pdf_worker_mode():
+    """PyInstaller EXE가 PDF 추출 전용 자식으로 실행될 때 MCP 초기화 전에 처리한다."""
+    if len(sys.argv) != 5 or sys.argv[1] != '--eiass-pdf-worker':
+        return False
+    from pdf_worker import extract_pdf_path
+
+    pdf_path, result_path, max_pages = sys.argv[2], sys.argv[3], int(sys.argv[4])
+    part_path = result_path + '.part'
+    try:
+        try:
+            payload = ('ok', extract_pdf_path(pdf_path, max_pages))
+        except Exception as exc:
+            payload = ('error', str(exc))
+        with open(part_path, 'wb') as stream:
+            pickle.dump(payload, stream, protocol=pickle.HIGHEST_PROTOCOL)
+        os.replace(part_path, result_path)
+        return True
+    finally:
+        try:
+            os.remove(part_path)
+        except OSError:
+            pass
+
+
+if _run_pdf_worker_mode():
+    raise SystemExit(0)
 
 from mcp.server.fastmcp import FastMCP
 

@@ -18,8 +18,10 @@ import hashlib
 import json
 import math
 import os
+import pickle
 import re
 import sqlite3
+import subprocess
 import sys
 import tempfile
 import threading
@@ -1878,6 +1880,8 @@ def _get_full_document_text(file_seq, session=None, should_cancel=None,
                                    throughput_bps=0))
 
         def extract_from_temp():
+            if getattr(sys, 'frozen', False):
+                return extract_from_temp_exe()
             ctx = multiprocessing.get_context('spawn')
             parent_pipe, child_pipe = ctx.Pipe(duplex=False)
             process = ctx.Process(
@@ -1953,6 +1957,99 @@ def _get_full_document_text(file_seq, session=None, should_cancel=None,
             finally:
                 parent_pipe.close()
                 child_pipe.close()
+
+        def extract_from_temp_exe():
+            result_fd, result_path = tempfile.mkstemp(
+                prefix='eiass-pdf-result-', suffix='.bin')
+            os.close(result_fd)
+            os.remove(result_path)
+            process = None
+            start_done = threading.Event()
+            start_error = []
+            abandoned = threading.Event()
+
+            def start_process():
+                nonlocal process
+                try:
+                    process = subprocess.Popen(
+                        [sys.executable, '--eiass-pdf-worker', temp_path, result_path,
+                         str(PDF_MAX_PAGES)],
+                        stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                        stderr=subprocess.PIPE)
+                    if abandoned.is_set() and process.poll() is None:
+                        process.terminate()
+                        process.wait(timeout=5)
+                except BaseException as exc:
+                    start_error.append(exc)
+                finally:
+                    start_done.set()
+
+            extract_started = time.monotonic()
+            starter = threading.Thread(
+                target=start_process, name='eiass-pdf-exe-start', daemon=True)
+            starter.start()
+            start_wait = min(PDF_PROCESS_START_TIMEOUT_SECONDS,
+                             max(0.0, document_deadline - time.monotonic()))
+            if not start_done.wait(start_wait):
+                abandoned.set()
+                report('local_resource_pressure', 'pdf_process_start_timeout', force=True,
+                       bytes_received=bytes_received, throughput_bps=None)
+                raise EiassError(
+                    f'PDF 추출 프로세스가 {PDF_PROCESS_START_TIMEOUT_SECONDS}초 안에 시작되지 않았습니다.')
+            if start_error:
+                raise EiassError(f'PDF 추출 프로세스 시작 실패: {start_error[0]}')
+            deadline = min(document_deadline, extract_started + PDF_EXTRACT_TIMEOUT_SECONDS)
+            try:
+                report('running', 'pdf_extracting', force=True, bytes_received=bytes_received,
+                       throughput_bps=None)
+                while process.poll() is None:
+                    _check_cancelled(should_cancel)
+                    if time.monotonic() >= deadline:
+                        process.terminate()
+                        try:
+                            process.wait(timeout=5)
+                        except subprocess.TimeoutExpired:
+                            process.kill()
+                            process.wait(timeout=5)
+                        report('timed_out', 'pdf_extract_timeout', force=True,
+                               bytes_received=bytes_received, throughput_bps=None)
+                        if deadline >= document_deadline:
+                            raise EiassError(
+                                f'문서 전체 처리 시간이 제한({DOC_TOTAL_TIMEOUT_SECONDS}초)을 초과했습니다.')
+                        raise EiassError(
+                            f'PDF 텍스트 추출 시간이 제한({PDF_EXTRACT_TIMEOUT_SECONDS}초)을 초과했습니다.')
+                    report('running', 'pdf_extracting', bytes_received=bytes_received,
+                           throughput_bps=None)
+                    time.sleep(0.25)
+                if process.returncode != 0:
+                    error = (process.stderr.read().decode('utf-8', errors='replace')
+                             if process.stderr else '')
+                    raise EiassError(
+                        f'PDF 추출 작업자 종료 오류(exit={process.returncode}): {error[-500:]}')
+                try:
+                    with open(result_path, 'rb') as stream:
+                        status, payload = pickle.load(stream)
+                except (OSError, EOFError, pickle.UnpicklingError) as exc:
+                    raise EiassError('PDF 추출 작업자가 유효한 결과를 남기지 않았습니다.') from exc
+                if status != 'ok':
+                    raise EiassError(f'PDF 텍스트 추출 실패: {payload}')
+                return payload
+            except BaseException:
+                if process is not None and process.poll() is None:
+                    process.terminate()
+                    try:
+                        process.wait(timeout=5)
+                    except subprocess.TimeoutExpired:
+                        process.kill()
+                raise
+            finally:
+                if process is not None and process.stderr:
+                    process.stderr.close()
+                for path in (result_path, result_path + '.part'):
+                    try:
+                        os.remove(path)
+                    except OSError:
+                        pass
 
         payload = _with_pdf_extract_slot(
             extract_from_temp, should_cancel=should_cancel, deadline=document_deadline,
