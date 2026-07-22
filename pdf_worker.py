@@ -38,6 +38,36 @@ def extract_pdf_path(pdf_path, max_pages):
     return {'text': '\n'.join(parts), 'page_offsets': offsets, 'pages': len(parts)}
 
 
+def extract_pdf_path_to_file(pdf_path, max_pages, text_path):
+    """페이지 텍스트를 즉시 파일로 써 자식 프로세스의 list+join 대형 복사를 없앤다."""
+    import os
+    import fitz
+
+    part_path = text_path + '.part'
+    doc = fitz.open(pdf_path)
+    try:
+        if doc.page_count > max_pages:
+            raise ValueError(f'PDF 페이지 수가 제한({max_pages})을 초과했습니다: {doc.page_count}')
+        cursor = 0
+        offsets = []
+        with open(part_path, 'w', encoding='utf-8', newline='\n') as stream:
+            for index, page in enumerate(doc):
+                text = page.get_text()
+                if index:
+                    stream.write('\n')
+                stream.write(text)
+                cursor += len(text) + 1
+                offsets.append(cursor)
+        os.replace(part_path, text_path)
+        return {'page_offsets': offsets, 'pages': doc.page_count, 'text_chars': max(0, cursor - 1)}
+    finally:
+        doc.close()
+        try:
+            os.remove(part_path)
+        except OSError:
+            pass
+
+
 def worker_entry(pdf_bytes, max_pages, result_pipe):
     try:
         result_pipe.send(('ok', extract_pdf_bytes(pdf_bytes, max_pages)))
@@ -47,9 +77,11 @@ def worker_entry(pdf_bytes, max_pages, result_pipe):
         result_pipe.close()
 
 
-def worker_entry_path(pdf_path, max_pages, result_pipe):
+def worker_entry_path(pdf_path, max_pages, result_pipe, text_path=None):
     try:
-        result_pipe.send(('ok', extract_pdf_path(pdf_path, max_pages)))
+        payload = (extract_pdf_path_to_file(pdf_path, max_pages, text_path)
+                   if text_path else extract_pdf_path(pdf_path, max_pages))
+        result_pipe.send(('ok', payload))
     except Exception as exc:
         result_pipe.send(('error', str(exc)))
     finally:

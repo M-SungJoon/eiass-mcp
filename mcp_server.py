@@ -28,15 +28,16 @@ import tempfile
 
 def _run_pdf_worker_mode():
     """PyInstaller EXE가 PDF 추출 전용 자식으로 실행될 때 MCP 초기화 전에 처리한다."""
-    if len(sys.argv) != 5 or sys.argv[1] != '--eiass-pdf-worker':
+    if len(sys.argv) != 6 or sys.argv[1] != '--eiass-pdf-worker':
         return False
-    from pdf_worker import extract_pdf_path
+    from pdf_worker import extract_pdf_path_to_file
 
-    pdf_path, result_path, max_pages = sys.argv[2], sys.argv[3], int(sys.argv[4])
+    pdf_path, result_path, text_path, max_pages = (
+        sys.argv[2], sys.argv[3], sys.argv[4], int(sys.argv[5]))
     part_path = result_path + '.part'
     try:
         try:
-            payload = ('ok', extract_pdf_path(pdf_path, max_pages))
+            payload = ('ok', extract_pdf_path_to_file(pdf_path, max_pages, text_path))
         except Exception as exc:
             payload = ('error', str(exc))
         with open(part_path, 'wb') as stream:
@@ -57,6 +58,7 @@ from mcp.server.fastmcp import FastMCP
 
 import eiass_core as core
 import requests
+from adaptive_engine import normalize_strategy
 from config import (JOB_RESULT_PAGE_LIMIT, MAX_DOCUMENT_SCAN_BATCH_SIZE, MAX_SCAN_BATCH_SIZE,
                     SCAN_MONITOR_POLL_SECONDS, SCAN_NORMAL_REPORT_SECONDS,
                     SCAN_UNCHANGED_REPORT_SECONDS)
@@ -115,11 +117,43 @@ def _confirmation_only(result):
     """AI가 조건을 재구성하지 않고 고정 문구만 전달하도록 미리보기 응답을 최소화한다."""
     if result.get('error'):
         return result
+    method_message = (
+        result['confirmation_message'] +
+        '\n\n조사 방법을 함께 선택해 주세요.\n'
+        '1. 적응형 조사: AI가 우선·감사 표본 전략으로 범위를 좁히거나 넓힙니다. '
+        '성공 기준을 충족하면 결과를 보고하고, 실패·완전성 부족이면 자동으로 남은 범위를 '
+        '전수조사한 뒤 보고합니다.\n'
+        '2. 전수조사: 확정한 전체 후보와 문서 범위를 모두 조사한 뒤 결과를 보고합니다.\n'
+        '검색조건과 조사 방법(적응형 조사 또는 전수조사)을 한 번에 확인해 주세요.')
     return {
         'confirm_required': True,
         'confirmation_required': True,
+        'survey_method_required': True,
+        'survey_method_options': [
+            {'value': 'adaptive', 'label': '적응형 조사',
+             'flow': '적응형 조사 → 성공 시 결과 보고 / 실패·완전성 부족 시 전수조사 → 결과 보고'},
+            {'value': 'exhaustive', 'label': '전수조사',
+             'flow': '전수조사 → 결과 보고'},
+        ],
         'display_mode': 'verbatim',
-        'confirmation_message': result['confirmation_message'],
+        'confirmation_message': method_message,
+    }
+
+
+def _normalize_survey_method(value):
+    normalized = str(value or '').strip().lower().replace(' ', '')
+    if normalized in ('adaptive', '적응형', '적응형조사'):
+        return 'adaptive'
+    if normalized in ('exhaustive', '전수', '전수조사'):
+        return 'exhaustive'
+    return None
+
+
+def _survey_method_required():
+    return {
+        'confirm_required': True, 'survey_method_required': True,
+        'error': "검색조건 승인과 함께 survey_method를 'adaptive'(적응형 조사) 또는 "
+                 "'exhaustive'(전수조사)로 선택해야 합니다.",
     }
 
 # ── 백그라운드 스캔 job 레지스트리 ──
@@ -394,6 +428,7 @@ def eiass_find_projects_by_document_keyword(
     stages: str = '초안,본안,보완,협의의견', doc_title_contains: str = '',
     max_pages: int = 0, offset: int = 0, max_candidates: int = 30,
     inference_notes: str = '', confirmed: bool = False, audit_sample_size: int = 0,
+    survey_method: str = '',
 ) -> dict:
     """필터(협의완료일 범위/진행상태 등)로 사업을 좁힌 뒤, 지정한 단계(기본 초안/본안/보완/
     협의의견 — 협의의견만 우선 확인하면 놓치는 경우가 있어 여러 단계를 기본으로 함께 확인)의
@@ -405,7 +440,8 @@ def eiass_find_projects_by_document_keyword(
     적용될 검색조건/문서범위/예상 후보·문서 수/과거 패턴 힌트가 담긴 확인 문구
     (confirmation_message)만 반환한다. confirmation_message만 사용자에게 한 글자도 바꾸지
     말고 그대로 보여라. 요약·생략·순서 변경·설명 추가를 금지한다. 승인을 받은 뒤,
-    **같은 조건 그대로에 confirmed=true만 추가**해서 다시 호출해야 실제로 실행된다.
+    검색조건과 함께 적응형 조사/전수조사 중 하나를 사용자에게 선택받는다. 승인 후
+    **같은 조건 그대로에 confirmed=true와 survey_method를 추가**해야 실제로 실행된다.
     사용자가 이미 조건을 구체적으로 다 말해서 확인이 필요 없다고 판단되더라도, 이 게이트를
     건너뛰지 마라 — 특히 stages를 '본안'/'초안'처럼 넓히거나 types/biz_gubun을 AI가
     추론해서 좁힌 경우는 반드시 확인받아야 한다.
@@ -468,6 +504,8 @@ def eiass_find_projects_by_document_keyword(
         inference_notes: AI가 추론/제안해서 좁힌 조건이 있으면 그 내용과 이유(없으면 빈 문자열).
         confirmed: 사용자 승인을 받았으면 true. false(기본값)면 미리보기만 반환하고 실행하지 않는다.
         audit_sample_size: stages 밖의 다른 단계도 이번 배치 중 이 수만큼 표본 검증한다(기본 0=끔).
+        survey_method: 사용자 선택. 'exhaustive'만 이 소규모 즉시 조회에서 실행 가능하다.
+            'adaptive'를 선택했으면 같은 조건으로 eiass_start_document_keyword_scan을 사용한다.
     """
     type_codes = [c.strip().upper() for c in types.split(',') if c.strip()] or None
     stage_list = tuple(s.strip() for s in stages.split(',') if s.strip()) or ('초안', '본안', '보완', '협의의견')
@@ -488,6 +526,16 @@ def eiass_find_projects_by_document_keyword(
             return _confirmation_only(core.preview_document_keyword_search(
                 query_list, inference_notes=inference_notes,
                 audit_sample_size=audit_sample_size, **common_kwargs))
+        method = _normalize_survey_method(survey_method)
+        if not method:
+            return _survey_method_required()
+        if method == 'adaptive':
+            return {
+                'error': '적응형 조사는 재현 가능한 라운드·감사·자동 전수승격 상태가 필요한 '
+                         '백그라운드 방식입니다. 같은 조건과 survey_method="adaptive"로 '
+                         'eiass_start_document_keyword_scan을 호출하세요.',
+                'required_tool': 'eiass_start_document_keyword_scan',
+            }
         return core.search_projects_by_document_keyword(
             query_list, offset=offset, max_candidates=max_candidates,
             audit_sample_size=audit_sample_size, **common_kwargs,
@@ -504,6 +552,7 @@ def eiass_start_document_keyword_scan(
     stages: str = '초안,본안,보완,협의의견', doc_title_contains: str = '',
     max_pages: int = 0, batch_size: int = 10, inference_notes: str = '', confirmed: bool = False,
     audit_sample_size: int = 0,
+    survey_method: str = '', adaptive_strategy_json: str = '',
 ) -> dict:
     """대량 후보(수십~수백 건)를 타임아웃 걱정 없이 끝까지 훑는 백그라운드 스캔을 시작한다.
     즉시 job_id를 반환하고, 실제 조회(사업 상세조회 + PDF 다운로드/추출 + 키워드 매칭)는
@@ -514,8 +563,24 @@ def eiass_start_document_keyword_scan(
 
     **실행 전 확인 필수**: confirmed=False(기본값)면 스캔을 시작하지 않고 eiass_preview_search와
     동일한 확인 문구만 반환한다. confirmation_message만 한 글자도 바꾸지 말고 그대로 보여라.
-    요약·생략·순서 변경·설명 추가를 금지한다. 사용자 승인 후 같은 조건 + confirmed=true로 다시 호출해야
-    실제 백그라운드 스캔이 시작된다.
+    이 문구는 검색조건과 `적응형 조사`/`전수조사` 선택을 동시에 묻는다. 요약·생략·순서 변경·
+    설명 추가를 금지한다. 사용자 승인 후 같은 조건 + confirmed=true + 사용자가 고른
+    survey_method로 다시 호출해야 실제 백그라운드 스캔이 시작된다.
+
+    **조사 절차(필수)**:
+    - survey_method="adaptive": AI가 확정 검색조건은 바꾸지 않고 adaptive_strategy_json에
+      priority_terms와 표본/감사 크기를 제안한다. 서버는 우선표본→계층 감사표본→유사 후보 확장을
+      라운드별로 기록한다. 포화·감사·실패율 기준을 통과하면 적응형 결과를 보고한다. 기준을
+      통과하지 못하거나 실패율/상한에 걸리면 같은 job이 자동으로 미확인 후보 전수조사로 전환되고,
+      전수조사 완료 후에만 결과를 보고한다. `coverage_insufficient` 상태를 성공으로 보고하지 마라.
+    - survey_method="exhaustive": 확정 후보 전체를 조사하고 완료 후 결과를 보고한다.
+    - 어떤 방식이든 terminal 전에는 최종 조사결과를 보고하지 말고 진행 알림만 전달한다.
+
+    adaptive_strategy_json 예:
+      {"objective":"coverage","priority_terms":["일조장해","일조시간"],
+       "initial_sample_size":30,"round_size":30,"audit_size":10,
+       "max_adaptive_percent":60,"saturation_rounds":2,"minimum_matches":1}
+    허용 키와 범위는 서버가 정규화하며, 감사표본에서 새 사례가 나오면 성공 판정을 하지 않는다.
 
     파라미터는 eiass_find_projects_by_document_keyword와 동일하되 offset/max_candidates
     대신 batch_size(체크포인트 묶음 크기, 기본·최대 10)를 쓴다. 실제 동시 처리량은 이 값과
@@ -557,9 +622,21 @@ def eiass_start_document_keyword_scan(
 
     if not isinstance(batch_size, int) or not 1 <= batch_size <= MAX_DOCUMENT_SCAN_BATCH_SIZE:
         return {'error': f'batch_size는 1~{MAX_DOCUMENT_SCAN_BATCH_SIZE} 범위의 정수여야 합니다.'}
+    method = _normalize_survey_method(survey_method)
+    if not method:
+        return _survey_method_required()
+    try:
+        adaptive_strategy = normalize_strategy(
+            adaptive_strategy_json,
+            default_terms=[*query_list, keyword, *(title_terms or [])])
+    except ValueError as exc:
+        return {'error': str(exc)}
+    if method == 'exhaustive':
+        adaptive_strategy = None
     job_id = uuid.uuid4().hex[:12]
     kwargs = dict(text_queries=query_list, batch_size=batch_size,
-                  audit_sample_size=audit_sample_size, **common_kwargs)
+                  audit_sample_size=audit_sample_size, survey_method=method,
+                  adaptive_strategy=adaptive_strategy, **common_kwargs)
     job_store, job_runner = _jobs_backend()
     job_store.cleanup()
     job_store.create(job_id, 'document', kwargs)
@@ -570,6 +647,10 @@ def eiass_start_document_keyword_scan(
     initial_status = document_status(job_store, job_id)
     return {
         'job_id': job_id, 'status': 'queued',
+        'survey_method': method,
+        'survey_flow': ('적응형 조사 → 성공 시 결과 보고 / 실패·완전성 부족 시 전수조사 → 결과 보고'
+                        if method == 'adaptive' else '전수조사 → 결과 보고'),
+        'adaptive_strategy': adaptive_strategy,
         'monitor_required': True,
         'monitor_tool': 'eiass_wait_scan_update',
         'monitor_cursor': make_monitor_cursor(initial_status),
@@ -593,6 +674,9 @@ def eiass_get_scan_status(job_id: str, include_matches: bool = False,
     stalled 등을 구분한다. work_progress는 현재 단계·사업·파일, 완료 문서/후보 수,
     현재/누적 수신 바이트, 전송률, 마지막 활동 시각을 보여준다. heartbeat_diagnostics와
     seconds_since_heartbeat/activity로 DB 기록 장애와 실제 작업 정지를 구분할 수 있다.
+    survey_phase/coverage_status/adaptive_state에는 적응형 라운드·감사 결과·판정 기록과
+    adaptive_complete/coverage_insufficient/exhaustive_fallback/exhaustive_complete 상태가
+    표시된다. 적응형 실패 후에는 coverage_status가 exhaustive_complete가 될 때까지 기다려라.
 
     needs_refinement가 true면 매칭이 과도하거나 참고문헌/부록 문맥으로 보이는 매칭이 많다는
     뜻이다 — refinement_hints를 참고해 스캔 결과를 그대로 최종 답으로 쓰지 말고, 사용자에게

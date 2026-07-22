@@ -172,6 +172,9 @@ class JobStore:
             'stage_stats': meta.get('stage_stats'),
             'needs_refinement': meta.get('needs_refinement'),
             'heartbeat_diagnostics': meta.get('heartbeat_diagnostics'),
+            'survey_phase': meta.get('survey_phase'),
+            'coverage_status': meta.get('coverage_status'),
+            'adaptive_state': meta.get('adaptive_state'),
         }
         return json.dumps(visible, ensure_ascii=False, sort_keys=True, default=str)
 
@@ -277,6 +280,31 @@ class JobStore:
         with self.lock, self._connect() as conn:
             rows = conn.execute(query, params).fetchall()
         return [json.loads(row[0]) for row in rows]
+
+    def outcomes_for_keys(self, job_id, candidate_keys):
+        """적응형 라운드의 후보별 outcome/payload를 한 번에 읽는다."""
+        keys = list(candidate_keys)
+        if not keys:
+            return {}
+        placeholders = ','.join('?' for _ in keys)
+        query = f'''SELECT candidate_key,outcome,payload_json FROM job_results
+                    WHERE job_id=? AND candidate_key IN ({placeholders})'''
+        with self.lock, self._connect() as conn:
+            rows = conn.execute(query, [job_id, *keys]).fetchall()
+        return {row['candidate_key']: (row['outcome'], json.loads(row['payload_json'])) for row in rows}
+
+    def requeue_skipped(self, job_id):
+        """적응형 단계의 실패 후보를 전수 승격 시 한 번 더 확인하도록 pending으로 되돌린다."""
+        now = time.time()
+        with self.lock, self._connect() as conn:
+            removed = conn.execute(
+                "DELETE FROM job_results WHERE job_id=? AND outcome='skipped'", (job_id,)).rowcount
+            checked = conn.execute(
+                'SELECT COUNT(*) FROM job_results WHERE job_id=?', (job_id,)).fetchone()[0]
+            conn.execute('''UPDATE jobs SET checked=?,updated_at=?,heartbeat_at=?,
+                         progress_seq=progress_seq+1,progress_changed_at=? WHERE job_id=?''',
+                         (checked, now, now, now, job_id))
+        return removed
 
     def register_runner(self, owner_id):
         now = time.time()

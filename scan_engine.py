@@ -8,6 +8,7 @@ import time
 import uuid
 
 import eiass_core as core
+from adaptive_engine import evaluate_round, initial_state, select_round
 from config import (JOB_HEARTBEAT_INTERVAL_SECONDS, JOB_QUEUE_SIZE, JOB_WORKER_COUNT,
                     SCAN_MONITOR_POLL_SECONDS, SCAN_NORMAL_REPORT_SECONDS,
                     SCAN_UNCHANGED_REPORT_SECONDS)
@@ -159,21 +160,22 @@ class ScanRunner:
                 disco_meta['date_filter_exclusions'] = date_filter_exclusions
                 self.store.save_candidates(job_id, candidates, meta=disco_meta)
             self.store.update(job_id, status='running', phase='document_scan' if kind == 'document' else 'spatial_scan')
-            pending = self.store.candidates(job_id, only_pending=True)
             batch_size = int(payload['batch_size'])
             progress_lock = threading.Lock()
             file_bytes = {}
             completed_files = set()
-            for start in range(0, len(pending), batch_size):
-                if not self.store.owner_is(job_id, self.owner_id):
-                    return  # 다른 runner가 stale lease를 회수했으므로 이전 실행 결과를 쓰지 않는다.
-                if self.store.cancel_requested(job_id):
-                    raise core.ScanCancelled('사용자 요청으로 취소했습니다.')
-                batch_meta = pending[start:start + batch_size]
-                candidates = [item[2] for item in batch_meta]
-                ordinal_by_key = {key: ordinal for key, ordinal, _ in batch_meta}
-                should_cancel = lambda: self.store.cancel_requested(job_id)
-                if kind == 'document':
+
+            def _process_document_rows(rows, survey_phase):
+                for start in range(0, len(rows), batch_size):
+                    if not self.store.owner_is(job_id, self.owner_id):
+                        return False
+                    if self.store.cancel_requested(job_id):
+                        raise core.ScanCancelled('사용자 요청으로 취소했습니다.')
+                    batch_meta = rows[start:start + batch_size]
+                    candidates = [item[2] for item in batch_meta]
+                    ordinal_by_key = {key: ordinal for key, ordinal, _ in batch_meta}
+                    should_cancel = lambda: self.store.cancel_requested(job_id)
+
                     def _on_work_progress(progress):
                         if not self.store.owner_is(job_id, self.owner_id):
                             raise core.ScanCancelled('작업 lease가 다른 runner로 이전되었습니다.')
@@ -186,11 +188,12 @@ class ScanRunner:
                                     completed_files.add(file_seq)
                             work_progress = dict(
                                 progress, progress_at=time.time(),
-                                documents_completed=len(completed_files),
-                                bytes_received_total=sum(file_bytes.values()),
-                                candidates_completed=self.store.get(job_id)['checked'])
+                                 documents_completed=len(completed_files),
+                                 bytes_received_total=sum(file_bytes.values()),
+                                 candidates_completed=self.store.get(job_id)['checked'],
+                                 survey_phase=survey_phase)
                         self.store.merge_meta(
-                            job_id, {'work_progress': work_progress},
+                            job_id, {'work_progress': work_progress, 'survey_phase': survey_phase},
                             phase=progress.get('phase', 'document_scan'))
 
                     def _checkpoint_candidate(candidate, candidate_result):
@@ -202,6 +205,7 @@ class ScanRunner:
                             'stage_stats': _merge_stage_stats(
                                 current.get('stage_stats', {}),
                                 candidate_result.get('stage_stats', {})),
+                            'survey_phase': survey_phase,
                         }
                         if candidate_result.get('needs_refinement'):
                             updates['needs_refinement'] = True
@@ -233,15 +237,122 @@ class ScanRunner:
                         meta = self.store.get(job_id)['meta']
                         meta['stage_stats'] = _merge_stage_stats(
                             meta.get('stage_stats', {}), result.get('stage_stats', {}))
+                    if not self.store.owner_is(job_id, self.owner_id):
+                        return False
+                    if normalized is not None:
+                        self.store.save_outcomes(job_id, normalized, meta=meta)
+                return True
+
+            if kind == 'document':
+                survey_method = payload.get('survey_method') or 'exhaustive'
+                if survey_method == 'adaptive':
+                    current_meta = self.store.get(job_id)['meta']
+                    strategy = payload['adaptive_strategy']
+                    adaptive_state = current_meta.get('adaptive_state')
+                    if not adaptive_state:
+                        adaptive_state = initial_state(
+                            self.store.get(job_id)['candidates_total'] or 0, strategy)
+                    if adaptive_state.get('coverage_status') == 'adaptive_complete':
+                        self.store.update(job_id, status='done', phase='adaptive_completed',
+                                          clear_owner=True)
+                        return
+                    fallback_reason = (adaptive_state.get('fallback_reason') or
+                                       '적응형 조사에서 충분한 완전성 근거를 확보하지 못했습니다.')
+                    while adaptive_state.get('coverage_status') != 'coverage_insufficient':
+                        pending = self.store.candidates(job_id, only_pending=True)
+                        if not pending:
+                            adaptive_state['coverage_status'] = 'adaptive_complete'
+                            adaptive_state['survey_phase'] = 'adaptive'
+                            self.store.merge_meta(job_id, {
+                                'survey_phase': 'adaptive', 'coverage_status': 'adaptive_complete',
+                                'adaptive_state': adaptive_state})
+                            self.store.update(job_id, status='done', phase='adaptive_completed',
+                                              clear_owner=True)
+                            return
+                        pending_by_key = {row[0]: row for row in pending}
+                        saved_keys = adaptive_state.get('current_round_keys') or []
+                        if saved_keys:
+                            round_rows = [pending_by_key[key] for key in saved_keys if key in pending_by_key]
+                            roles = {key: role for key, role in
+                                     (adaptive_state.get('current_round_roles') or {}).items()
+                                     if key in pending_by_key}
+                        else:
+                            matched_payloads = self.store.results(
+                                job_id, 'match', 0, max(1, self.store.get(job_id)['checked']))
+                            matched_eias = {str(item.get('eia_cd')) for item in matched_payloads}
+                            matched_candidates = [row[2] for row in self.store.candidates(job_id)
+                                                  if str(row[2].get('eia_cd')) in matched_eias]
+                            round_rows, roles = select_round(
+                                pending, strategy, adaptive_state, matched_candidates)
+                            adaptive_state['current_round_keys'] = [row[0] for row in round_rows]
+                            adaptive_state['current_round_roles'] = roles
+                            self.store.merge_meta(job_id, {
+                                'survey_phase': 'adaptive', 'coverage_status': 'adaptive_running',
+                                'adaptive_state': adaptive_state}, phase='adaptive_round')
+                        if not round_rows:
+                            adaptive_state['coverage_status'] = 'coverage_insufficient'
+                            fallback_reason = '적응형 조사 대상 상한에 도달해 남은 후보 전수조사로 전환합니다.'
+                            adaptive_state.setdefault('decision_log', []).append({
+                                'action': 'fallback', 'reason': fallback_reason})
+                            break
+                        if not _process_document_rows(round_rows, 'adaptive'):
+                            return
+                        round_outcomes = self.store.outcomes_for_keys(
+                            job_id, adaptive_state['current_round_keys'])
+                        action, fallback_reason = evaluate_round(
+                            adaptive_state, strategy, round_outcomes,
+                            self.store.get(job_id)['candidates_total'] or 0)
+                        self.store.merge_meta(job_id, {
+                            'survey_phase': 'adaptive',
+                            'coverage_status': adaptive_state['coverage_status'],
+                            'adaptive_state': adaptive_state}, phase='adaptive_evaluation')
+                        if action == 'success':
+                            self.store.update(job_id, status='done', phase='adaptive_completed',
+                                              clear_owner=True)
+                            return
+                        if action == 'fallback':
+                            break
+
+                    retried = self.store.requeue_skipped(job_id)
+                    adaptive_state['survey_phase'] = 'exhaustive_fallback'
+                    adaptive_state['fallback_reason'] = fallback_reason
+                    adaptive_state['requeued_skipped'] = retried
+                    self.store.merge_meta(job_id, {
+                        'survey_phase': 'exhaustive_fallback',
+                        'coverage_status': 'exhaustive_fallback',
+                        'fallback_reason': fallback_reason,
+                        'adaptive_state': adaptive_state}, phase='exhaustive_fallback')
+                    pending = self.store.candidates(job_id, only_pending=True)
+                    if not _process_document_rows(pending, 'exhaustive_fallback'):
+                        return
                 else:
+                    self.store.merge_meta(job_id, {
+                        'survey_phase': 'exhaustive', 'coverage_status': 'exhaustive_running'})
+                    pending = self.store.candidates(job_id, only_pending=True)
+                    if not _process_document_rows(pending, 'exhaustive'):
+                        return
+            else:
+                pending = self.store.candidates(job_id, only_pending=True)
+                for start in range(0, len(pending), batch_size):
+                    if not self.store.owner_is(job_id, self.owner_id):
+                        return
+                    if self.store.cancel_requested(job_id):
+                        raise core.ScanCancelled('사용자 요청으로 취소했습니다.')
+                    batch_meta = pending[start:start + batch_size]
+                    candidates = [item[2] for item in batch_meta]
+                    ordinal_by_key = {key: ordinal for key, ordinal, _ in batch_meta}
+                    should_cancel = lambda: self.store.cancel_requested(job_id)
                     result = run_spatial_batch(payload, candidates, should_cancel, session)
                     normalized = spatial_outcomes(candidates, result, ordinal_by_key)
                     meta = self.store.get(job_id)['meta']
-                if not self.store.owner_is(job_id, self.owner_id):
-                    return
-                if normalized is not None:
+                    if not self.store.owner_is(job_id, self.owner_id):
+                        return
                     self.store.save_outcomes(job_id, normalized, meta=meta)
             if self.store.owner_is(job_id, self.owner_id):
+                if kind == 'document':
+                    final_meta = self.store.get(job_id)['meta']
+                    if final_meta.get('survey_phase') in ('exhaustive', 'exhaustive_fallback'):
+                        self.store.merge_meta(job_id, {'coverage_status': 'exhaustive_complete'})
                 self.store.update(job_id, status='done', phase='completed', clear_owner=True)
         except core.ScanCancelled:
             if self.store.owner_is(job_id, self.owner_id):
@@ -291,6 +402,7 @@ def _progress_message(status, unchanged=False):
     percent = status.get('progress_percent')
     work = status.get('work_progress') or {}
     state = status.get('activity_state')
+    survey_phase = status.get('survey_phase')
     if job_status == 'done':
         heading = f"스캔이 완료되었습니다 — 후보 {checked}/{total or checked}건을 확인했습니다."
     elif job_status == 'cancelled':
@@ -305,6 +417,17 @@ def _progress_message(status, unchanged=False):
     if unchanged and job_status not in _TERMINAL_JOB_STATES:
         heading = '처리 건수에는 변화가 없지만 작업은 계속 실행 중입니다. ' + heading
     lines = [heading]
+    if survey_phase == 'adaptive':
+        adaptive = status.get('adaptive_state') or {}
+        lines.append(
+            f"조사 방식: 적응형 · 라운드 {adaptive.get('rounds_completed', 0)} · "
+            f"완전성 상태 {status.get('coverage_status') or 'adaptive_running'}")
+    elif survey_phase == 'exhaustive_fallback':
+        lines.append(
+            '조사 방식: 적응형 조사에서 전수조사로 자동 전환 · '
+            f"사유: {status.get('fallback_reason') or '완전성 근거 부족'}")
+    elif survey_phase == 'exhaustive':
+        lines.append('조사 방식: 전수조사')
     if job_status not in ('queued', 'discovering'):
         lines.append(
             f"결과: 일치 {status.get('match_count', 0)}건 · 매칭 없음 "
@@ -426,6 +549,13 @@ def document_status(store, job_id, include_results=False, offset=0, limit=100):
     result = {'status': job['status'], 'activity_state': activity_state,
               'checked': job['checked'], 'candidates_total': job['candidates_total'],
               'progress_percent': progress_percent,
+              'candidate_coverage_percent': progress_percent,
+              'survey_method': job['payload'].get('survey_method') or 'exhaustive',
+              'survey_phase': job['meta'].get('survey_phase') or
+                              job['payload'].get('survey_method') or 'exhaustive',
+              'coverage_status': job['meta'].get('coverage_status'),
+              'fallback_reason': job['meta'].get('fallback_reason'),
+              'adaptive_state': job['meta'].get('adaptive_state'),
               'progress_seq': job.get('progress_seq', 0),
               'progress_changed_at': job.get('progress_changed_at'),
               'match_count': counts.get('match', 0), 'checked_no_match_count': counts.get('no_match', 0),
