@@ -296,6 +296,105 @@ function Register-CodexClients {
     }
 }
 
+function ConvertTo-TomlBasicString {
+    param([string]$Value)
+    $escaped = $Value.Replace('\', '\\').Replace('"', '\"')
+    return '"' + $escaped + '"'
+}
+
+# Store/MSIX 앱의 codex.exe가 WindowsApps ACL 때문에 외부 PowerShell에서 실행 거부될 수 있다.
+# Codex CLI와 데스크톱 앱이 읽는 사용자 config.toml의 EIASS 섹션만 안전하게 직접 갱신한다.
+function Register-CodexConfigDirect {
+    param([string]$ConfigPath, [string]$ExePath)
+
+    $configDir = Split-Path $ConfigPath -Parent
+    $backupPath = "$ConfigPath.eiass-backup"
+    $tempPath = Join-Path $configDir ("config.toml.eiass-{0}.tmp" -f [Guid]::NewGuid().ToString('N'))
+    $hadExistingConfig = Test-Path -LiteralPath $ConfigPath
+    $targetWasWritten = $false
+
+    try {
+        if (-not (Test-Path -LiteralPath $configDir)) {
+            New-Item -ItemType Directory -Path $configDir -Force | Out-Null
+        }
+
+        $raw = if ($hadExistingConfig) { Read-Utf8Text -Path $ConfigPath } else { '' }
+        $newline = if ($raw.Contains("`r`n")) { "`r`n" } else { "`n" }
+        $lines = if ($raw.Length -gt 0) { @([regex]::Split($raw, '\r?\n')) } else { @() }
+        $sectionHeader = '[mcp_servers.eiass]'
+        $commandLine = 'command = ' + (ConvertTo-TomlBasicString -Value $ExePath)
+
+        $sectionStarts = @()
+        for ($index = 0; $index -lt $lines.Count; $index++) {
+            if ($lines[$index] -match '^\s*\[mcp_servers\.eiass\]\s*(?:#.*)?$') {
+                $sectionStarts += $index
+            }
+        }
+        if ($sectionStarts.Count -gt 1) {
+            throw 'config.toml에 [mcp_servers.eiass] 섹션이 중복되어 안전하게 수정할 수 없습니다.'
+        }
+
+        if ($sectionStarts.Count -eq 1) {
+            $sectionStart = $sectionStarts[0]
+            $sectionEnd = $lines.Count
+            for ($index = $sectionStart + 1; $index -lt $lines.Count; $index++) {
+                if ($lines[$index] -match '^\s*\[') {
+                    $sectionEnd = $index
+                    break
+                }
+            }
+
+            $updatedLines = @()
+            if ($sectionStart -gt 0) { $updatedLines += $lines[0..($sectionStart - 1)] }
+            $updatedLines += @($sectionHeader, $commandLine, '')
+            if ($sectionEnd -lt $lines.Count) { $updatedLines += $lines[$sectionEnd..($lines.Count - 1)] }
+            $updatedRaw = $updatedLines -join $newline
+        } else {
+            $trimmedRaw = $raw.TrimEnd("`r", "`n")
+            $prefix = if ($trimmedRaw.Length -gt 0) { $trimmedRaw + $newline + $newline } else { '' }
+            $updatedRaw = $prefix + $sectionHeader + $newline + $commandLine + $newline
+        }
+
+        # 쓰기 전 임시 파일에서 대상 섹션과 명령 경로가 정확한지 먼저 검증한다.
+        Write-Utf8NoBomText -Path $tempPath -Text $updatedRaw
+        $tempText = Read-Utf8Text -Path $tempPath
+        $expectedBlock = $sectionHeader + $newline + $commandLine
+        if ($tempText.IndexOf($expectedBlock, [StringComparison]::Ordinal) -lt 0) {
+            throw '임시 config.toml에서 EIASS 등록 내용을 확인하지 못했습니다.'
+        }
+
+        if ($hadExistingConfig) { Copy-Item -LiteralPath $ConfigPath -Destination $backupPath -Force }
+        $targetWasWritten = $true
+        Copy-Item -LiteralPath $tempPath -Destination $ConfigPath -Force
+
+        $verifyText = Read-Utf8Text -Path $ConfigPath
+        if ($verifyText.IndexOf($expectedBlock, [StringComparison]::Ordinal) -lt 0) {
+            throw '기록한 config.toml에서 EIASS 등록 내용을 다시 읽지 못했습니다.'
+        }
+
+        # 대상 외의 모든 TOML 섹션이 그대로 남아 있어야 한다.
+        $headersBefore = @($lines | Where-Object { $_ -match '^\s*\[[^]]+\]\s*(?:#.*)?$' })
+        $headersAfter = @([regex]::Split($verifyText, '\r?\n') |
+            Where-Object { $_ -match '^\s*\[[^]]+\]\s*(?:#.*)?$' })
+        foreach ($header in $headersBefore) {
+            if ($header -match '^\s*\[mcp_servers\.eiass\]\s*(?:#.*)?$') { continue }
+            if ($headersAfter -notcontains $header) { throw "기존 설정 섹션이 사라졌습니다: $header" }
+        }
+        return 'registered-direct'
+    } catch {
+        if ($targetWasWritten) {
+            if ($hadExistingConfig -and (Test-Path -LiteralPath $backupPath)) {
+                Copy-Item -LiteralPath $backupPath -Destination $ConfigPath -Force
+            } elseif (-not $hadExistingConfig -and (Test-Path -LiteralPath $ConfigPath)) {
+                Remove-Item -LiteralPath $ConfigPath -Force -ErrorAction SilentlyContinue
+            }
+        }
+        return "failed:$($_.Exception.Message)"
+    } finally {
+        Remove-Item -LiteralPath $tempPath -Force -ErrorAction SilentlyContinue
+    }
+}
+
 function Get-LegacyInstallRoot {
     param([string]$CurrentRoot)
     $command = Get-RegisteredEiassCommand
@@ -830,16 +929,29 @@ try {
     # 3) Codex CLI / ChatGPT Desktop의 Codex 환경. PATH에 CLI가 없어도 앱 패키지 내부의
     # codex.exe를 찾아 같은 사용자 설정(~/.codex/config.toml)에 등록하고 즉시 검증한다.
     $codexCommand = Get-CodexCommandPath
+    $codexResult = if ($codexCommand) {
+        Register-CodexClients -CodexCommand $codexCommand -ExePath $ExePath
+    } else {
+        'failed:codex.exe를 찾지 못했습니다.'
+    }
     if ($codexCommand) {
-        $codexResult = Register-CodexClients -CodexCommand $codexCommand -ExePath $ExePath
         if ($codexResult -eq 'registered') {
             Write-Host "✅ Codex CLI / ChatGPT Desktop에 등록 및 검증 완료`n"
+        }
+    }
+
+    if ($codexResult -ne 'registered') {
+        $codexConfigPath = Join-Path $env:USERPROFILE '.codex\config.toml'
+        $directResult = Register-CodexConfigDirect -ConfigPath $codexConfigPath -ExePath $ExePath
+        if ($directResult -eq 'registered-direct') {
+            Write-Host "ℹ codex.exe 직접 실행을 사용할 수 없어 설정 파일 등록으로 전환했습니다."
+            Write-Host "✅ Codex CLI / ChatGPT Desktop 설정 직접 등록 및 검증 완료"
+            Write-Host "   $codexConfigPath`n"
         } else {
             Write-Host "⚠ Codex CLI / ChatGPT Desktop 자동 등록 실패" -ForegroundColor Yellow
-            Write-Host "   $($codexResult -replace '^failed:', '')`n"
+            Write-Host "   CLI: $($codexResult -replace '^failed:', '')"
+            Write-Host "   설정 파일: $($directResult -replace '^failed:', '')`n"
         }
-    } else {
-        Write-Host "⚠ Codex CLI 또는 ChatGPT Desktop의 codex.exe를 찾지 못해 등록을 건너뜁니다.`n"
     }
 
     # 4) Claude Desktop — 설정 JSON에 직접 등록한다. 터미널도 어려워하는 사용자에게 JSON을
