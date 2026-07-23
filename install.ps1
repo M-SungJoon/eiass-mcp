@@ -223,6 +223,79 @@ function Register-ClaudeDesktop {
     return 'updated'
 }
 
+# Codex CLI와 캡처된 ChatGPT Desktop의 Codex 환경은 같은 ~/.codex/config.toml을 쓴다.
+# Store/MSIX 설치에서는 codex.exe가 앱 패키지 안에 있으므로 PATH 등록이 빠진 PC도 직접 찾는다.
+function Get-CodexCommandPath {
+    $command = Get-Command codex -CommandType Application -ErrorAction SilentlyContinue |
+        Select-Object -First 1
+    if ($command) {
+        foreach ($property in @('Path', 'Source', 'Definition')) {
+            $candidate = [string]$command.$property
+            if ($candidate -and (Test-Path -LiteralPath $candidate -PathType Leaf)) {
+                return $candidate
+            }
+        }
+    }
+
+    $candidates = @()
+    foreach ($packagePattern in @('OpenAI.Codex', 'OpenAI.ChatGPT', '*Codex*', '*ChatGPT*')) {
+        try {
+            foreach ($package in @(Get-AppxPackage -Name $packagePattern -ErrorAction Stop)) {
+                if (-not $package.InstallLocation) { continue }
+                $candidates += (Join-Path $package.InstallLocation 'app\resources\codex.exe')
+                $candidates += (Join-Path $package.InstallLocation 'resources\codex.exe')
+                $candidates += (Join-Path $package.InstallLocation 'codex.exe')
+            }
+        } catch {
+            # AppX 조회가 제한된 환경이면 아래 일반 설치 경로 탐색으로 계속한다.
+        }
+    }
+
+    foreach ($root in @($env:LOCALAPPDATA, $env:ProgramFiles)) {
+        if (-not $root) { continue }
+        foreach ($relativePath in @(
+            'Programs\ChatGPT\app\resources\codex.exe',
+            'Programs\ChatGPT\resources\codex.exe',
+            'Programs\Codex\app\resources\codex.exe',
+            'Programs\Codex\resources\codex.exe',
+            'ChatGPT\app\resources\codex.exe',
+            'ChatGPT\resources\codex.exe',
+            'Codex\app\resources\codex.exe',
+            'Codex\resources\codex.exe'
+        )) {
+            $candidates += (Join-Path $root $relativePath)
+        }
+    }
+
+    foreach ($candidate in @($candidates | Select-Object -Unique)) {
+        if (Test-Path -LiteralPath $candidate -PathType Leaf) { return $candidate }
+    }
+    return $null
+}
+
+function Register-CodexClients {
+    param([string]$CodexCommand, [string]$ExePath)
+    try {
+        & $CodexCommand mcp remove eiass 2>$null | Out-Null
+        & $CodexCommand mcp add eiass -- $ExePath 2>&1 | Out-Null
+        if ($LASTEXITCODE -ne 0) { throw "codex mcp add가 종료 코드 $LASTEXITCODE 을 반환했습니다." }
+
+        $verifyLines = @(& $CodexCommand mcp get eiass 2>&1)
+        $verifyExitCode = $LASTEXITCODE
+        $verifyText = $verifyLines -join "`n"
+        if ($verifyExitCode -ne 0) { throw "codex mcp get이 종료 코드 $verifyExitCode 을 반환했습니다." }
+        if ($verifyText -notmatch '(?m)^\s*enabled:\s*true\s*$') {
+            throw '등록 결과가 enabled 상태가 아닙니다.'
+        }
+        if ($verifyText.IndexOf($ExePath, [StringComparison]::OrdinalIgnoreCase) -lt 0) {
+            throw '등록 결과의 실행 파일 경로가 설치 경로와 다릅니다.'
+        }
+        return 'registered'
+    } catch {
+        return "failed:$($_.Exception.Message)"
+    }
+}
+
 function Get-LegacyInstallRoot {
     param([string]$CurrentRoot)
     $command = Get-RegisteredEiassCommand
@@ -754,16 +827,19 @@ try {
         Write-Host "⚠ claude CLI를 찾지 못해 Claude Code 등록을 건너뜁니다.`n"
     }
 
-    # 3) Codex CLI
-    $codex = Get-Command codex -ErrorAction SilentlyContinue
-    if ($codex) {
-        try {
-            & codex mcp remove eiass 2>$null | Out-Null
-        } catch {}
-        & codex mcp add eiass -- "$ExePath"
-        Write-Host "✅ Codex에 등록 완료`n"
+    # 3) Codex CLI / ChatGPT Desktop의 Codex 환경. PATH에 CLI가 없어도 앱 패키지 내부의
+    # codex.exe를 찾아 같은 사용자 설정(~/.codex/config.toml)에 등록하고 즉시 검증한다.
+    $codexCommand = Get-CodexCommandPath
+    if ($codexCommand) {
+        $codexResult = Register-CodexClients -CodexCommand $codexCommand -ExePath $ExePath
+        if ($codexResult -eq 'registered') {
+            Write-Host "✅ Codex CLI / ChatGPT Desktop에 등록 및 검증 완료`n"
+        } else {
+            Write-Host "⚠ Codex CLI / ChatGPT Desktop 자동 등록 실패" -ForegroundColor Yellow
+            Write-Host "   $($codexResult -replace '^failed:', '')`n"
+        }
     } else {
-        Write-Host "⚠ codex CLI를 찾지 못해 Codex 등록을 건너뜁니다.`n"
+        Write-Host "⚠ Codex CLI 또는 ChatGPT Desktop의 codex.exe를 찾지 못해 등록을 건너뜁니다.`n"
     }
 
     # 4) Claude Desktop — 설정 JSON에 직접 등록한다. 터미널도 어려워하는 사용자에게 JSON을
@@ -820,7 +896,7 @@ try {
         # 부가 기능이라 실패해도 설치 자체는 성공으로 둔다.
     }
 
-    Write-Host "완료! Claude Code / Codex를 재시작하면 eiass 도구를 쓸 수 있습니다."
+    Write-Host "완료! Claude Code / Codex CLI / ChatGPT Desktop / Claude Desktop을 재시작하면 eiass 도구를 쓸 수 있습니다."
     Write-Host ""
     Write-Host "다음에 업데이트할 때는 아래 파일을 더블클릭하세요:"
     Write-Host "  $updaterPath"
