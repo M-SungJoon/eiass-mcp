@@ -32,11 +32,15 @@ param(
     [switch]$DryRun,
     # 등록할 AI 플랫폼(중복 선택). 비우면 대화형으로 물어보고, 비대화식이면 All로 동작한다.
     # CodexCli는 Codex CLI와 ChatGPT/Codex 데스크톱을 함께 덮는다 — 둘은 ~/.codex/config.toml을 공유한다.
-    [ValidateSet("All", "ClaudeCode", "ClaudeDesktop", "CodexCli", "Antigravity")]
+    # 여기에 [ValidateSet]을 붙이면 안 된다: 이 스크립트는 'irm | iex'로 실행되는데, iex는 param
+    # 블록을 현재 스코프에서 평가한다. 기본값 없는 배열은 빈 값이 되고, 그 빈 값이 집합에 없어
+    # "attribute cannot be added" 오류로 설치가 통째로 죽는다(실제 사용자가 겪음). 값 검증은
+    # 아래에서 수동으로 한다.
     [string[]]$Platforms,
     # full(기본) = 지금까지와 동일. lite = 무료 플랜용 경량(도구 14개, 조사 상한 적용).
+    # $Profile은 PowerShell 자동 변수($PROFILE, 프로필 스크립트 경로)와 이름이 겹치므로 쓰지 않는다.
     [ValidateSet("Menu", "full", "lite")]
-    [string]$Profile = "Menu"
+    [string]$ServerProfile = "Menu"
 )
 
 $ErrorActionPreference = "Stop"
@@ -1035,24 +1039,33 @@ try {
 
     # 1-b) 실행 프로필 선택 — 무료 플랜은 도구 정의 무게만으로도 한도가 빠듯해서, 도구를 줄인
     # 경량 모드를 고를 수 있게 한다. 선택 결과는 등록 시 env로 넣어 서버 시작 시 적용된다.
-    if ($Profile -eq "Menu") {
+    if ($ServerProfile -eq "Menu") {
         if (Test-InteractiveConsole) {
             Write-Host "사용할 모드를 선택하세요:"
             Write-Host "  [1] 전체 모드 - 유료 플랜(Pro/Max 등) 권장. 모든 기능 사용"
             Write-Host "  [2] 경량 모드 - 무료 플랜용. 도구를 줄여 사용량 절약(대량 조사 제한)"
             $profileChoice = (Read-Host "선택 (1~2, 기본 1)").Trim()
-            $Profile = if ($profileChoice -eq "2") { "lite" } else { "full" }
+            $ServerProfile = if ($profileChoice -eq "2") { "lite" } else { "full" }
         } else {
-            $Profile = "full"
+            $ServerProfile = "full"
         }
     }
-    Write-Host ("선택한 모드: {0}`n" -f $(if ($Profile -eq 'lite') { '경량(무료 플랜용)' } else { '전체' }))
+    Write-Host ("선택한 모드: {0}`n" -f $(if ($ServerProfile -eq 'lite') { '경량(무료 플랜용)' } else { '전체' }))
     # 프로필은 설치 폴더 .env에 기록한다 — 클라이언트별 등록 설정마다 env를 넣는 대신 한 곳에
     # 두면 어느 클라이언트로 실행하든 같은 프로필이 적용된다(서버가 .env에서 EIASS_PROFILE을 읽는다).
-    Set-EnvValue -Path $envPath -Key 'EIASS_PROFILE' -Value $Profile
+    Set-EnvValue -Path $envPath -Key 'EIASS_PROFILE' -Value $ServerProfile
 
     # 1-c) 등록할 플랫폼 선택(중복 가능).
     # Codex CLI와 ChatGPT/Codex 데스크톱은 ~/.codex/config.toml을 공유하므로 한 항목으로 묶는다.
+    # 파라미터로 넘어온 값은 여기서 수동 검증한다(위 param에서 ValidateSet을 뺐기 때문 — iex 호환).
+    $validPlatforms = @("All", "ClaudeCode", "ClaudeDesktop", "CodexCli", "Antigravity")
+    if ($Platforms -and $Platforms.Count -gt 0) {
+        $unknown = @($Platforms | Where-Object { $validPlatforms -notcontains $_ })
+        if ($unknown.Count -gt 0) {
+            throw ("알 수 없는 -Platforms 값: $($unknown -join ', '). " +
+                   "사용 가능: $($validPlatforms -join ', ')")
+        }
+    }
     if (-not $Platforms -or $Platforms.Count -eq 0) {
         if (Test-InteractiveConsole) {
             Write-Host "등록할 AI 플랫폼을 선택하세요 (쉼표로 중복 선택, 예: 2,3)"
