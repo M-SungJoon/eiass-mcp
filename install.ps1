@@ -29,7 +29,14 @@ param(
     [string]$InstallMode = "Menu",
     [string]$TargetVersion,
     [switch]$AllowDowngrade,
-    [switch]$DryRun
+    [switch]$DryRun,
+    # 등록할 AI 플랫폼(중복 선택). 비우면 대화형으로 물어보고, 비대화식이면 All로 동작한다.
+    # CodexCli는 Codex CLI와 ChatGPT/Codex 데스크톱을 함께 덮는다 — 둘은 ~/.codex/config.toml을 공유한다.
+    [ValidateSet("All", "ClaudeCode", "ClaudeDesktop", "CodexCli", "Antigravity")]
+    [string[]]$Platforms,
+    # full(기본) = 지금까지와 동일. lite = 무료 플랜용 경량(도구 14개, 조사 상한 적용).
+    [ValidateSet("Menu", "full", "lite")]
+    [string]$Profile = "Menu"
 )
 
 $ErrorActionPreference = "Stop"
@@ -101,6 +108,29 @@ function Write-Utf8NoBomText {
     [System.IO.File]::WriteAllText($Path, $Text, (New-Object System.Text.UTF8Encoding($false)))
 }
 
+# .env 파일에서 KEY=VALUE 한 줄을 갱신하거나 추가한다(다른 줄은 그대로 둔다).
+# VWORLD_API_KEY 같은 기존 값은 건드리지 않고 EIASS_PROFILE만 반영하기 위한 것.
+function Set-EnvValue {
+    param([string]$Path, [string]$Key, [string]$Value)
+    $lines = @()
+    if (Test-Path $Path) {
+        # 괄호 필수: 괄호가 없으면 -split이 Read-Utf8Text의 인자로 잘못 파싱돼 문자열이 나뉘지 않고,
+        # 그러면 기존 KEY 줄을 못 찾아 갱신 대신 중복 추가가 된다.
+        try { $lines = @((Read-Utf8Text -Path $Path) -split "`r?`n") } catch { $lines = @() }
+    }
+    $out = @()
+    $replaced = $false
+    foreach ($line in $lines) {
+        if ($line -match "^\s*$([regex]::Escape($Key))\s*=") {
+            $out += "$Key=$Value"; $replaced = $true
+        } elseif ($line.Trim() -ne '') {
+            $out += $line
+        }
+    }
+    if (-not $replaced) { $out += "$Key=$Value" }
+    Write-Utf8NoBomText -Path $Path -Text (($out -join "`n") + "`n")
+}
+
 function Get-EiassCommandFromConfig {
     param([string]$ConfigPath)
     if (-not (Test-Path $ConfigPath)) { return $null }
@@ -146,6 +176,60 @@ function Get-DesktopConfigForWrite {
     $existing = $paths | Where-Object { Test-Path $_ } | Select-Object -First 1
     if ($existing) { return $existing }
     return ($paths | Where-Object { Test-Path (Split-Path $_ -Parent) } | Select-Object -First 1)
+}
+
+# Google Antigravity 등록. Antigravity 2.0 / IDE / CLI가 ~/.gemini/config/mcp_config.json을
+# 공유하고, 형식은 Claude Desktop과 같은 mcpServers 객체다. Claude Desktop과 동일하게
+# 백업 → eiass 항목만 수정 → 다시 읽어 검증 → 어긋나면 복구 순으로 안전하게 처리한다.
+function Register-Antigravity {
+    param([string]$ExePath, [hashtable]$EnvVars)
+
+    $configPath = Join-Path $env:USERPROFILE ".gemini\config\mcp_config.json"
+    $configDir = Split-Path $configPath -Parent
+    $entry = @{ command = $ExePath }
+    if ($EnvVars -and $EnvVars.Count -gt 0) { $entry['env'] = $EnvVars }
+
+    if (-not (Test-Path $configPath)) {
+        if (-not (Test-Path $configDir)) { New-Item -ItemType Directory -Path $configDir -Force | Out-Null }
+        Write-Utf8NoBomText -Path $configPath -Text (@{ mcpServers = @{ eiass = $entry } } |
+            ConvertTo-Json -Depth 100)
+        return 'created'
+    }
+
+    try {
+        $config = Read-Utf8Text -Path $configPath | ConvertFrom-Json
+    } catch {
+        return 'unparsable'
+    }
+    $keysBefore = @($config.PSObject.Properties.Name)
+    $serversBefore = if ($config.mcpServers) { @($config.mcpServers.PSObject.Properties.Name) } else { @() }
+    $backup = "$configPath.bak"
+    Copy-Item $configPath $backup -Force
+    try {
+        if (-not $config.mcpServers) {
+            $config | Add-Member -NotePropertyName 'mcpServers' -NotePropertyValue (New-Object PSObject) -Force
+        }
+        $config.mcpServers | Add-Member -NotePropertyName 'eiass' `
+            -NotePropertyValue ([PSCustomObject]$entry) -Force
+        # -Depth 100 없이 저장하면 하위 구조가 "System.Object[]" 문자열로 뭉개진다(기본 깊이 2).
+        $json = $config | ConvertTo-Json -Depth 100
+        if ($json -match 'System\.(Object|Management)') { throw "직렬화 중 구조가 손상되었습니다." }
+        Write-Utf8NoBomText -Path $configPath -Text $json
+        $verify = Read-Utf8Text -Path $configPath | ConvertFrom-Json
+        foreach ($key in $keysBefore) {
+            if (@($verify.PSObject.Properties.Name) -notcontains $key) { throw "최상위 항목이 사라졌습니다: $key" }
+        }
+        foreach ($server in $serversBefore) {
+            if (@($verify.mcpServers.PSObject.Properties.Name) -notcontains $server) {
+                throw "MCP 서버 등록이 사라졌습니다: $server"
+            }
+        }
+        if ($verify.mcpServers.eiass.command -ne $ExePath) { throw "eiass 경로가 기록되지 않았습니다." }
+    } catch {
+        Copy-Item $backup $configPath -Force
+        return "failed:$($_.Exception.Message)"
+    }
+    return 'updated'
 }
 
 function Get-RegisteredEiassCommand {
@@ -482,6 +566,20 @@ function ConvertTo-SemanticVersion {
     try { return [Version]($Value.Trim() -replace '^v', '') } catch { return $null }
 }
 
+# 저장소의 STABLE 파일이 가리키는 "검증된 안정 버전"을 읽는다.
+# 최신(latest)이 항상 안정적이지는 않다 — 방금 낸 버전은 아직 실사용 검증 전이다.
+# 사용자가 특정 버전을 고를 때 무엇이 안전한 선택인지 알려주려고 별도 표식을 둔다.
+function Get-StableVersion {
+    param([string]$RepoOwner, [string]$RepoName, [hashtable]$Headers)
+    try {
+        $url = "https://raw.githubusercontent.com/$RepoOwner/$RepoName/main/STABLE"
+        $value = (Invoke-RestMethod -Uri $url -Headers $Headers -TimeoutSec 10)
+        return ([string]$value).Trim() -replace '^v', ''
+    } catch {
+        return $null   # STABLE 표식이 없어도 설치 자체는 진행한다
+    }
+}
+
 function Backup-DowngradeJobDatabase {
     param([string]$TargetVersion)
     $dataDir = Join-Path $env:LOCALAPPDATA "DOHWA EIASS Agent"
@@ -610,25 +708,39 @@ try {
 
         if ($InstallMode -eq "Menu") {
             if (Test-InteractiveConsole) {
+                $menuStable = Get-StableVersion -RepoOwner $RepoOwner -RepoName $RepoName -Headers $ghHeaders
                 while ($InstallMode -eq "Menu") {
                     Write-Host ""
                     Write-Host "설치 방법을 선택하세요:"
                     Write-Host "  [1] 최신 버전 설치/업데이트"
-                    Write-Host "  [2] 특정 버전 선택"
-                    if ($canReinstallCurrent) {
-                        Write-Host "  [3] 현재 버전 재설치 ($localVersion)"
+                    if ($menuStable) {
+                        Write-Host ("  [2] 안정 버전 설치 ({0}) - 권장" -f $menuStable)
                     } else {
-                        Write-Host "  [3] 현재 버전 재설치 (현재 설치 없음)"
+                        Write-Host "  [2] 안정 버전 설치 (표식 없음)"
                     }
-                    $menuChoice = Read-Host "선택 (1~3)"
+                    Write-Host "  [3] 특정 버전 선택"
+                    if ($canReinstallCurrent) {
+                        Write-Host "  [4] 현재 버전 재설치 ($localVersion)"
+                    } else {
+                        Write-Host "  [4] 현재 버전 재설치 (현재 설치 없음)"
+                    }
+                    $menuChoice = Read-Host "선택 (1~4)"
                     switch ($menuChoice.Trim()) {
                         "1" { $InstallMode = "Latest" }
-                        "2" { $InstallMode = "Specific" }
-                        "3" {
+                        "2" {
+                            if ($menuStable) {
+                                $TargetVersion = $menuStable
+                                $InstallMode = "Specific"
+                            } else {
+                                Write-Host "안정 버전 표식을 가져오지 못했습니다. 다른 항목을 선택해 주세요." -ForegroundColor Yellow
+                            }
+                        }
+                        "3" { $InstallMode = "Specific" }
+                        "4" {
                             if ($canReinstallCurrent) { $InstallMode = "Reinstall" }
                             else { Write-Host "현재 설치된 버전이 없어 재설치할 수 없습니다." -ForegroundColor Yellow }
                         }
-                        default { Write-Host "1, 2, 3 중 하나를 입력해 주세요." -ForegroundColor Yellow }
+                        default { Write-Host "1~4 중 하나를 입력해 주세요." -ForegroundColor Yellow }
                     }
                 }
             } else {
@@ -648,10 +760,17 @@ try {
             if ($compatibleReleases.Count -eq 0) {
                 throw "선택 설치가 가능한 정식 릴리스를 찾지 못했습니다."
             }
+            $stableVersion = Get-StableVersion -RepoOwner $RepoOwner -RepoName $RepoName -Headers $ghHeaders
             Write-Host ""
+            if ($stableVersion) {
+                Write-Host ("  * 안정 버전(권장): {0}" -f $stableVersion) -ForegroundColor Green
+                Write-Host ""
+            }
             for ($index = 0; $index -lt $compatibleReleases.Count; $index++) {
-                $marker = ""
-                if ($compatibleReleases[$index].Tag -eq $localTag) { $marker = " (현재 설치)" }
+                $marks = @()
+                if ($stableVersion -and $compatibleReleases[$index].Version -eq $stableVersion) { $marks += "안정" }
+                if ($compatibleReleases[$index].Tag -eq $localTag) { $marks += "현재 설치" }
+                $marker = if ($marks.Count -gt 0) { " (" + ($marks -join ", ") + ")" } else { "" }
                 Write-Host ("  [{0}] {1}{2}" -f ($index + 1), $compatibleReleases[$index].Version, $marker)
             }
             while (-not $selectedRelease) {
@@ -914,9 +1033,64 @@ try {
         Write-Host "기존 .env 발견, 그대로 사용합니다: $envPath`n"
     }
 
+    # 1-b) 실행 프로필 선택 — 무료 플랜은 도구 정의 무게만으로도 한도가 빠듯해서, 도구를 줄인
+    # 경량 모드를 고를 수 있게 한다. 선택 결과는 등록 시 env로 넣어 서버 시작 시 적용된다.
+    if ($Profile -eq "Menu") {
+        if (Test-InteractiveConsole) {
+            Write-Host "사용할 모드를 선택하세요:"
+            Write-Host "  [1] 전체 모드 - 유료 플랜(Pro/Max 등) 권장. 모든 기능 사용"
+            Write-Host "  [2] 경량 모드 - 무료 플랜용. 도구를 줄여 사용량 절약(대량 조사 제한)"
+            $profileChoice = (Read-Host "선택 (1~2, 기본 1)").Trim()
+            $Profile = if ($profileChoice -eq "2") { "lite" } else { "full" }
+        } else {
+            $Profile = "full"
+        }
+    }
+    Write-Host ("선택한 모드: {0}`n" -f $(if ($Profile -eq 'lite') { '경량(무료 플랜용)' } else { '전체' }))
+    # 프로필은 설치 폴더 .env에 기록한다 — 클라이언트별 등록 설정마다 env를 넣는 대신 한 곳에
+    # 두면 어느 클라이언트로 실행하든 같은 프로필이 적용된다(서버가 .env에서 EIASS_PROFILE을 읽는다).
+    Set-EnvValue -Path $envPath -Key 'EIASS_PROFILE' -Value $Profile
+
+    # 1-c) 등록할 플랫폼 선택(중복 가능).
+    # Codex CLI와 ChatGPT/Codex 데스크톱은 ~/.codex/config.toml을 공유하므로 한 항목으로 묶는다.
+    if (-not $Platforms -or $Platforms.Count -eq 0) {
+        if (Test-InteractiveConsole) {
+            Write-Host "등록할 AI 플랫폼을 선택하세요 (쉼표로 중복 선택, 예: 2,3)"
+            Write-Host "  [1] 전체"
+            Write-Host "  [2] Claude Code"
+            Write-Host "  [3] Claude Desktop"
+            Write-Host "  [4] Codex CLI / Codex(ChatGPT) 데스크톱"
+            Write-Host "  [5] Google Antigravity"
+            $picked = @()
+            while ($picked.Count -eq 0) {
+                $raw = (Read-Host "선택 (기본 1=전체)").Trim()
+                if (-not $raw) { $raw = "1" }
+                foreach ($token in ($raw -split '[,\s]+' | Where-Object { $_ })) {
+                    switch ($token) {
+                        "1" { $picked += "All" }
+                        "2" { $picked += "ClaudeCode" }
+                        "3" { $picked += "ClaudeDesktop" }
+                        "4" { $picked += "CodexCli" }
+                        "5" { $picked += "Antigravity" }
+                        default { Write-Host "알 수 없는 항목: $token" -ForegroundColor Yellow }
+                    }
+                }
+                if ($picked.Count -eq 0) { Write-Host "1~5 중에서 선택해 주세요." -ForegroundColor Yellow }
+            }
+            $Platforms = @($picked | Select-Object -Unique)
+        } else {
+            $Platforms = @("All")   # 비대화식은 기존 동작(모두 등록)을 유지한다
+        }
+    }
+    $registerAll = $Platforms -contains "All"
+    function Should-Register { param([string]$Name) return ($registerAll -or ($Platforms -contains $Name)) }
+    Write-Host ("등록 대상: {0}`n" -f $(if ($registerAll) { "전체" } else { ($Platforms -join ", ") }))
+
     # 2) Claude Code (user scope: 모든 프로젝트에서 사용 가능)
-    $claude = Get-Command claude -ErrorAction SilentlyContinue
-    if ($claude) {
+    $claude = if (Should-Register "ClaudeCode") { Get-Command claude -ErrorAction SilentlyContinue } else { $null }
+    if (-not (Should-Register "ClaudeCode")) {
+        Write-Host "ℹ Claude Code는 선택하지 않아 건너뜁니다.`n"
+    } elseif ($claude) {
         try {
             & claude mcp remove eiass --scope user 2>$null | Out-Null
         } catch {}
@@ -928,37 +1102,43 @@ try {
 
     # 3) Codex CLI / ChatGPT Desktop의 Codex 환경. PATH에 CLI가 없어도 앱 패키지 내부의
     # codex.exe를 찾아 같은 사용자 설정(~/.codex/config.toml)에 등록하고 즉시 검증한다.
-    $codexCommand = Get-CodexCommandPath
-    $codexResult = if ($codexCommand) {
-        Register-CodexClients -CodexCommand $codexCommand -ExePath $ExePath
+    if (-not (Should-Register "CodexCli")) {
+        Write-Host "ℹ Codex는 선택하지 않아 건너뜁니다.`n"
     } else {
-        'failed:codex.exe를 찾지 못했습니다.'
-    }
-    if ($codexCommand) {
-        if ($codexResult -eq 'registered') {
-            Write-Host "✅ Codex CLI / ChatGPT Desktop에 등록 및 검증 완료`n"
-        }
-    }
-
-    if ($codexResult -ne 'registered') {
-        $codexConfigPath = Join-Path $env:USERPROFILE '.codex\config.toml'
-        $directResult = Register-CodexConfigDirect -ConfigPath $codexConfigPath -ExePath $ExePath
-        if ($directResult -eq 'registered-direct') {
-            Write-Host "ℹ codex.exe 직접 실행을 사용할 수 없어 설정 파일 등록으로 전환했습니다."
-            Write-Host "✅ Codex CLI / ChatGPT Desktop 설정 직접 등록 및 검증 완료"
-            Write-Host "   $codexConfigPath`n"
+        $codexCommand = Get-CodexCommandPath
+        $codexResult = if ($codexCommand) {
+            Register-CodexClients -CodexCommand $codexCommand -ExePath $ExePath
         } else {
-            Write-Host "⚠ Codex CLI / ChatGPT Desktop 자동 등록 실패" -ForegroundColor Yellow
-            Write-Host "   CLI: $($codexResult -replace '^failed:', '')"
-            Write-Host "   설정 파일: $($directResult -replace '^failed:', '')`n"
+            'failed:codex.exe를 찾지 못했습니다.'
+        }
+        if ($codexCommand) {
+            if ($codexResult -eq 'registered') {
+                Write-Host "✅ Codex CLI / ChatGPT Desktop에 등록 및 검증 완료`n"
+            }
+        }
+
+        if ($codexResult -ne 'registered') {
+            $codexConfigPath = Join-Path $env:USERPROFILE '.codex\config.toml'
+            $directResult = Register-CodexConfigDirect -ConfigPath $codexConfigPath -ExePath $ExePath
+            if ($directResult -eq 'registered-direct') {
+                Write-Host "ℹ codex.exe 직접 실행을 사용할 수 없어 설정 파일 등록으로 전환했습니다."
+                Write-Host "✅ Codex CLI / ChatGPT Desktop 설정 직접 등록 및 검증 완료"
+                Write-Host "   $codexConfigPath`n"
+            } else {
+                Write-Host "⚠ Codex CLI / ChatGPT Desktop 자동 등록 실패" -ForegroundColor Yellow
+                Write-Host "   CLI: $($codexResult -replace '^failed:', '')"
+                Write-Host "   설정 파일: $($directResult -replace '^failed:', '')`n"
+            }
         }
     }
 
     # 4) Claude Desktop — 설정 JSON에 직접 등록한다. 터미널도 어려워하는 사용자에게 JSON을
     # 손으로 고치게 할 수는 없다. 실패하면 기존 파일을 되돌리고 수동 안내로 넘어간다.
     # 설정 경로는 일반 설치와 Microsoft Store 설치(가상화된 패키지 경로)를 모두 찾는다.
-    $desktopConfigPath = Get-DesktopConfigForWrite
-    if ($desktopConfigPath) {
+    $desktopConfigPath = if (Should-Register "ClaudeDesktop") { Get-DesktopConfigForWrite } else { $null }
+    if (-not (Should-Register "ClaudeDesktop")) {
+        Write-Host "ℹ Claude Desktop은 선택하지 않아 건너뜁니다.`n"
+    } elseif ($desktopConfigPath) {
         $desktopResult = Register-ClaudeDesktop -ConfigPath $desktopConfigPath -ExePath $ExePath
         switch -Wildcard ($desktopResult) {
             'updated' { Write-Host "✅ Claude Desktop에 등록 완료`n" }
@@ -982,6 +1162,22 @@ try {
         }
     } else {
         Write-Host "ℹ Claude Desktop이 설치되어 있지 않은 것으로 보여 건너뜁니다.`n"
+    }
+
+    # 4-b) Google Antigravity — ~/.gemini/config/mcp_config.json에 직접 등록한다.
+    if (Should-Register "Antigravity") {
+        $antiResult = Register-Antigravity -ExePath $ExePath -EnvVars @{}
+        switch -Wildcard ($antiResult) {
+            'updated' { Write-Host "✅ Google Antigravity에 등록 완료`n" }
+            'created' { Write-Host "✅ Google Antigravity 설정을 새로 만들어 등록했습니다`n" }
+            'unparsable' {
+                Write-Host "⚠ Antigravity 설정 파일을 읽지 못해 자동 등록을 건너뜁니다(파일은 그대로 두었습니다).`n"
+            }
+            default {
+                Write-Host "⚠ Antigravity 자동 등록 실패 — 원래 설정으로 되돌렸습니다."
+                Write-Host "   ($($antiResult -replace '^failed:', ''))`n"
+            }
+        }
     }
 
     # 5) 다음 업데이트용 실행 파일을 설치 폴더에 남긴다. 사용자가 처음 받은 .bat을 어디에 뒀는지

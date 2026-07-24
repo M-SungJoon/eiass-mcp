@@ -13,6 +13,67 @@ def bounded_env_int(name, default, minimum, maximum):
     return max(minimum, min(maximum, value))
 
 
+# ── 실행 프로필 ──
+# 'full'(기본): 지금까지와 동일하게 모든 도구를 노출한다.
+# 'lite'      : 무료 플랜용. MCP 도구 정의는 대화마다 통째로 컨텍스트에 실리는데(실측 20개
+#               ≈16,800토큰), 무료 플랜은 컨텍스트·메시지 한도가 빡빡해 이것만으로도 버겁다.
+#               도구를 14개로 줄이고 설명은 첫 문단만 노출해 ≈5,900토큰으로 낮춘다.
+#               결과 payload도 매칭 1건당 ≈810토큰이라 함께 상한을 건다.
+def _profile_from_env_file():
+    """설치 폴더의 .env에서 EIASS_PROFILE을 읽는다.
+
+    클라이언트(Claude Code/Desktop/Codex/Antigravity)마다 등록 설정에 환경변수를 넣는 대신
+    .env 한 곳에 적어두면 어느 클라이언트로 실행하든 같은 프로필이 적용된다. 탐색 위치는
+    eiass_core.dotenv_paths()와 같다(exe 폴더 + 설치 폴더). config는 eiass_core보다 먼저
+    import되므로 여기서 최소한의 파서를 따로 둔다.
+    """
+    import sys
+    if getattr(sys, 'frozen', False):
+        base = os.path.dirname(os.path.abspath(sys.executable))
+    else:
+        base = os.path.dirname(os.path.abspath(__file__))
+    for path in (os.path.join(base, '.env'), os.path.join(os.path.dirname(base), '.env')):
+        try:
+            with open(path, 'r', encoding='utf-8-sig') as handle:
+                for line in handle:
+                    key, sep, value = line.partition('=')
+                    if sep and key.strip().upper() == 'EIASS_PROFILE':
+                        return value.strip().strip('"').strip("'")
+        except (OSError, UnicodeDecodeError):
+            continue
+    return None
+
+
+EIASS_PROFILE = (os.environ.get('EIASS_PROFILE') or _profile_from_env_file() or 'full').strip().lower()
+if EIASS_PROFILE not in ('full', 'lite'):
+    EIASS_PROFILE = 'full'
+IS_LITE_PROFILE = EIASS_PROFILE == 'lite'
+
+# 경량 프로필에서 노출할 도구. 단발 조회 위주로 두되, 백그라운드 문서 스캔은
+# 시작/상태/취소 3종을 한 세트로 넣는다 — 시작만 있으면 결과를 꺼낼 방법이 없다.
+LITE_TOOLS = frozenset({
+    'eiass_search_projects',
+    'eiass_preview_search',
+    'eiass_get_project_documents',
+    'eiass_read_document',
+    'eiass_find_projects_by_document_keyword',
+    'eiass_geocode',
+    'eiass_check_protected_area_adjacency',
+    'eiass_check_project_protected_area_adjacency',
+    'eiass_export_matches_csv',
+    'eiass_version',
+    'eiass_check_server_status',
+    'eiass_start_document_keyword_scan',
+    'eiass_get_scan_status',
+    'eiass_cancel_scan',
+})
+
+# 경량 프로필 상한. 후보 수는 초과 시 "조용히 잘라내지 않고" 거부한다 — 말없이 일부만 훑으면
+# 사용자가 전수 조사한 것으로 오해하는데, 이 도구는 조사 완전성이 중요하다.
+LITE_MAX_CANDIDATES = bounded_env_int('EIASS_LITE_MAX_CANDIDATES', 50, 1, 200)
+LITE_RESULT_LIMIT = bounded_env_int('EIASS_LITE_RESULT_LIMIT', 20, 1, 100)
+LITE_SNIPPET_CHARS = bounded_env_int('EIASS_LITE_SNIPPET_CHARS', 150, 50, 500)
+
 APP_NAME = 'DOHWA EIASS Agent'
 JOB_WORKER_COUNT = 2
 JOB_QUEUE_SIZE = 32

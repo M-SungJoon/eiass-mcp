@@ -1,5 +1,6 @@
 # -*- coding: utf-8 -*-
 import os
+import sys
 import threading
 import time
 import unittest
@@ -494,6 +495,74 @@ class ParallelDocumentScanTests(unittest.TestCase):
         self.assertEqual(parallel, ['s0', 's2', 's4', 's6'])         # right matches
         self.assertGreaterEqual(parallel_max, 4)                     # actually ran in parallel
         self.assertEqual(self.max_concurrency, 1)                    # K=1 stays sequential
+
+
+class LiteProfileTests(unittest.TestCase):
+    """무료 플랜용 경량 프로필이 도구/설명/상한을 줄이면서, 기본(full)은 손대지 않는지 검증한다.
+
+    도구 정의는 대화마다 컨텍스트에 실려서(full 20개 ≈16,800토큰) 무료 플랜에서는 이 무게만으로
+    실사용이 어렵다. lite는 도구 14개 + 설명 첫 문단으로 줄인다.
+    """
+
+    @staticmethod
+    def _load(profile):
+        import importlib
+        os.environ['EIASS_PROFILE'] = profile
+        for name in ('config', 'mcp_server', 'eiass_core', 'scan_engine', 'job_store',
+                     'adaptive_engine', 'document_engine', 'spatial_engine'):
+            sys.modules.pop(name, None)
+        return importlib.import_module('mcp_server')
+
+    @classmethod
+    def tearDownClass(cls):
+        os.environ.pop('EIASS_PROFILE', None)
+        cls._load('full')   # 다른 테스트가 기본 프로필을 보도록 되돌린다
+
+    def _tools(self, module):
+        import asyncio
+        return asyncio.run(module.mcp.list_tools())
+
+    def test_lite_exposes_fewer_tools_than_full(self):
+        full = {t.name for t in self._tools(self._load('full'))}
+        lite = {t.name for t in self._tools(self._load('lite'))}
+        self.assertLess(len(lite), len(full))
+        self.assertTrue(lite < full, 'lite는 full의 부분집합이어야 한다')
+        # 백그라운드 문서 스캔은 결과를 꺼내려면 상태 조회가 반드시 함께 있어야 한다.
+        self.assertIn('eiass_start_document_keyword_scan', lite)
+        self.assertIn('eiass_get_scan_status', lite)
+        # 왕복이 많은 공간 스캔 계열은 빠져야 한다.
+        self.assertNotIn('eiass_start_spatial_scan', lite)
+        self.assertNotIn('eiass_wait_scan_update', lite)
+
+    def test_lite_descriptions_are_shortened(self):
+        full = {t.name: (t.description or '') for t in self._tools(self._load('full'))}
+        lite = {t.name: (t.description or '') for t in self._tools(self._load('lite'))}
+        long_tool = 'eiass_find_projects_by_document_keyword'
+        self.assertLess(len(lite[long_tool]), len(full[long_tool]))
+        self.assertNotIn('\n\n', lite[long_tool])          # 첫 문단만 남는다
+        total = sum(len(d) for d in lite.values())
+        self.assertLess(total, sum(len(d) for d in full.values()) / 2)
+
+    def test_lite_rejects_oversized_candidate_request(self):
+        module = self._load('lite')
+        result = module.eiass_find_projects_by_document_keyword(
+            text_queries='X', max_candidates=module.LITE_MAX_CANDIDATES + 1, confirmed=True)
+        # 조용히 잘라내면 사용자가 전수 조사한 것으로 오해한다 — 반드시 거부해야 한다.
+        self.assertIn('error', result)
+        self.assertEqual(result['lite_max_candidates'], module.LITE_MAX_CANDIDATES)
+
+    def test_lite_clamps_display_limits(self):
+        module = self._load('lite')
+        probe = module._apply_lite_limits(lambda **kw: kw)
+        out = probe(result_limit=1000, snippet_chars=1000, max_candidates=1)
+        self.assertEqual(out['result_limit'], module.LITE_RESULT_LIMIT)
+        self.assertEqual(out['snippet_chars'], module.LITE_SNIPPET_CHARS)
+
+    def test_full_profile_is_unchanged(self):
+        module = self._load('full')
+        self.assertFalse(module.IS_LITE_PROFILE)
+        # full에서는 상한 래퍼가 아예 씌워지지 않는다(기존 동작 100% 보존).
+        self.assertFalse(hasattr(module.eiass_find_projects_by_document_keyword, '__wrapped__'))
 
 
 if __name__ == '__main__':
