@@ -391,9 +391,13 @@ def eiass_search_projects(keyword: str = '', types: str = '', agency_code: str =
         consult_date_from: 'YYYY-MM-DD'. 협의완료일(사후조사는 조사년도) 하한.
         consult_date_to: 'YYYY-MM-DD'. 협의완료일(사후조사는 조사년도) 상한.
             예: "최근 1년" → consult_date_from=오늘로부터 1년 전, consult_date_to=오늘.
-        progress_status: '완료' | '진행' | ''. 진행현황 필터.
+        progress_status: '완료' | '진행' | ''. 진행현황 필터. 사후환경영향조사(A)만 조회할 때는
+            반드시 빈 문자열('전체')이어야 한다 — 그 외 값이면 에러가 난다. types를 비워
+            전체로 조회하면 진행현황이 지정된 경우 A는 결과에서 자동으로 빠진다.
         climate_filter: 'Y' | 'N' | ''. 기후변화영향평가 대상 여부(사후조사 제외).
-        biz_gubun: 사업유형(사업구분) 필터. 다음 라벨 중 정확히 일치해야 한다(사후환경영향조사는 미지원):
+        biz_gubun: 사업유형(사업구분) 필터. 사후환경영향조사(A)만 조회할 때는 반드시 빈
+            문자열('전체')이어야 한다(A는 이 필터를 지원하지 않음). 다음 라벨 중 정확히
+            일치해야 한다:
             도시의 개발, 산업입지 및 산업단지의 조성, 에너지 개발, 항만 건설, 도로의 건설,
             수자원의 개발, 철도(도시철도 포함)의 건설, 공항 또는 비행장의 건설, 하천의 이용 및 개발,
             개간 및 공유수면의 매립, 관광단지의 개발, 지역개발/특정지역의 개발, 체육시설의 설치,
@@ -424,7 +428,7 @@ def eiass_preview_search(
     text_queries: str, match_mode: str = 'any', keyword: str = '', types: str = '', agency_code: str = '',
     consult_date_from: str = '', consult_date_to: str = '', progress_status: str = '완료',
     climate_filter: str = '', biz_gubun: str = '', progress_stage: str = '',
-    stages: str = '초안,본안,보완,협의의견', doc_title_contains: str = '',
+    stages: str = '', doc_title_contains: str = '',
     max_pages: int = 0, inference_notes: str = '', audit_sample_size: int = 0,
 ) -> dict:
     """실제로 문서를 다운로드하지 않고, 이 조건으로 검색하면 무엇을 하게 될지 미리 보여준다.
@@ -458,7 +462,7 @@ def eiass_preview_search(
             '산업단지 사례'라고만 했음"). 없으면 빈 문자열로 둔다.
     """
     type_codes = [c.strip().upper() for c in types.split(',') if c.strip()] or None
-    stage_list = tuple(s.strip() for s in stages.split(',') if s.strip()) or ('초안', '본안', '보완', '협의의견')
+    stage_list = tuple(s.strip() for s in stages.split(',') if s.strip()) or None
     query_list = [q.strip() for q in text_queries.split(',') if q.strip()]
     title_terms = [t.strip() for t in doc_title_contains.split(',') if t.strip()] or None
     progress_stage_labels = [s.strip() for s in progress_stage.split(',') if s.strip()]
@@ -482,7 +486,7 @@ def eiass_find_projects_by_document_keyword(
     text_queries: str, match_mode: str = 'any', keyword: str = '', types: str = '', agency_code: str = '',
     consult_date_from: str = '', consult_date_to: str = '', progress_status: str = '완료',
     climate_filter: str = '', biz_gubun: str = '', progress_stage: str = '',
-    stages: str = '초안,본안,보완,협의의견', doc_title_contains: str = '',
+    stages: str = '', doc_title_contains: str = '',
     max_pages: int = 0, offset: int = 0, max_candidates: int = 30,
     inference_notes: str = '', confirmed: bool = False, audit_sample_size: int = 0,
     survey_method: str = '',
@@ -543,14 +547,22 @@ def eiass_find_projects_by_document_keyword(
             비워두고, AI 판단으로 좁힐 경우 반드시 inference_notes에 남겨라.
         agency_code: 협의기관 코드(선택).
         consult_date_from/consult_date_to: 'YYYY-MM-DD'. 협의완료일 범위.
-        progress_status: '완료' | '진행' | ''. 기본 '완료'(협의의견은 완료 건에만 존재).
+        progress_status: '완료' | '진행' | ''. 기본 '완료'(협의의견은 완료 건에만 존재). types에
+            A(사후환경영향조사)만 지정할 때는 반드시 빈 문자열('전체')로 넘겨야 한다 —
+            그 외 값이면 에러가 난다. types를 비워 전체로 조회하는데 progress_status가
+            기본값('완료')이면 A는 자동으로 검색 대상에서 빠진다(A는 이 필터를 지원하지
+            않으므로) — 사후조사도 함께 보려면 progress_status=''로 명시해야 한다.
         climate_filter: 'Y' | 'N' | ''. 기후변화영향평가 대상 여부. 비우면 전체.
         biz_gubun: 사업유형(사업구분) 필터 라벨(예: '산업입지 및 산업단지의 조성'). 정확한 목록은
-            eiass_search_projects 설명 참고. 사후환경영향조사는 미지원.
+            eiass_search_projects 설명 참고. 사후환경영향조사(A)는 미지원 — types에 A만
+            지정할 때는 반드시 빈 문자열('전체')이어야 한다.
         progress_stage: 진행구분 다중선택, 콤마 구분. 사용 가능 라벨: 초안, 평가서, 재협의,
             약식평가, 변경협의. 비우면 5개 전부(=전체, 필터 없음)로 취급한다.
-        stages: 검색 대상 단계, 콤마 구분(기본 '초안,본안,보완,협의의견'). 특정 단계만 보려면
-            좁혀서 넘긴다(예: '협의의견'만).
+        stages: 검색 대상 단계, 콤마 구분. 비우면 types에 따라 자동으로 기본값이 정해진다
+            — 환경영향평가 계열은 '초안,본안,보완,협의의견', types에 A(사후환경영향조사)가
+            섞여 있으면(또는 types를 비워 전체로 조회하면) 여기에 '사후조사'도 자동으로
+            더해진다. A만 조회하면 '사후조사' 단독이 기본값이 된다. 특정 단계만 보려면
+            직접 좁혀서 넘긴다(예: '협의의견'만, 또는 사후환경영향조사만 볼 때 '사후조사'만).
         doc_title_contains: stages 범위 안에서 파일명에 포함되어야 할 문자열, 콤마 구분(예:
             '대기질,기상'). 챕터별로 쪼개진 초안/본안/보완 등에서 제목에 특정 단어가 들어간
             문서만 확인하고 싶을 때 쓴다(예: '0922 대기질(...).pdf'). 비우면 단계 안의 모든
@@ -565,7 +577,7 @@ def eiass_find_projects_by_document_keyword(
             'adaptive'를 선택했으면 같은 조건으로 eiass_start_document_keyword_scan을 사용한다.
     """
     type_codes = [c.strip().upper() for c in types.split(',') if c.strip()] or None
-    stage_list = tuple(s.strip() for s in stages.split(',') if s.strip()) or ('초안', '본안', '보완', '협의의견')
+    stage_list = tuple(s.strip() for s in stages.split(',') if s.strip()) or None
     query_list = [q.strip() for q in text_queries.split(',') if q.strip()]
     title_terms = [t.strip() for t in doc_title_contains.split(',') if t.strip()] or None
     progress_stage_labels = [s.strip() for s in progress_stage.split(',') if s.strip()]
@@ -606,7 +618,7 @@ def eiass_start_document_keyword_scan(
     text_queries: str, match_mode: str = 'any', keyword: str = '', types: str = '', agency_code: str = '',
     consult_date_from: str = '', consult_date_to: str = '', progress_status: str = '완료',
     climate_filter: str = '', biz_gubun: str = '', progress_stage: str = '',
-    stages: str = '초안,본안,보완,협의의견', doc_title_contains: str = '',
+    stages: str = '', doc_title_contains: str = '',
     max_pages: int = 0, batch_size: int = 10, inference_notes: str = '', confirmed: bool = False,
     audit_sample_size: int = 0,
     survey_method: str = '', adaptive_strategy_json: str = '',
@@ -653,7 +665,7 @@ def eiass_start_document_keyword_scan(
     매칭 없는 사업은 원문 파일명/유사내용 페이지번호/변경 내용 요약을 `매칭 없음`으로 채운다.
     """
     type_codes = [c.strip().upper() for c in types.split(',') if c.strip()] or None
-    stage_list = tuple(s.strip() for s in stages.split(',') if s.strip()) or ('초안', '본안', '보완', '협의의견')
+    stage_list = tuple(s.strip() for s in stages.split(',') if s.strip()) or None
     query_list = [q.strip() for q in text_queries.split(',') if q.strip()]
     title_terms = [t.strip() for t in doc_title_contains.split(',') if t.strip()] or None
     progress_stage_labels = [s.strip() for s in progress_stage.split(',') if s.strip()]

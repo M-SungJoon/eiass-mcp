@@ -71,7 +71,7 @@ except ImportError:
 
 # 저장소 루트 VERSION 파일과 항상 같은 값으로 맞춰서 커밋할 것(버전 두 곳 중복 관리).
 # 어긋난 채로 커밋되지 않도록 build_mcp.py가 빌드 시작 전에 두 값을 대조한다.
-__version__ = '1.18.0'
+__version__ = '1.18.1'
 
 REQUEST_TIMEOUT = (8, 30)
 
@@ -184,6 +184,25 @@ STAGE_MAP = {
 }
 
 ALL_KNOWN_STAGES = ('초안', '본안', '협의의견', '협의후조치', '사후조사', '보완', '변경')
+
+DEFAULT_EIA_STAGES = ('초안', '본안', '보완', '협의의견')
+
+
+def default_stages_for_types(type_codes):
+    """type_codes(평가종류 코드)에 맞춰 문서 stage 기본값을 고른다.
+
+    A(사후환경영향조사)의 첨부문서는 초안/본안/보완/협의의견 구조가 아니라 '사후조사'
+    단독 단계이므로, EIA 계열 기본값('초안','본안','보완','협의의견')만 쓰면 A유형은
+    전수 실패로 처리된다. type_codes가 A만이면 '사후조사' 단독, A가 다른 종류와 섞여
+    있으면 EIA 기본값 + '사후조사'를 함께 기본으로 삼는다. type_codes가 비어 있으면
+    (전체 평가종류 = S/E/A/M/P) A가 포함된 것으로 취급한다.
+    """
+    codes = set(type_codes) if type_codes else {'S', 'E', 'A', 'M', 'P'}
+    if codes == {'A'}:
+        return ('사후조사',)
+    if 'A' in codes:
+        return DEFAULT_EIA_STAGES + ('사후조사',)
+    return DEFAULT_EIA_STAGES
 
 
 # ── .env 설정 (원본 dotenv_paths()/read_dotenv_values()와 동일 위치를 조회한다) ──
@@ -1059,11 +1078,14 @@ def search_projects(keyword='', type_codes=None, agency_code='', max_pages=0, se
             기준 범위 필터. 서버에는 연도 단위로만 먼저 필터링을 걸고, 정확한 날짜 비교는
             결과를 받은 뒤 클라이언트에서 다시 검증한다(원본과 동일한 2단계 필터링).
         progress_status: '완료' | '진행' | ''. 진행현황 셀의 '(완료)'/'(진행)' 표기와 매칭.
+            사후환경영향조사(A)는 이 필터를 지원하지 않는다 — target_types가 A만이면 반드시
+            빈 문자열('전체')이어야 하고, 그렇지 않으면 EiassError를 던진다.
         climate_filter: 'Y' | 'N' | ''. 기후변화영향평가 대상 여부(사후조사 제외).
         progress_stage_keys: 진행구분 부분집합 {'draft','report','reconsult','simple','change'}.
             None이면 원본 UI 기본값과 동일하게 전체 선택.
         biz_gubun: BIZ_GUBUN_OPTIONS의 라벨 텍스트(예: '산업입지 및 산업단지의 조성'). 사후환경영향조사(A)는
-            지원하지 않으므로 target_types에 A만 있으면 결과가 비게 된다.
+            지원하지 않는다 — target_types가 A만이면 반드시 빈 문자열('전체')이어야 하고,
+            그렇지 않으면 EiassError를 던진다.
     반환: [{'type','name','agency','date','comp_date','progress_status','biz_gubun',
             'view_type','eia_cd','revirpt_seq'}, ...]
     """
@@ -1086,7 +1108,12 @@ def search_projects(keyword='', type_codes=None, agency_code='', max_pages=0, se
                           'biz_gubun 중 하나 이상은 지정해야 합니다.')
 
     target_types = list(type_codes) if type_codes else ['S', 'E', 'A', 'M', 'P']
+    if progress_status and target_types == ['A']:
+        raise EiassError("사후환경영향조사(A)는 진행현황(progress_status) 필터를 지원하지 않습니다 — "
+                          "progress_status를 빈 문자열('전체')로 두고 조회하세요.")
     if climate_filter:
+        target_types = [t for t in target_types if t != 'A']
+    if progress_status:
         target_types = [t for t in target_types if t != 'A']
     if biz_gubun:
         known_labels = {label for label, _per, _eia in BIZ_GUBUN_OPTIONS if label != '전체'}
@@ -2408,7 +2435,7 @@ def preview_document_keyword_search(
     progress_status='완료',
     biz_gubun='',
     progress_stage_keys=None,
-    stages=('초안', '본안', '보완', '협의의견'),
+    stages=None,
     doc_title_contains=None,
     max_pages=0,
     inference_notes='',
@@ -2446,6 +2473,8 @@ def preview_document_keyword_search(
     text_queries = [q for q in (text_queries or []) if q]
     if not text_queries:
         raise EiassError('text_queries에 검색어를 하나 이상 지정해야 합니다.')
+    if stages is None:
+        stages = default_stages_for_types(type_codes)
     doc_title_contains = [t for t in (doc_title_contains or []) if t]
 
     session = session or _session()
@@ -2560,7 +2589,7 @@ def search_projects_by_document_keyword(
     progress_status='완료',
     biz_gubun='',
     progress_stage_keys=None,
-    stages=('초안', '본안', '보완', '협의의견'),
+    stages=None,
     doc_title_contains=None,
     max_pages=0,
     offset=0,
@@ -2575,9 +2604,10 @@ def search_projects_by_document_keyword(
     date_filter_exclusions=None,
     climate_filter='',
 ):
-    """검색 필터(협의완료일 범위/진행상태/진행구분 등)로 후보 사업을 뽑은 뒤, 지정한 단계(기본값
-    '초안,본안,보완,협의의견' — 협의의견만 우선 확인하면 놓치는 경우가 있어 여러 단계를
-    기본으로 함께 확인한다)의 첨부 PDF 원문에서 text_queries 키워드가 있는 사업만 골라낸다.
+    """검색 필터(협의완료일 범위/진행상태/진행구분 등)로 후보 사업을 뽑은 뒤, 지정한 단계(stages가
+    None이면 default_stages_for_types(type_codes)로 자동 결정 — EIA 계열은 '초안,본안,보완,
+    협의의견'을 기본으로 함께 확인하고, A(사후환경영향조사)가 포함되면 '사후조사'도 기본에
+    추가한다)의 첨부 PDF 원문에서 text_queries 키워드가 있는 사업만 골라낸다.
 
     이 함수는 실제로 문서를 다운로드하는 "실행" 단계다 — MCP 도구 계층
     (eiass_find_projects_by_document_keyword / eiass_start_document_keyword_scan)은
@@ -2638,6 +2668,8 @@ def search_projects_by_document_keyword(
     if match_mode not in ('any', 'all'):
         raise EiassError("match_mode는 'any' 또는 'all'이어야 합니다.")
     _validate_paging(offset, max_candidates)
+    if stages is None:
+        stages = default_stages_for_types(type_codes)
     doc_title_contains = [t for t in (doc_title_contains or []) if t]
 
     session = session or _session()
