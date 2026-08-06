@@ -565,5 +565,39 @@ class LiteProfileTests(unittest.TestCase):
         self.assertFalse(hasattr(module.eiass_find_projects_by_document_keyword, '__wrapped__'))
 
 
+class PostSurveyStageDefaultTests(unittest.TestCase):
+    def test_eia_types_default_to_eia_stages_only(self):
+        self.assertEqual(core.default_stages_for_types(['E']), core.DEFAULT_EIA_STAGES)
+
+    def test_post_survey_only_defaults_to_post_survey_stage(self):
+        self.assertEqual(core.default_stages_for_types(['A']), ('사후조사',))
+
+    def test_mixed_types_include_post_survey_stage(self):
+        self.assertEqual(core.default_stages_for_types(['E', 'A']),
+                          core.DEFAULT_EIA_STAGES + ('사후조사',))
+
+    def test_no_types_selected_is_treated_as_all_and_includes_post_survey(self):
+        self.assertEqual(core.default_stages_for_types(None),
+                          core.DEFAULT_EIA_STAGES + ('사후조사',))
+
+    def test_preview_search_defaults_stages_from_type_codes(self):
+        original_search = core.search_projects
+        core.search_projects = lambda *args, **kwargs: []
+        try:
+            result = core.preview_document_keyword_search(
+                ['q'], type_codes=['A'], progress_status='', agency_code='HG')
+        finally:
+            core.search_projects = original_search
+        self.assertEqual(result['stages_to_check'], ['사후조사'])
+
+    def test_progress_status_rejected_when_only_post_survey_type_selected(self):
+        with self.assertRaises(core.EiassError):
+            core.search_projects(progress_status='완료', type_codes=['A'])
+
+    def test_biz_gubun_rejected_when_only_post_survey_type_selected(self):
+        with self.assertRaises(core.EiassError):
+            core.search_projects(biz_gubun='산업입지 및 산업단지의 조성', type_codes=['A'])
+
+
 if __name__ == '__main__':
     unittest.main()
