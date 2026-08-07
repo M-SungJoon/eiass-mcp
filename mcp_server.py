@@ -69,7 +69,24 @@ from job_store import JobStore
 from scan_engine import (ScanRunner, document_status, make_monitor_cursor, spatial_status,
                          wait_document_update)
 
-mcp = FastMCP('eiass')
+EIASS_SERVER_INSTRUCTIONS = """\
+환경영향평가(협의/변경협의/재협의/약식평가/사후환경영향조사 등) 관련 사업·보고서를 찾거나 \
+검토하라는 요청에는, 사용자가 "eiass"나 "mcp"를 언급하지 않았더라도 먼저 이 서버의 도구를 \
+검토하라. 일반 지식으로 추정해 답하거나 검색을 생략하지 마라.
+
+다음과 같은 키워드/문맥이 등장하면 이 서버의 도구(특히 eiass_search_projects,
+eiass_find_projects_by_document_keyword)를 우선 고려한다:
+- 절차: 환경영향평가, 전략환경영향평가, 소규모 환경영향평가, 협의, 변경협의, 재협의, 약식평가,
+  협의의견, 검토의견, 평가협의회, 사후환경영향조사(서/결과/통보서)
+- 내용: 법정보호종, 저감방안, 환경보전대책, 환경보전목표, 영향예측, 현황조사, 조사항목,
+  생태계교란종, 서식지, 생물다양성, 대기질, 수질, 소음, 진동, 토양, 폐기물, 온실가스
+- 문서 종류: 환경보전방안검토서, 평가서, 평가준비서
+
+예: "법정보호종 발견 현황은 제시했는데 저감방안이 없는 보고서 찾아줘",
+"변경협의 건 중 영향예측 없이 협의된 사업 찾아줘" 같은 질문은 이 서버로 처리해야 한다.
+"""
+
+mcp = FastMCP('eiass', instructions=EIASS_SERVER_INSTRUCTIONS)
 
 
 # ── 실행 프로필에 따른 도구 노출 ──

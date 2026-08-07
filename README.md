@@ -4,26 +4,26 @@
 
 ## 제공 도구
 
-| 도구                                        | 기능                                                                                                                                        |
-| ----------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------- |
-| `eiass_search_projects`                   | 사업명/협의완료일 범위/진행상태/진행구분/기후변화영향평가/사업유형 등 필터로 사업 검색                                                                                          |
-| `eiass_preview_search`                    | 실제 조회 없이 검색조건/문서범위/예상 후보·문서 수/과거 패턴 힌트를 확인 문구로 반환                                                                                         |
-| `eiass_find_projects_by_document_keyword` | 필터로 후보를 좁힌 뒤, 지정 단계(기본 초안/본안/보완/협의의견) 원문에서 키워드가 있는 사업만 추려서 반환. `confirmed=true` 없이는 미리보기만 반환(아래 "실행 전 확인" 참고). 소규모(~50건) 조회용, `offset`으로 이어서 조회 가능 |
-| `eiass_start_document_keyword_scan`       | 대량 후보(수백 건)를 타임아웃 없이 끝까지 훑는 백그라운드 스캔 시작. `confirmed=true`일 때만 실제로 시작하고 즉시 `job_id` 반환                                                     |
-| `eiass_get_scan_status`                   | `job_id`로 스캔 진행 상황·중간/최종 매칭 결과 조회(스캔 중에도 즉시 응답)                                                                                           |
-| `eiass_cancel_scan`                       | 진행 중인 백그라운드 스캔 취소(즉시 응답)                                                                                                                  |
-| `eiass_get_project_documents`             | 사업 개요 필드 + 단계별(초안/본안/협의의견 등) 첨부문서 목록 조회                                                                                                   |
-| `eiass_read_document`                     | 첨부 PDF를 다운로드해 텍스트 추출(로컬 캐시 우선)                                                                                                            |
-| `eiass_check_protected_area_adjacency`    | 단순 주소 문자열 → 지오코딩 → 반경 내 KDPA 보호지역(국립공원/천연기념물/습지보호지역/야생생물보호구역/OECM) 조회. `designations`로 특정 종류만 조회 가능                                              |
-| `eiass_check_project_protected_area_adjacency` | EIASS 사업지 주소(도로명/지번 복합 표기) 전용 — 여러 후보로 분해해 지오코딩 후 보호구역 인접조회. `confirmed=true` 없이는 미리보기만 반환                                                    |
+| 도구                                             | 기능                                                                                                                                                     |
+| ---------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `eiass_search_projects`                        | 사업명/협의완료일 범위/진행상태/진행구분/기후변화영향평가/사업유형 등 필터로 사업 검색                                                                                                       |
+| `eiass_preview_search`                         | 실제 조회 없이 검색조건/문서범위/예상 후보·문서 수/과거 패턴 힌트를 확인 문구로 반환                                                                                                      |
+| `eiass_find_projects_by_document_keyword`      | 필터로 후보를 좁힌 뒤, 지정 단계(기본 초안/본안/보완/협의의견) 원문에서 키워드가 있는 사업만 추려서 반환. `confirmed=true` 없이는 미리보기만 반환(아래 "실행 전 확인" 참고). 소규모(~50건) 조회용, `offset`으로 이어서 조회 가능     |
+| `eiass_start_document_keyword_scan`            | 대량 후보(수백 건)를 타임아웃 없이 끝까지 훑는 백그라운드 스캔 시작. `confirmed=true`일 때만 실제로 시작하고 즉시 `job_id` 반환                                                                  |
+| `eiass_get_scan_status`                        | `job_id`로 스캔 진행 상황·중간/최종 매칭 결과 조회(스캔 중에도 즉시 응답)                                                                                                        |
+| `eiass_cancel_scan`                            | 진행 중인 백그라운드 스캔 취소(즉시 응답)                                                                                                                               |
+| `eiass_get_project_documents`                  | 사업 개요 필드 + 단계별(초안/본안/협의의견 등) 첨부문서 목록 조회                                                                                                                |
+| `eiass_read_document`                          | 첨부 PDF를 다운로드해 텍스트 추출(로컬 캐시 우선)                                                                                                                         |
+| `eiass_check_protected_area_adjacency`         | 단순 주소 문자열 → 지오코딩 → 반경 내 KDPA 보호지역(국립공원/천연기념물/습지보호지역/야생생물보호구역/OECM) 조회. `designations`로 특정 종류만 조회 가능                                                    |
+| `eiass_check_project_protected_area_adjacency` | EIASS 사업지 주소(도로명/지번 복합 표기) 전용 — 여러 후보로 분해해 지오코딩 후 보호구역 인접조회. `confirmed=true` 없이는 미리보기만 반환                                                             |
 | `eiass_find_projects_protected_area_adjacency` | 검색 필터(협의완료일 범위/사업유형 등)로 후보를 뽑은 뒤 각 사업지 주소를 지오코딩해 보호구역 인접까지 한 번에 확인. `confirmed=true` 없이는 검색+공간조회 조건을 합친 확인 문구만 반환. 소규모(~15건) 조회용, `offset`으로 이어서 조회 가능 |
-| `eiass_start_spatial_scan`                | 대량 후보를 타임아웃 없이 끝까지 훑는 백그라운드 공간조회 시작. `confirmed=true`일 때만 실제로 시작하고 즉시 `job_id` 반환                                                              |
-| `eiass_get_spatial_scan_status`           | `job_id`로 공간조회 스캔 진행 상황·중간/최종 결과 조회(스캔 중에도 즉시 응답)                                                                                            |
-| `eiass_cancel_spatial_scan`               | 진행 중인 백그라운드 공간조회 취소(즉시 응답)                                                                                                                  |
-| `eiass_geocode`                           | 주소 → 경위도 좌표                                                                                                                               |
-| `eiass_export_matches_csv`                | 문서 키워드 조사 결과(사업명/eia_cd/원문 파일명/유사내용 페이지번호/변경 내용 요약)를 CSV 파일로 저장 — 스캔한 전체 사업 기준(매칭 없는 사업도 포함)                                                          |
-| `eiass_export_spatial_matches_csv`        | 공간조회(보호구역 인접) 결과(사업명/eia_cd/대상 보호구역/거리)를 CSV 파일로 저장 — 스캔한 전체 사업 기준(반경 밖 사업도 포함)                                                                       |
-| `eiass_check_server_status`               | EIASS 본사이트/검색 API, VWorld 지오코딩 API, KDPA WFS의 접속 가능 여부·상태코드·응답시간 점검                                                                              |
+| `eiass_start_spatial_scan`                     | 대량 후보를 타임아웃 없이 끝까지 훑는 백그라운드 공간조회 시작. `confirmed=true`일 때만 실제로 시작하고 즉시 `job_id` 반환                                                                      |
+| `eiass_get_spatial_scan_status`                | `job_id`로 공간조회 스캔 진행 상황·중간/최종 결과 조회(스캔 중에도 즉시 응답)                                                                                                      |
+| `eiass_cancel_spatial_scan`                    | 진행 중인 백그라운드 공간조회 취소(즉시 응답)                                                                                                                             |
+| `eiass_geocode`                                | 주소 → 경위도 좌표                                                                                                                                            |
+| `eiass_export_matches_csv`                     | 문서 키워드 조사 결과(사업명/eia_cd/원문 파일명/유사내용 페이지번호/변경 내용 요약)를 CSV 파일로 저장 — 스캔한 전체 사업 기준(매칭 없는 사업도 포함)                                                           |
+| `eiass_export_spatial_matches_csv`             | 공간조회(보호구역 인접) 결과(사업명/eia_cd/대상 보호구역/거리)를 CSV 파일로 저장 — 스캔한 전체 사업 기준(반경 밖 사업도 포함)                                                                        |
+| `eiass_check_server_status`                    | EIASS 본사이트/검색 API, VWorld 지오코딩 API, KDPA WFS의 접속 가능 여부·상태코드·응답시간 점검                                                                                    |
 
 ### 스캔 안정성 (v1.8.0)
 
@@ -35,7 +35,7 @@
 - 작업은 최대 2개 worker와 제한된 대기열에서 실행되고, 상태 응답에는 heartbeat·재개 횟수가 포함된다. PDF 추출은 별도 프로세스에서 파일 크기·페이지 수·시간 제한을 적용한다.
 - 문서 텍스트 캐시는 TTL과 총 용량 상한을 적용하며, 협의완료일이 미상이라 날짜 범위에서 제외된 사업은 `date_filter_exclusions`로 확인할 수 있다.
 - Windows CI는 lock된 의존성으로 컴파일·회귀 테스트·클린 EXE 빌드·소스/EXE parity smoke test를 수행한다. 릴리스 실행 파일은 SHA-256 manifest로 검증한다.
-| `eiass_version`                           | 현재 실행 중인 서버(exe)의 버전 반환                                                                                                                    |
+  | `eiass_version`                           | 현재 실행 중인 서버(exe)의 버전 반환                                                                                                                    |
 
 ### 실행 전 확인(confirm) 게이트
 
@@ -53,6 +53,7 @@
 10. 예상 확인 문서 수
 
 추가로:
+
 - AI가 사용자 발화 이상으로 추론/제안해서 좁힌 조건이 있다면 `inference_notes`로 별도 표시(비워두면 "AI가 임의로 좁힌 조건 없음")
 - 과거 유사 조건(같은 평가종류+사업유형) 기록이 있으면 우선순위 힌트로만 표시 — **검색 범위를 줄이는 근거로 쓰지 않으며, 신뢰도(표본 수 기준 low/medium/high)를 함께 표시한다**
 
@@ -90,7 +91,7 @@ EIASS 사업 개요의 사업지 주소는 `경기도 김포시 대곶면 (천�
 **검색 필터로 후보를 새로 뽑아야 하는 공간조회**("최근 6개월 내 협의완료된 도로사업 중 국립공원 5km 이내" 같은 요청)는 `eiass_find_projects_protected_area_adjacency`(소규모, `offset` 이어조회) 또는 `eiass_start_spatial_scan`(백그라운드, 대량)을 쓴다. 이 두 도구는 원문 키워드 검색과 동일한 "실행 전 확인" 원칙을 따른다:
 
 - **실행 전 확인**: `confirmed=true` 없이 호출하면 실제 지오코딩/공간조회를 하지 않고, 아래 10개 항목을 **이 순서 그대로, 하나도 빠짐없이** 담은 확인 문구를 반환한다(문서 키워드 검색의 10개 항목 중 문서조회 전용 3개를 공간조회 전용 3개로 바꾼 구조):
-
+  
   1. 평가종류
   2. 사업유형
   3. 협의기관
@@ -178,6 +179,7 @@ VWORLD_API_KEY=발급받은_키
 **PowerShell이 익숙하지 않다면 `install.bat`을 그냥 더블클릭하면 된다** — 우클릭 메뉴나 실행 정책(ExecutionPolicy) 같은 걸 몰라도 된다. 콘솔 창에서 결과를 보여준 뒤 Enter를 눌러야 닫히므로, 성공/실패 여부를 놓치지 않고 확인할 수 있다.
 
 터미널에서 직접 실행하고 싶다면:
+
 ```
 powershell -ExecutionPolicy Bypass -File install.ps1
 ```
