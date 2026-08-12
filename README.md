@@ -1,278 +1,113 @@
 # EIASS MCP 서버
 
-[EIASS](https://www.eiass.go.kr)(환경영향평가정보지원시스템) 사업 검색·상세조회·협의의견 원문 조회와, VWorld 지오코딩 + KDPA 보호지역 인접 조회를 Claude(AI)가 직접 쓸 수 있도록 MCP(Model Context Protocol) 도구로 제공합니다.
+[EIASS](https://www.eiass.go.kr)(환경영향평가정보지원시스템)의 사업 검색·상세조회·협의의견 원문 조회와, VWorld 지오코딩 + KDPA 보호지역 인접 조회를 Claude 같은 AI가 직접 쓸 수 있도록 MCP(Model Context Protocol) 도구로 제공합니다.
 
-## 제공 도구
+> 이 저장소는 **배포 전용**입니다. 설치 스크립트와 릴리즈만 여기에 있고, 소스 코드는 비공개 저장소에서 관리합니다.
 
-| 도구                                             | 기능                                                                                                                                                     |
-| ---------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| `eiass_search_projects`                        | 사업명/협의완료일 범위/진행상태/진행구분/기후변화영향평가/사업유형 등 필터로 사업 검색                                                                                                       |
-| `eiass_preview_search`                         | 실제 조회 없이 검색조건/문서범위/예상 후보·문서 수/과거 패턴 힌트를 확인 문구로 반환                                                                                                      |
-| `eiass_find_projects_by_document_keyword`      | 필터로 후보를 좁힌 뒤, 지정 단계(기본 초안/본안/보완/협의의견) 원문에서 키워드가 있는 사업만 추려서 반환. `confirmed=true` 없이는 미리보기만 반환(아래 "실행 전 확인" 참고). 소규모(~50건) 조회용, `offset`으로 이어서 조회 가능     |
-| `eiass_start_document_keyword_scan`            | 대량 후보(수백 건)를 타임아웃 없이 끝까지 훑는 백그라운드 스캔 시작. `confirmed=true`일 때만 실제로 시작하고 즉시 `job_id` 반환                                                                  |
-| `eiass_get_scan_status`                        | `job_id`로 스캔 진행 상황·중간/최종 매칭 결과 조회(스캔 중에도 즉시 응답)                                                                                                        |
-| `eiass_cancel_scan`                            | 진행 중인 백그라운드 스캔 취소(즉시 응답)                                                                                                                               |
-| `eiass_get_project_documents`                  | 사업 개요 필드 + 단계별(초안/본안/협의의견 등) 첨부문서 목록 조회                                                                                                                |
-| `eiass_read_document`                          | 첨부 PDF를 다운로드해 텍스트 추출(로컬 캐시 우선)                                                                                                                         |
-| `eiass_check_protected_area_adjacency`         | 단순 주소 문자열 → 지오코딩 → 반경 내 KDPA 보호지역(국립공원/천연기념물/습지보호지역/야생생물보호구역/OECM) 조회. `designations`로 특정 종류만 조회 가능                                                    |
-| `eiass_check_project_protected_area_adjacency` | EIASS 사업지 주소(도로명/지번 복합 표기) 전용 — 여러 후보로 분해해 지오코딩 후 보호구역 인접조회. `confirmed=true` 없이는 미리보기만 반환                                                             |
-| `eiass_find_projects_protected_area_adjacency` | 검색 필터(협의완료일 범위/사업유형 등)로 후보를 뽑은 뒤 각 사업지 주소를 지오코딩해 보호구역 인접까지 한 번에 확인. `confirmed=true` 없이는 검색+공간조회 조건을 합친 확인 문구만 반환. 소규모(~15건) 조회용, `offset`으로 이어서 조회 가능 |
-| `eiass_start_spatial_scan`                     | 대량 후보를 타임아웃 없이 끝까지 훑는 백그라운드 공간조회 시작. `confirmed=true`일 때만 실제로 시작하고 즉시 `job_id` 반환                                                                      |
-| `eiass_get_spatial_scan_status`                | `job_id`로 공간조회 스캔 진행 상황·중간/최종 결과 조회(스캔 중에도 즉시 응답)                                                                                                      |
-| `eiass_cancel_spatial_scan`                    | 진행 중인 백그라운드 공간조회 취소(즉시 응답)                                                                                                                             |
-| `eiass_geocode`                                | 주소 → 경위도 좌표                                                                                                                                            |
-| `eiass_export_matches_csv`                     | 문서 키워드 조사 결과(사업명/eia_cd/원문 파일명/유사내용 페이지번호/변경 내용 요약)를 CSV 파일로 저장 — 스캔한 전체 사업 기준(매칭 없는 사업도 포함)                                                           |
-| `eiass_export_spatial_matches_csv`             | 공간조회(보호구역 인접) 결과(사업명/eia_cd/대상 보호구역/거리)를 CSV 파일로 저장 — 스캔한 전체 사업 기준(반경 밖 사업도 포함)                                                                        |
-| `eiass_check_server_status`                    | EIASS 본사이트/검색 API, VWorld 지오코딩 API, KDPA WFS의 접속 가능 여부·상태코드·응답시간 점검                                                                                    |
+## 설치 (Windows)
 
-### 스캔 안정성 (v1.8.0)
+**[`install.bat`](install.bat) 하나만 받아서 더블클릭하면 끝납니다.** 터미널을 열 필요도, 명령을 칠 필요도, 설치 폴더를 고를 필요도 없습니다. 배포본 다운로드 → VWorld API 키 입력 → AI 클라이언트 등록까지 한 번에 처리합니다.
 
-- 백그라운드 스캔은 시작 시 후보 목록을 한 번만 확정한 뒤 그 스냅샷만 처리한다. 스캔 중 새 사업이 등록돼도 기존 후보가 밀려 누락·중복되지 않는다.
-- EIASS가 동일한 100건 검색 페이지를 반복하면 무한 조회 대신 명시적인 오류로 중단한다.
-- `eiass_get_scan_status`/`eiass_get_spatial_scan_status`는 결과 본문을 기본으로 제외한다. 결과가 필요하면 `include_matches` 또는 `include_results`와 `result_offset`/`result_limit`을 지정한다.
-- KDPA 조회가 일부 실패하거나 200건 제한에 걸리면 `spatial_complete=false`와 오류 정보를 반환한다. 빈 결과를 보호구역 없음으로 단정하지 않는다.
-- 백그라운드 작업은 SQLite에 후보 스냅샷과 후보별 단일 결과를 저장한다. 서버를 재시작해도 중단된 작업은 미처리 후보부터 자동 재개한다.
-- 작업은 최대 2개 worker와 제한된 대기열에서 실행되고, 상태 응답에는 heartbeat·재개 횟수가 포함된다. PDF 추출은 별도 프로세스에서 파일 크기·페이지 수·시간 제한을 적용한다.
-- 문서 텍스트 캐시는 TTL과 총 용량 상한을 적용하며, 협의완료일이 미상이라 날짜 범위에서 제외된 사업은 `date_filter_exclusions`로 확인할 수 있다.
-- Windows CI는 lock된 의존성으로 컴파일·회귀 테스트·클린 EXE 빌드·소스/EXE parity smoke test를 수행한다. 릴리스 실행 파일은 SHA-256 manifest로 검증한다.
-  | `eiass_version`                           | 현재 실행 중인 서버(exe)의 버전 반환                                                                                                                    |
-
-### 실행 전 확인(confirm) 게이트
-
-`eiass_find_projects_by_document_keyword`/`eiass_start_document_keyword_scan`은 **`confirmed=true`를 명시적으로 넘기지 않으면 실제로 문서를 다운로드하지 않는다.** 대신 아래 10개 항목을 **이 순서 그대로, 하나도 빠짐없이** 담은 확인 문구를 반환한다 — 사용자가 언급하지 않은 필터는 항상 `전체`로 표시:
-
-1. 평가종류
-2. 사업유형
-3. 협의기관
-4. 협의완료일
-5. 진행현황(완료/진행중/전체)
-6. 진행구분
-7. 확인 문서 범위
-8. 키워드 매칭
-9. 예상 후보 사업 수
-10. 예상 확인 문서 수
-
-추가로:
-
-- AI가 사용자 발화 이상으로 추론/제안해서 좁힌 조건이 있다면 `inference_notes`로 별도 표시(비워두면 "AI가 임의로 좁힌 조건 없음")
-- 과거 유사 조건(같은 평가종류+사업유형) 기록이 있으면 우선순위 힌트로만 표시 — **검색 범위를 줄이는 근거로 쓰지 않으며, 신뢰도(표본 수 기준 low/medium/high)를 함께 표시한다**
-
-사용자 승인 후 **같은 조건 그대로 `confirmed=true`만 추가**해서 다시 호출해야 실제로 실행된다.
-
-### 조사 결과 보고 형식 — "스캔한 전체" 기준
-
-`eiass_find_projects_by_document_keyword`/`eiass_start_document_keyword_scan`으로 조사를 마치면 AI는 항상:
-
-1. `사업명 | eia_cd | 원문 파일명 | 유사내용 페이지번호 | 변경 내용 요약` 컬럼의 마크다운 표로 결과를 채팅에 보여주고,
-2. 같은 행 데이터를 `eiass_export_matches_csv`로 CSV 파일로도 만들어 저장 경로를 사용자에게 안내한다.
-
-**표/CSV는 매칭된 사업만이 아니라 이번에 스캔한 전체 사업을 대상으로 한다.** 응답에는 `matches`(매칭됨) 외에 `checked_no_match`(문서를 열어봤지만 키워드가 없었던 사업)와 `skipped`(첨부문서가 없거나 조회에 실패한 사업)도 함께 담겨 있으니, 이 셋을 합쳐서 빠짐없이 행에 넣어야 한다. 매칭이 없는 사업은 `원문 파일명`/`유사내용 페이지번호`/`변경 내용 요약`을 `매칭 없음`으로 채운다. `변경 내용 요약`은 매칭된 건에 한해 기계적으로 만들 수 없으므로 `matched_snippets`의 원문 발췌를 근거로 AI가 직접 작성한다(빈 값 금지). CSV는 기본적으로 사용자 Downloads 폴더에 `utf-8-sig`(엑셀 호환)로 저장된다.
-
-### 사업지 주소 지오코딩 (도로명·지번 복합 표기 대응)
-
-EIASS 사업 개요의 사업지 주소는 `경기도 김포시 대곶면 (천호로 210) 대벽리 662-1번지`처럼 도로명과 지번이 괄호로 섞인 복합 문자열인 경우가 많다. `eiass_geocode`/`eiass_check_protected_area_adjacency`는 입력 문자열을 그대로만 조회하므로 이런 복합 표기에서 지오코딩이 실패하기 쉽다.
-
-`eiass_check_project_protected_area_adjacency`는 이 문제를 위해 사업지 주소를 아래 순서로 여러 후보로 분해해 순서대로 지오코딩을 시도한다(성공한 후보에서 멈춤):
-
-1. 원문 그대로
-2. 개행/중복 공백만 정리한 원문
-3. 괄호 안 도로명 + 앞쪽 행정구역 접두어 (예: `경기도 김포시 대곶면 천호로 210`)
-4. 괄호를 제거한 지번 표기 (예: `경기도 김포시 대곶면 대벽리 662-1번지`)
-5. **최후 대체**: 위 후보가 모두 실패했을 때만 읍/면/동 단위 행정구역 (예: `경기도 김포시 대곶면`)
-
-응답의 `location_precision`(raw/normalized/road_address/parcel_address/admin_fallback)과 `fallback_used`로 "사업지 주소 기준 거리"인지 "읍면동 대체 거리"인지 구분할 수 있다. `attempts`에는 시도별 HTTP 상태·에러·매칭 여부가 남아 실패 원인을 진단할 수 있다.
-
-### 보호구역 종류 필터 (조회 속도)
-
-`eiass_check_protected_area_adjacency`/`eiass_check_project_protected_area_adjacency`의 `designations` 인자로 확인할 보호구역 종류를 좁힐 수 있다(콤마 구분, 예: `"천연기념물"`). 비우면 기존처럼 국립공원/천연기념물/습지보호지역/야생생물보호구역/OECM/최신 보호지역 전체 6개 레이어를 모두 조회한다 — 필요한 종류를 미리 알고 있으면 지정해서 불필요한 왕복 요청과 대기 시간을 줄일 수 있다. KDPA 최신 버전 조회(`/getNewVer`)는 5분 TTL로 캐시되어, 같은 세션에서 여러 사업을 연달아 조회해도 매번 다시 부르지 않는다. 서버측 `DWITHIN` 필터는 근사치라 경계 케이스에서 반경을 살짝 넘는 결과가 섞일 수 있어, 폴리곤 경계까지 재계산한 거리 기준으로 반경 초과 결과는 후처리로 제외한다.
-
-### 공간조회(보호구역 인접) — 확인 게이트 + 보고 형식
-
-**검색 필터로 후보를 새로 뽑아야 하는 공간조회**("최근 6개월 내 협의완료된 도로사업 중 국립공원 5km 이내" 같은 요청)는 `eiass_find_projects_protected_area_adjacency`(소규모, `offset` 이어조회) 또는 `eiass_start_spatial_scan`(백그라운드, 대량)을 쓴다. 이 두 도구는 원문 키워드 검색과 동일한 "실행 전 확인" 원칙을 따른다:
-
-- **실행 전 확인**: `confirmed=true` 없이 호출하면 실제 지오코딩/공간조회를 하지 않고, 아래 10개 항목을 **이 순서 그대로, 하나도 빠짐없이** 담은 확인 문구를 반환한다(문서 키워드 검색의 10개 항목 중 문서조회 전용 3개를 공간조회 전용 3개로 바꾼 구조):
-  
-  1. 평가종류
-  2. 사업유형
-  3. 협의기관
-  4. 협의완료일
-  5. 진행현황
-  6. 진행구분
-  7. 대상 보호구역 *(문서검색의 "확인 문서 범위" 대체)*
-  8. 반경 *(문서검색의 "키워드 매칭" 대체)*
-  9. 기준 위치 *(문서검색의 "예상 확인 문서 수" 대체 — EIASS 사업지 주소 기준, 지오코딩 실패 시에만 읍/면/동 대체)*
-  10. 예상 후보 사업 수
-
-- **보고 형식**: 결과는 스캔한 사업 **전체**(`scanned`)를 기준으로 한다 — 반경 이내 매칭(`matches`)만 추리지 않는다. `사업명 | eia_cd | 대상 보호구역 | 거리` 컬럼의 마크다운 표에 반경 밖이거나 지오코딩에 실패한 사업(`geocode_failures`)도 포함하고, 그 경우 대상 보호구역/거리는 `해당 없음`으로 채운다. 같은 행 데이터를 `eiass_export_spatial_matches_csv`로 CSV 파일로도 만들어 경로를 안내한다(문서 키워드 조사용 `eiass_export_matches_csv`와 컬럼이 다르다).
-
-**사업(들)을 이미 알고 있을 때**(예: 사업지 주소 하나만 확인)는 `eiass_check_project_protected_area_adjacency`를 쓴다 — 검색 필터가 없다는 점만 빼면 확인 게이트/보고 형식 원칙은 동일하다.
-
-### 오탐(참고문헌/부록) 감지와 대응
-
-실행 결과에는 `needs_refinement`(매칭이 과도하거나 참고문헌/부록 문맥으로 보이는 비율이 높으면 true)와 `refinement_hint`가 포함된다. true면 바로 최종 답을 내지 말고 사용자에게 문맥 조건 추가 여부를 물어봐야 한다. 각 `matched_snippets` 항목에도 `reference_like` 플래그가 있어 개별 매칭이 본문인지 참고문헌류인지 구분할 수 있다.
-
-### 범위 밖 표본 검증 (scan scope audit)
-
-`audit_sample_size`(기본 0)를 지정하면, 요청한 stages 밖의 다른 단계도 이번 배치 중 일부를 표본 검증해 `audit_sample`로 함께 반환한다. 좁힌 범위 밖에서도 매칭이 있을 수 있다는 걸 알려주는 안전장치이며, 전수조사가 아니므로 "매칭 없음"이 "확실히 없음"을 뜻하지는 않는다.
-
-### 진행구분 다중선택 필터
-
-`progress_stage`로 사업 자체의 진행구분(첨부문서 stage와는 다른 축)을 다중선택할 수 있다. 사용 가능 라벨: `초안`, `평가서`, `재협의`, `약식평가`, `변경협의`(콤마로 여러 개 지정, 예: `"초안,재협의"`). 비우면 원본 앱 기본값과 동일하게 5개 전부 선택된 것으로 취급한다(=전체, 필터 없음). 알 수 없는 라벨을 넣으면 사용 가능한 라벨 목록과 함께 에러를 반환한다. `eiass_search_projects`/`eiass_preview_search`/`eiass_find_projects_by_document_keyword`/`eiass_start_document_keyword_scan` 모두에 적용된다.
-
-### 문서 제목(항목) 필터
-
-`stages`가 문서 단계(초안/본안/협의의견 등)를 고르는 것과 별개로, `doc_title_contains`로 그 단계 안에서도 **파일명에 특정 단어가 포함된 문서만** 확인 대상으로 좁힐 수 있다. 초안/본안/보완 등은 챕터별로 PDF가 쪼개져 있고 파일명에 챕터명이 그대로 들어있다(예: `(본안) 0922 대기질(사업명).pdf`). "모든 단계의 대기질 항목만 확인"처럼 요청하면 `stages="초안,본안,보완"` + `doc_title_contains="대기질,기상"`으로 처리한다 — 실측 사례에서 예상 확인 문서 수가 758건 → 46건으로 줄었다.
-
-단순 파일명 문자열 매칭(대소문자 무시)이라 "대기질 항목"을 의미 단위로 이해하는 건 아니다. 실제 챕터 파일명 표기와 다른 용어를 쓰면 관련 문서를 놓칠 수 있으므로, `eiass_preview_search`의 `estimated_documents`가 기대와 다르면 용어를 조정해서 다시 미리보기 하는 것을 권장한다. `audit_sample_size`와 함께 쓰면 stages/제목 필터로 좁힌 범위 밖도 일부 표본 검증할 수 있다.
-
-### 대량 문서 키워드 검색이 빨라진 이유
-
-첨부 PDF를 file_seq 기준으로 로컬 SQLite에 캐시하고(`%LOCALAPPDATA%\DOHWA EIASS Agent\doc_text_cache.sqlite3`), 사업 상세조회 결과도 서버 프로세스가 살아있는 동안 메모리에 캐시한다. 그래서:
-
-- `text_queries="CALPUFF,CMAQ"`처럼 **여러 키워드를 한 번에** 넘기면 문서를 한 번만 열어서 전부 확인한다(키워드 수만큼 반복 다운로드하지 않음).
-- 같은 후보군을 **다른 키워드로 다시 조회**하거나 `offset`으로 **이어서 조회**해도 이미 받은 문서는 재다운로드하지 않는다 (실측: 같은 배치를 다른 키워드로 재조회 시 5초대 → 0.3초대).
-- 후보가 많아 한 번의 호출로는 끝낼 수 없을 때는 `eiass_start_document_keyword_scan`으로 백그라운드에 맡기고 `eiass_get_scan_status`로 폴링하면, MCP 호출 하나의 타임아웃과 무관하게 끝까지 진행된다.
-- 같은 (평가종류+사업유형) 조합으로 실제 실행된 검색은 단계별 확인/매칭 건수가 로컬 패턴 캐시에 누적되어, 다음 유사 요청의 `eiass_preview_search`에서 우선순위 힌트로 쓰인다(범위 축소 근거로는 쓰이지 않음).
-
-## 설치 — 방법 1: exe로 실행 (Python 설치 불필요, 추천)
-
-**[`install.bat`](install.bat) 하나만 받아서 더블클릭하면 끝난다.** 터미널을 열 필요도, 명령을 칠 필요도, 설치 폴더를 고를 필요도 없다. 이 파일이 최신 설치 스크립트를 웹에서 받아 실행하면서 배포본 다운로드 → VWorld API 키 입력(`.env` 생성) → Claude/Codex 등록까지 처리한다.
-
-터미널을 쓰는 게 편하다면 아래 한 줄도 같은 일을 한다:
+터미널이 편하시면 아래 한 줄도 같은 일을 합니다:
 
 ```powershell
 irm https://raw.githubusercontent.com/M-SungJoon/eiass-mcp/main/install.ps1 | iex
 ```
 
-설치 위치는 **`%LOCALAPPDATA%\Programs\EIASS MCP`로 고정**된다:
+설치 위치는 `%LOCALAPPDATA%\Programs\EIASS MCP`로 고정됩니다. 경로가 고정돼 있어 업데이트해도 재등록이 필요 없습니다.
 
 ```
 C:\Users\<사용자>\AppData\Local\Programs\EIASS MCP\
-  .env                     ← VWorld API 키. 업데이트해도 유지된다.
-  .eiass_mcp_version
+  .env                     ← VWorld API 키. 업데이트해도 유지됩니다.
   EIASS MCP 업데이트.bat   ← 다음 업데이트 때 더블클릭
-  mcp_server\              ← 배포본. 업데이트 때 이 폴더만 통째로 교체된다.
-    mcp_server.exe
-    _internal\...
+  mcp_server\              ← 배포본. 업데이트 때 이 폴더만 통째로 교체됩니다.
 ```
 
-경로를 고정하는 이유는 세 가지다. (1) `irm | iex`로 실행하면 스크립트가 디스크에 없어 `$PSScriptRoot`가 비므로, 예전처럼 "스크립트가 있는 폴더"를 설치 위치로 삼을 수 없다. (2) 등록 경로가 영구히 고정돼 업데이트해도 재등록이 필요 없다 — 특히 Claude Desktop은 설정 JSON에 경로를 직접 적어야 해서 경로가 바뀌면 사용자가 매번 손봐야 한다. (3) 사용자가 폴더를 고르지 않아도 된다.
+### VWorld API 키
 
-`.env`를 직접 만들 거라면 `mcp_server` 폴더 **안이 아니라 그 위(설치 폴더)에** 두어야 한다 — 업데이트가 `mcp_server` 폴더를 통째로 갈아끼우기 때문이다. 내용은 아래와 같다([VWorld 오픈API](https://www.vworld.kr/dev/v4api.do)에서 무료 발급):
+보호구역 인접 조회(지오코딩)에 필요합니다. [VWorld 오픈API](https://www.vworld.kr/dev/v4api.do)에서 무료로 발급받을 수 있고, 설치 중에 물어보므로 붙여넣기만 하면 됩니다.
+
+직접 만들려면 `mcp_server` 폴더 **안이 아니라 그 위(설치 폴더)에** `.env`를 두세요 — 업데이트가 `mcp_server` 폴더를 통째로 갈아끼우기 때문입니다.
 
 ```
 VWORLD_API_KEY=발급받은_키
 ```
 
-### 이미 예전 방식으로 설치한 경우
+### 지원 클라이언트
 
-`install.bat`을 한 번 실행하면 **자동으로 이주된다** — 기존 등록에서 예전 설치 위치를 찾아 **VWorld API 키(.env)를 새 위치로 옮기고**, 배포본을 새 위치에 깔고, Claude/Codex 등록을 갱신하고, 예전 배포본을 정리한다. 예전 폴더에 사용자가 넣어둔 다른 파일은 건드리지 않는다. 키를 다시 발급받거나 입력할 필요는 없다.
+Claude Code, Claude Desktop, Codex CLI, Antigravity에 자동 등록됩니다. 설치 후 해당 앱을 재시작하면 `eiass_*` 도구를 바로 쓸 수 있습니다.
 
-> **왜 한 번은 수동으로 실행해야 하나**: 사용자 PC에 있는 예전 `install.ps1`은 자기 자신을 갱신하지 않아서, 새 배포 방식(릴리스 자산)을 알지 못한다. 그래서 첫 이주만 사람이 시작해야 한다. 이번 전환 이후로는 `install.bat`이 실행할 때마다 웹에서 최신 스크립트를 가져오므로, 설치 로직이 고쳐지면 자동으로 반영된다.
+### 이미 예전 방식으로 설치했다면
 
-> **v1.9.0 이하에서 올라오는 경우**: 예전에는 `mcp_server.exe` 단일 파일을 배포했다(PyInstaller `--onefile`). onefile은 **실행할 때마다 exe 전체를 `%TEMP%\_MEIxxxxxx`에 풀고 정상 종료할 때만 지우는데**, MCP 서버는 클라이언트가 끝낼 때 강제 종료되는 일이 잦아 이 폴더가 무한정 쌓였다(실측: 개발 PC에 280개 20.7GB 잔류). v1.10.0부터 `--onedir` 폴더 배포로 바꿔 추출 단계 자체를 없앴고, 설치할 때 그 잔재도 자동으로 청소한다(실측 40초에 18.8GB 회수).
+`install.bat`을 한 번 실행하면 자동으로 이주됩니다. VWorld API 키를 새 위치로 옮기고, 등록을 갱신하고, 예전 배포본을 정리합니다. 키를 다시 발급받을 필요는 없습니다.
 
-## 자동 등록 + 업데이트 (Claude Code + Codex CLI)
+## 업데이트
 
-`claude`, `codex` CLI가 PC에 설치되어 있으면 아래 스크립트가 둘 다 자동으로 등록해준다(찾지 못한 CLI는 건너뛴다). VWorld API 키도 대화형으로 물어봐서 `.env`까지 만들어준다.
+설치 폴더의 **`EIASS MCP 업데이트.bat`을 더블클릭**하면 됩니다(처음 받은 `install.bat`을 다시 실행해도 같습니다). 최신 릴리즈를 확인해 다르면 내려받아 검증한 뒤 교체합니다.
 
-**PowerShell이 익숙하지 않다면 `install.bat`을 그냥 더블클릭하면 된다** — 우클릭 메뉴나 실행 정책(ExecutionPolicy) 같은 걸 몰라도 된다. 콘솔 창에서 결과를 보여준 뒤 Enter를 눌러야 닫히므로, 성공/실패 여부를 놓치지 않고 확인할 수 있다.
+v2.0.0부터는 **서버가 스스로 알려줍니다.** 구버전이면 도구를 실행하기 전에 멈추고 업데이트 여부를 먼저 물어봅니다. "나중에 하겠다"고 답하면 원래 요청한 작업을 그대로 이어서 진행하고, 그날은 다시 묻지 않습니다.
 
-터미널에서 직접 실행하고 싶다면:
+AI 클라이언트가 실행 중이라 파일이 잠겨 있으면 교체를 건너뛰고 기존 버전으로 계속 진행하니, 안내가 뜨면 앱을 완전히 종료한 뒤 다시 실행하세요.
 
-```
-powershell -ExecutionPolicy Bypass -File install.ps1
-```
+## 제공 도구
 
-실행 후 Claude Code/Codex를 재시작하면 `eiass_*` 도구를 바로 쓸 수 있다. **Claude Desktop도 자동으로 등록된다** — `claude_desktop_config.json`을 직접 수정할 필요가 없다.
+| 도구                                             | 기능                                                                                        |
+| ---------------------------------------------- | ------------------------------------------------------------------------------------------- |
+| `eiass_search_projects`                        | 사업명/협의완료일 범위/진행상태/진행구분/기후변화영향평가/사업유형 등 필터로 사업 검색                 |
+| `eiass_preview_search`                         | 실제 조회 없이 검색조건·문서범위·예상 후보/문서 수를 확인 문구로 반환                          |
+| `eiass_find_projects_by_document_keyword`      | 후보를 좁힌 뒤 보고서 원문에서 키워드가 있는 사업만 추려서 반환 (소규모 ~50건)                 |
+| `eiass_start_document_keyword_scan`            | 대량 후보(수백 건)를 타임아웃 없이 끝까지 훑는 백그라운드 스캔 시작                            |
+| `eiass_get_scan_status` / `eiass_cancel_scan`  | 스캔 진행 상황·중간/최종 결과 조회, 진행 중인 스캔 취소                                       |
+| `eiass_get_project_documents`                  | 사업 개요 + 단계별(초안/본안/협의의견 등) 첨부문서 목록 조회                                   |
+| `eiass_read_document`                          | 첨부 PDF를 다운로드해 텍스트 추출                                                              |
+| `eiass_check_protected_area_adjacency`         | 주소 → 지오코딩 → 반경 내 보호지역(국립공원/천연기념물/습지보호지역/야생생물보호구역/OECM) 조회 |
+| `eiass_check_project_protected_area_adjacency` | EIASS 사업지 주소(도로명·지번 복합 표기) 전용 보호구역 인접조회                                 |
+| `eiass_find_projects_protected_area_adjacency` | 검색 필터로 후보를 뽑은 뒤 사업지별 보호구역 인접까지 한 번에 확인                             |
+| `eiass_start_spatial_scan`                     | 대량 후보의 보호구역 인접조회를 백그라운드로 실행                                              |
+| `eiass_geocode`                                | 주소 → 경위도 좌표                                                                             |
+| `eiass_export_matches_csv`                     | 문서 키워드 조사 결과를 CSV로 저장 (스캔한 전체 사업 기준)                                      |
+| `eiass_export_spatial_matches_csv`             | 보호구역 인접 조회 결과를 CSV로 저장 (반경 밖 사업도 포함)                                      |
+| `eiass_check_server_status`                    | EIASS·VWorld·KDPA 각 서비스의 접속 가능 여부·응답시간 점검                                     |
+| `eiass_version`                                | 설치된 버전과 배포된 최신/안정 버전 확인                                                       |
 
-Desktop 설정 파일에는 `mcpServers` 말고 앱이 관리하는 상태(`preferences` 등)도 들어 있어서, 다음 순서로 안전하게 처리한다: 백업 → `eiass` 항목만 추가/교체 → 다시 읽어서 **최상위 키와 기존 MCP 서버가 모두 살아있는지 검증** → 하나라도 어긋나면 백업으로 되돌리고 수동 안내로 전환. 파일이 손상돼 파싱조차 안 되면 아예 건드리지 않는다.
+## 쓰기 전에 알아두면 좋은 것
 
-이 과정에는 Windows PowerShell 5.1의 함정이 두 개 있어서 그렇게 짜여 있다. (1) `Get-Content -Raw`는 UTF-8 파일을 시스템 ANSI 코드페이지로 디코딩해 한글을 깨뜨리고, 그 깨진 문자열은 JSON 파싱에 실패한다(실측: 6,326바이트 파일이 5,954자로 읽혀 실패, 올바르게 읽으면 5,846자). 그래서 `[System.IO.File]::ReadAllText(..., UTF8)`로 읽는다. (2) `ConvertTo-Json`의 기본 깊이는 **2**라서, 깊이 6인 이 파일을 그냥 저장하면 하위 구조가 `System.Object[]` 문자열로 뭉개진다. 그래서 `-Depth 100`을 명시하고, 직렬화 결과에 손상 흔적이 있으면 저장하지 않는다.
+### 실행 전 확인 절차
 
-Claude Desktop이 실행 중이면 종료할 때 앱이 설정을 다시 쓰면서 방금 넣은 등록을 덮어쓸 수 있다. 그래서 실행 중이면 안내를 띄우고, 그런 일이 생겨도 설치를 한 번 더 실행하면 복구된다.
+대량 문서를 내려받는 도구는 **사용자 승인 없이 실행되지 않습니다.** 먼저 적용될 검색 조건을 전부 나열한 확인 문구를 보여주고, 승인해야 실제로 조회합니다.
 
-**git 없이도 최신 버전으로 갱신된다.** 설치 폴더에 생긴 **`EIASS MCP 업데이트.bat`을 더블클릭**하면 된다(처음 받은 `install.bat`을 다시 실행해도 똑같다). GitHub Releases API로 최신 릴리스를 확인해 `.eiass_mcp_version`에 기록된 태그와 비교하고, 다르면 릴리스 자산을 받아 SHA-256을 검증한 뒤 `mcp_server` 폴더를 통째로 교체한다 — git clone이나 pull이 전혀 필요 없다. 저장소를 push해도 각 사용자 PC에 자동 반영되지는 않으므로 **업데이트를 받으려면 이 파일을 다시 실행해야 한다**(완전 자동 업데이트는 아님).
-
-Claude Code/Codex가 실행 중이라 파일이 잠겨 있으면 교체를 건너뛰고 기존 배포본으로 계속 진행하니(새 배포본은 검증까지 끝난 뒤에만 갈아끼우므로 실패해도 쓰던 버전이 그대로 남는다), 안내 메시지가 뜨면 앱을 완전히 종료한 뒤 다시 실행한다. 업데이트 확인을 건너뛰려면 `-SkipUpdateCheck` 옵션을 준다.
-
-**배포본은 저장소에 커밋하지 않고 [GitHub Releases](https://github.com/M-SungJoon/eiass-mcp/releases) 자산으로 올린다.** 41MB 바이너리를 커밋하면 git 히스토리에 영구히 쌓여(실측: 22회 커밋으로 `.git` 907MB) clone이 갈수록 무거워지기 때문이다. 릴리스를 발행하려면 빌드할 때 `--publish-release`를 준다:
-
-```
-.mcpbuild_venv\Scripts\python.exe build_mcp.py --publish-release
-```
-
-**임시파일은 사용자가 관리할 필요가 없다.** onedir 배포라 실행 중에 임시파일이 생기지 않고(v1.9.0 이하에서 쌓이던 `%TEMP%\_MEI*` 폴더가 없어졌다), 서버는 기동할 때마다 예전 버전이 남긴 고아 `_MEI` 폴더를 백그라운드로 청소한다. 청소는 **삭제 전에 폴더 이름을 바꿔보는 방식**으로 안전을 확보한다 — Windows는 안에 열린 파일이 하나라도 있으면 폴더 rename을 거부하므로, rename 성공 자체가 "이 폴더를 쓰는 프로세스가 없다"는 증거가 된다. 실행 중인 서버의 폴더는 rename이 실패해 자동으로 건너뛴다(수정 시각으로 판정하면 며칠씩 떠 있는 서버의 폴더를 지워버리는데, 실제로 2주 넘게 떠 있는 인스턴스가 있었다).
-
-### 버전 확인
-
-커밋 ID만으로는 어느 게 더 최신인지 한눈에 알기 어려워서, 저장소 루트에 사람이 읽는 [`VERSION`](VERSION) 파일(예: `1.1.0`, [시맨틱 버저닝](https://semver.org/lang/ko/))을 둔다. `install.ps1`/`install.bat`을 실행하면 매번 (SkipUpdateCheck 여부와 무관하게) 아래 두 줄을 항상 보여준다:
-
-```
-현재 설치된 버전: 1.1.0 (commit ff4a6a6)
-Git에 푸시된 최신 버전: 1.1.0 (commit ff4a6a6)
-```
-
-업데이트 필요 여부 자체는 지금까지처럼 `mcp_server.exe`의 커밋 SHA로 정확히 판단하고, `VERSION`은 그 결과를 사람이 읽기 좋게 보여주는 용도다. 로컬 상태는 `.eiass_mcp_version` 파일에 `커밋 SHA` / `버전` 두 줄로 저장된다. Claude 안에서 직접 확인하고 싶으면 `eiass_version` 도구로 현재 연결된 서버(exe)의 버전을 물어볼 수 있다.
-
-**exe/소스를 수정해서 새로 배포할 때는 반드시 `VERSION` 파일과 `eiass_core.py`의 `__version__` 상수를 같이 올린다**(시맨틱 버저닝: 기존 도구의 동작이 바뀌지 않는 자잘한 수정=PATCH, 새 도구/필드 추가처럼 하위 호환되는 기능 추가=MINOR, 기존 도구 시그니처/동작이 깨지는 변경=MAJOR).
-
-## 설치 — 방법 2: Python으로 실행
-
-1. Python 3.10 이상 설치
-2. 이 저장소를 clone하거나 zip으로 받는다
-3. `pip install -r requirements.txt`
-4. 같은 폴더에 `.env` 파일을 만들고 `VWORLD_API_KEY=...` 추가
-5. Claude 설정에 등록 (아래 참고)
-
-## Claude에 등록하기
-
-### Claude Code
-
-프로젝트 루트에 `.mcp.json`을 만든다 (exe 방식 예시):
-
-```json
-{
-  "mcpServers": {
-    "eiass": {
-      "command": "C:/Tools/eiass-mcp/mcp_server.exe"
-    }
-  }
-}
-```
-
-Python 방식이면:
-
-```json
-{
-  "mcpServers": {
-    "eiass": {
-      "command": "python",
-      "args": ["mcp_server.py"],
-      "cwd": "C:/Tools/eiass-mcp"
-    }
-  }
-}
-```
-
-Claude Code를 재시작하면 "eiass" 서버 신뢰 여부를 물어본다 → 승인.
-
-### Claude Desktop
-
-`%APPDATA%\Claude\claude_desktop_config.json`에 위와 동일한 형식으로 `mcpServers` 항목을 추가하고 Claude Desktop을 재시작한다.
-
-## 직접 빌드하기
-
-`eiass_core.py`/`mcp_server.py`를 수정한 뒤 exe를 새로 만들려면, **반드시 이 저장소 전용의 깨끗한 venv**에서 빌드해야 한다(시스템 Python에 다른 프로젝트용 패키지가 잔뜩 깔려 있으면 PyInstaller가 그것들까지 끌고 들어가 exe가 수백MB로 부풀고 느려진다):
+이때 AI가 사용자가 말하지 않은 조건을 임의로 좁혔다면 그 항목에 `← AI 추론` 표시가 붙고, 이유가 따로 표시됩니다. 의도한 조건이 아니면 승인하지 말고 알려주시면 됩니다.
 
 ```
-python -m venv .mcpbuild_venv
-.mcpbuild_venv\Scripts\pip install -r requirements-build.txt
-.mcpbuild_venv\Scripts\python build_mcp.py
+적용 조건:
+- 사업명 키워드: 전체
+- 평가종류: 환경영향평가   ← AI 추론
+
+⚠️ 아래 조건은 사용자가 직접 말하지 않아 AI가 추론한 것입니다:
+- 평가종류: 환경영향평가
+
+추론 이유: 사용자는 '산업단지 사례'라고만 했음
 ```
 
-## 참고
+### 조사 결과는 "스캔한 전체" 기준
 
-- EIASS/KDPA는 정부 사이트 인증서 문제로 SSL 검증을 끄고 접속한다(원본 데스크톱 앱과 동일).
-- `eiass_find_projects_by_document_keyword`의 텍스트 검색은 단순 부분문자열 매칭이다. 동의어/문맥 유사도까지 필요하면 1차 후보를 좁힌 뒤 `eiass_read_document`로 원문을 받아 AI가 다시 판단해야 한다.
-- 이 저장소는 DOHWA EIASS agent 데스크톱 앱의 검색/조회 로직 일부를 PyQt 의존성 없이 재구현한 것이다.
+결과 표에는 키워드가 발견된 사업만이 아니라 **이번에 확인한 모든 사업**이 들어갑니다. 문서를 열어봤지만 키워드가 없던 사업, 첨부문서가 없어 건너뛴 사업도 함께 표시되므로, 조사 범위를 그대로 확인할 수 있습니다.
+
+### 무료 플랜 사용자용 경량 모드
+
+MCP 도구 정의는 대화마다 통째로 AI 컨텍스트에 실립니다. 무료 플랜은 한도가 빡빡해 이것만으로도 버거울 수 있어, 도구 수와 응답 크기를 줄인 경량 모드를 제공합니다. 설치 폴더의 `.env`에 아래를 추가하고 클라이언트를 재시작하세요.
+
+```
+EIASS_PROFILE=lite
+```
+
+## 문제가 생기면
+
+- **도구가 안 보임**: 설치 후 AI 클라이언트를 완전히 종료했다가 다시 켜세요.
+- **보호구역 조회만 실패**: VWorld API 키가 없거나 잘못된 경우입니다. 설치 폴더의 `.env`를 확인하세요.
+- **검색이 전부 실패**: `eiass_check_server_status`로 EIASS 사이트 자체의 장애 여부를 확인할 수 있습니다.
+- **업데이트 안내를 끄고 싶음**: 외부 통신이 막힌 환경이라면 `.env`에 `EIASS_UPDATE_CHECK=0`을 추가하세요.
+
+## 라이선스·문의
+
+[Issues](https://github.com/M-SungJoon/eiass-mcp/issues)로 문의해 주세요. 버전별 변경 내용은 [Releases](https://github.com/M-SungJoon/eiass-mcp/releases)에서 확인할 수 있습니다.
