@@ -1,6 +1,6 @@
 ﻿# EIASS MCP 자동 설치 스크립트
 # 사용법: 'EIASS MCP 설치.bat'을 더블클릭한다(사용자는 이것만 하면 된다).
-#   터미널에서 직접 돌리려면: irm https://raw.githubusercontent.com/M-SungJoon/eiass-mcp/main/install.ps1 | iex
+#   터미널에서 직접 돌리려면: iex ((irm https://raw.githubusercontent.com/M-SungJoon/eiass-mcp/main/install.ps1).TrimStart([char]0xFEFF))
 # Claude Code / Claude Desktop / Codex CLI 중 이 PC에 설치된 것을 찾아 자동으로 eiass MCP 서버를 등록한다.
 # 성공하든 실패하든 마지막에 Enter를 눌러야 창이 닫힌다(더블클릭 실행 시 결과를 볼 수 있도록).
 #
