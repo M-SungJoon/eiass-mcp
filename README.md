@@ -11,7 +11,7 @@
 터미널이 편하시면 아래 한 줄도 같은 일을 합니다:
 
 ```powershell
-irm https://raw.githubusercontent.com/M-SungJoon/eiass-mcp/main/install.ps1 | iex
+iex ((irm https://raw.githubusercontent.com/M-SungJoon/eiass-mcp/main/install.ps1).TrimStart([char]0xFEFF))
 ```
 
 설치 위치는 `%LOCALAPPDATA%\Programs\EIASS MCP`로 고정됩니다. 경로가 고정돼 있어 업데이트해도 재등록이 필요 없습니다.
