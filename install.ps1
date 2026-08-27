@@ -501,6 +501,75 @@ function Test-InteractiveConsole {
     return ([Environment]::UserInteractive -and -not ([Console]::IsInputRedirected))
 }
 
+function Get-RunningServerProcess {
+    <#
+      설치 폴더 안에서 실행 중인 MCP 서버를 찾는다.
+
+      Windows는 실행 중인 프로세스에 매핑된 exe와 DLL을 잠근다. AI 클라이언트(Claude
+      Desktop/Codex)는 mcp_server.exe를 자식 프로세스로 띄워두므로, 클라이언트가 살아 있는
+      한 mcp_server 폴더 전체가 잠겨 교체가 막힌다. 잠근 주체는 클라이언트 본체가 아니라
+      이 exe 하나뿐이라, 이것만 정확히 종료하면 클라이언트를 끄지 않아도 교체할 수 있다.
+
+      이름만으로 고르면 안 된다 — 다른 경로에 설치된 별개의 mcp_server.exe(개발용 빌드 등)를
+      같이 죽이게 된다. 반드시 지금 교체하려는 폴더 밑에서 돌아가는 것만 고른다.
+    #>
+    param([string]$AppDir)
+    $found = @()
+    if (-not $AppDir) { return $found }
+    $prefix = [System.IO.Path]::GetFullPath($AppDir).TrimEnd('') + ''
+    foreach ($proc in @(Get-Process -Name "mcp_server" -ErrorAction SilentlyContinue)) {
+        # 다른 사용자 소유 프로세스는 Path를 읽을 때 예외가 난다. 그건 우리가 건드릴 대상이 아니다.
+        $path = $null
+        try { $path = $proc.Path } catch { continue }
+        if ($path -and $path.StartsWith($prefix, [StringComparison]::OrdinalIgnoreCase)) {
+            $found += $proc
+        }
+    }
+    return $found
+}
+
+function Stop-RunningServerProcess {
+    <#
+      교체를 막고 있는 서버를 종료한다. 성공하면 $true.
+
+      새 버전은 어차피 AI 클라이언트를 재시작해야 적용되므로, 여기서 서버를 끊는다고 사용자가
+      추가로 잃는 것은 없다. 다만 백그라운드 조사(문서 키워드 스캔 등)가 돌고 있으면 그건
+      끊기므로, 묻지 않고 죽이지는 않는다.
+    #>
+    param($Processes)
+    if (-not $Processes -or @($Processes).Count -eq 0) { return $true }
+    $pids = (@($Processes) | ForEach-Object { $_.Id }) -join ', '
+    Write-Host ""
+    Write-Host "⚠ EIASS MCP 서버가 실행 중입니다 (PID: $pids)."
+    Write-Host "   Windows가 실행 중인 파일을 잠그기 때문에 이 상태로는 배포본을 교체할 수 없습니다."
+    Write-Host "   종료해도 손해는 없습니다 — 새 버전은 어차피 AI 클라이언트를 재시작해야 적용됩니다."
+    Write-Host "   다만 진행 중인 백그라운드 조사가 있다면 중단됩니다."
+    if (Test-InteractiveConsole) {
+        $answer = (Read-Host "   서버를 종료하고 계속할까요? (Y/n, 기본 Y)").Trim()
+        if ($answer -and $answer -notmatch '^(y|yes)$') {
+            Write-Host "   종료하지 않았습니다 — 기존 버전을 그대로 둡니다."
+            return $false
+        }
+    } else {
+        Write-Host "   비대화식 실행이라 자동으로 종료합니다."
+    }
+    foreach ($proc in @($Processes)) {
+        try { $proc.Kill() } catch { }
+    }
+    # 잠금은 종료를 "요청"한 시점이 아니라 프로세스가 실제로 사라진 뒤에 풀린다. 기다리지 않고
+    # 곧바로 rename하면 방금 죽인 프로세스 때문에 여전히 막힌다.
+    foreach ($proc in @($Processes)) {
+        try { $null = $proc.WaitForExit(10000) } catch { }
+    }
+    $still = @(@($Processes) | Where-Object { -not $_.HasExited })
+    if ($still.Count -gt 0) {
+        Write-Host "   ❌ 서버가 종료되지 않았습니다 (PID: $((@($still) | ForEach-Object { $_.Id }) -join ', '))."
+        return $false
+    }
+    Write-Host "   서버를 종료했습니다. 교체를 계속합니다."
+    return $true
+}
+
 function Normalize-ReleaseTag {
     param([string]$VersionOrTag)
     if (-not $VersionOrTag) { return $null }
@@ -907,14 +976,32 @@ try {
                     # 일부 파일이 잠겨 있으면 옮길 수 있는 것만 옮기고 멈춰 설치본을 반쯤 부순다
                     # (실제로 exe만 빠져나가고 _internal만 남아 MCP가 통째로 죽었다).
                     # Directory.Move는 진짜 rename이라 막히면 아무것도 건드리지 않고 예외를 던진다.
+                    $lockedMessage = ("기존 배포본이 사용 중이라 교체할 수 없습니다. Claude Code/Codex를 " +
+                                      "완전히 종료한 뒤 다시 실행하세요. (기존 버전은 그대로 유지됩니다)")
                     $retired = $false
                     if (Test-Path $AppDir) {
+                        # 먼저 그냥 시도한다. 서버가 떠 있지 않으면 여기서 끝나고, 사용자는 아무것도
+                        # 묻지 않은 채 업데이트가 끝난다. 잠금 처리는 실제로 막혔을 때만 개입한다.
                         try {
                             [System.IO.Directory]::Move($AppDir, $retireDir)
                             $retired = $true
                         } catch {
-                            throw ("기존 배포본이 사용 중이라 교체할 수 없습니다. Claude Code/Codex를 " +
-                                   "완전히 종료한 뒤 다시 실행하세요. (기존 버전은 그대로 유지됩니다)")
+                            # 막히는 이유는 거의 항상 "이 폴더 안의 mcp_server.exe가 실행 중"이다.
+                            # 예전에는 여기서 그대로 포기했는데, AI 클라이언트를 완전히 종료하는 것
+                            # 말고는 길이 없어서 사용자가 업데이트를 못 하는 상태에 갇혔다.
+                            # (Claude Desktop은 창을 닫아도 트레이에 남아 자식 프로세스를 유지한다.)
+                            $running = Get-RunningServerProcess -AppDir $AppDir
+                            if (@($running).Count -eq 0) { throw $lockedMessage }
+                            if (-not (Stop-RunningServerProcess -Processes $running)) { throw $lockedMessage }
+                            try {
+                                [System.IO.Directory]::Move($AppDir, $retireDir)
+                                $retired = $true
+                            } catch {
+                                # 서버를 껐는데도 막힌다면 다른 무언가가 잡고 있다(백신 검사, 탐색기
+                                # 미리보기 등). 원인이 다르므로 같은 안내를 반복하지 않는다.
+                                throw ("서버를 종료했는데도 배포본을 교체하지 못했습니다: " +
+                                       $_.Exception.Message + " (기존 버전은 그대로 유지됩니다)")
+                            }
                         }
                     }
                     try {
