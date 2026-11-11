@@ -58,6 +58,7 @@ AI 클라이언트가 실행 중이라 파일이 잠겨 있으면 교체를 건�
 | `eiass_find_projects_by_document_keyword`      | 후보를 좁힌 뒤 보고서 원문에서 키워드가 있는 사업만 추려서 반환 (소규모 ~50건)                 |
 | `eiass_start_document_keyword_scan`            | 대량 후보(수백 건)를 타임아웃 없이 끝까지 훑는 백그라운드 스캔 시작                            |
 | `eiass_get_scan_status` / `eiass_cancel_scan`  | 스캔 진행 상황·중간/최종 결과 조회, 진행 중인 스캔 취소                                       |
+| `eiass_resume_scan`                            | 중지한 스캔을 남은 후보부터 이어서 진행 (확인한 결과 유지, 중지 후 7일간 가능)                 |
 | `eiass_get_project_documents`                  | 사업 개요 + 단계별(초안/본안/협의의견 등) 첨부문서 목록 조회                                   |
 | `eiass_read_document`                          | 첨부 PDF를 다운로드해 텍스트 추출                                                              |
 | `eiass_check_protected_area_adjacency`         | 주소 → 지오코딩 → 반경 내 보호지역(국립공원/천연기념물/습지보호지역/야생생물보호구역/OECM) 조회 |
